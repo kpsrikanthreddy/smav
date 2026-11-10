@@ -1,0 +1,13 @@
+<resources>
+    <color name="smav_primary">#0F172A</color>
+    <color name="smav_accent">#0284C7</color>
+    <color name="smav_salon_rose">#BE185D</color>
+    <color name="smav_restaurant_amber">#D97706</color>
+    <color name="smav_bg_dark">#090D16</color>
+    <color name="smav_surface">#1E293B</color>
+    <color name="smav_text_primary">#F8FAFC</color>
+    <color name="smav_text_muted">#94A3B8</color>
+    <color name="smav_success">#10B981</color>
+    <color name="smav_warning">#F59E0B</color>
+    <color name="smav_error">#EF4444</color>
+</resources>

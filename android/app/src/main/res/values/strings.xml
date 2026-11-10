@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">SMAV Print Agent</string>
+    <string name="app_subtitle">Smart Mobile Automated Ventures</string>
+    <string name="offline_banner">Offline – bills are saved safely on this device</string>
+    <string name="printer_channel_name">Thermal Printer Service</string>
+    <string name="printer_channel_desc">Maintains reliable Bluetooth connection to 80mm ESC/POS printer</string>
+</resources>

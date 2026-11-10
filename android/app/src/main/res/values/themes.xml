@@ -1,0 +1,6 @@
+<resources>
+    <style name="Theme.SMAVPrintAgent" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@color/smav_primary</item>
+        <item name="android:navigationBarColor">@color/smav_primary</item>
+    </style>
+</resources>

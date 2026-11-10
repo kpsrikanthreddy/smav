@@ -1,0 +1,8 @@
+{
+  "name": "SMAV Print Agent",
+  "description": "Production offline-first billing, Bluetooth ESC/POS thermal printing, and multi-business synchronization system for The Glossy Looks Salon and MOZZ / Starters4U Restaurant.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
