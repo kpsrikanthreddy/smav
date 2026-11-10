@@ -111,6 +111,7 @@ export interface RestaurantMenuItem {
   id: string;
   name: string;
   category: string;
+  subcategory?: string;
   basePrice: number;
   isVeg: boolean;
   variants: Array<{ id: string; name: string; priceDelta: number }>;
@@ -129,6 +130,7 @@ export interface RetailProduct {
   id: string;
   name: string;
   category: string;
+  subcategory?: string;
   sku: string;
   price: number;
   gstPercent: number;

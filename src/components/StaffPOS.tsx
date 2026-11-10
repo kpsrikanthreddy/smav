@@ -82,6 +82,38 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
   // Search & Filter
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategoryFilter, setSelectedCategoryFilter] = useState('All');
+  const [selectedSubcategoryFilter, setSelectedSubcategoryFilter] = useState('All');
+
+  // Derive navigation from the current outlet's live catalog, never from sample labels.
+  const catalogItems = category === 'salon' ? salonServices : category === 'restaurant' ? restaurantMenu : retailProducts;
+  const normalized = (value?: string | null) => (value || '').trim() || 'General';
+  const catalogCategories = Array.from(new Set(catalogItems.map(item => normalized(item.category)))).sort((a, b) => a.localeCompare(b));
+  const categoryItems = catalogItems.filter(item => selectedCategoryFilter === 'All' || normalized(item.category) === selectedCategoryFilter);
+  const catalogSubcategories = Array.from(new Set(categoryItems.map(item => normalized(item.subcategory)))).sort((a, b) => a.localeCompare(b));
+  const visibleCatalogItems = categoryItems.filter(item =>
+    (selectedSubcategoryFilter === 'All' || normalized(item.subcategory) === selectedSubcategoryFilter) &&
+    (item.name.toLowerCase().includes(searchQuery.trim().toLowerCase()) ||
+      normalized(item.category).toLowerCase().includes(searchQuery.trim().toLowerCase()) ||
+      normalized(item.subcategory).toLowerCase().includes(searchQuery.trim().toLowerCase()))
+  );
+
+  useEffect(() => {
+    setSelectedCategoryFilter('All');
+    setSelectedSubcategoryFilter('All');
+    setSearchQuery('');
+  }, [session.activeOutlet.id]);
+
+  useEffect(() => {
+    if (selectedCategoryFilter !== 'All' && !catalogCategories.includes(selectedCategoryFilter)) {
+      setSelectedCategoryFilter('All');
+    }
+  }, [selectedCategoryFilter, catalogCategories.join('|')]);
+
+  useEffect(() => {
+    if (selectedSubcategoryFilter !== 'All' && !catalogSubcategories.includes(selectedSubcategoryFilter)) {
+      setSelectedSubcategoryFilter('All');
+    }
+  }, [selectedSubcategoryFilter, catalogSubcategories.join('|')]);
 
   // Printing & Previews
   const [activeReceiptPreview, setActiveReceiptPreview] = useState<any | null>(null);
@@ -627,8 +659,35 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                 />
               </div>
 
+              <div className="space-y-2" aria-label="Catalog category navigation">
+                <div className="text-[11px] font-semibold text-slate-300">Categories</div>
+                <div className="flex flex-wrap gap-2">
+                  {['All', ...catalogCategories].map(cat => (
+                    <button key={cat} type="button"
+                      aria-pressed={selectedCategoryFilter === cat}
+                      onClick={() => { setSelectedCategoryFilter(cat); setSelectedSubcategoryFilter('All'); }}
+                      className={`rounded-lg border px-3 py-1.5 text-xs ${selectedCategoryFilter === cat ? 'border-pink-500 bg-pink-500/20 text-white' : 'border-[#2a3055] text-slate-300 hover:border-pink-500/50'}`}>
+                      {cat === 'All' ? 'All Categories' : cat}
+                    </button>
+                  ))}
+                </div>
+                <div className="text-[11px] font-semibold text-slate-300">Subcategories</div>
+                <div className="flex flex-wrap gap-2">
+                  {['All', ...catalogSubcategories].map(sub => (
+                    <button key={sub} type="button"
+                      aria-pressed={selectedSubcategoryFilter === sub}
+                      onClick={() => setSelectedSubcategoryFilter(sub)}
+                      className={`rounded-lg border px-3 py-1.5 text-xs ${selectedSubcategoryFilter === sub ? 'border-amber-500 bg-amber-500/20 text-white' : 'border-[#2a3055] text-slate-300 hover:border-amber-500/50'}`}>
+                      {sub === 'All' ? 'All Subcategories' : sub}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[11px] text-slate-400">Showing {visibleCatalogItems.length} of {catalogItems.length} items</p>
+              </div>
+              {catalogError && <p role="alert" className="text-xs text-rose-400">{catalogError}</p>}
+              {visibleCatalogItems.length === 0 && <p className="text-xs text-slate-400 py-4">No items found for these filters. Check the outlet catalog sync if the list is empty.</p>}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-[460px] overflow-y-auto pr-1">
-                {category === 'salon' && salonServices.map(srv => (
+                {category === 'salon' && (visibleCatalogItems as SalonService[]).map(srv => (
                   <div
                     key={srv.id}
                     onClick={() => {
@@ -639,7 +698,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                   >
                     <div>
                       <div className="flex items-center justify-between">
-                        <span className="text-[10px] text-slate-400 font-mono">{srv.category}</span>
+                        <span className="text-[10px] text-slate-400 font-mono">{srv.category} / {normalized(srv.subcategory)}</span>
                         <span className="text-xs font-bold text-emerald-400 font-mono">₹{srv.price}</span>
                       </div>
                       <p className="text-xs font-bold text-white mt-1">{srv.name}</p>
@@ -650,7 +709,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                   </div>
                 ))}
 
-                {category === 'restaurant' && restaurantMenu.map(menuItem => (
+                {category === 'restaurant' && (visibleCatalogItems as RestaurantMenuItem[]).map(menuItem => (
                   <div
                     key={menuItem.id}
                     onClick={() => {
@@ -661,7 +720,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                   >
                     <div>
                       <div className="flex items-center justify-between">
-                        <span className="text-[10px] text-slate-400 font-mono">{menuItem.category}</span>
+                        <span className="text-[10px] text-slate-400 font-mono">{menuItem.category} / {normalized(menuItem.subcategory)}</span>
                         <span className="text-xs font-bold text-emerald-400 font-mono">₹{menuItem.basePrice}</span>
                       </div>
                       <p className="text-xs font-bold text-white mt-1 flex items-center gap-1.5">
@@ -672,6 +731,16 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                     <button className="mt-2 text-[11px] font-semibold text-amber-400 flex items-center gap-1">
                       <Plus className="w-3.5 h-3.5" /> Add to Order
                     </button>
+                  </div>
+                ))}
+                {(category === 'retail' || category === 'other') && (visibleCatalogItems as RetailProduct[]).map(product => (
+                  <div key={product.id} onClick={() => {
+                    setRetailCart(prev => [...prev, { product, quantity: 1, discountPercent: 0, addedPrice: product.price, addedRevision: product.revision }]);
+                    setActivePosView('billing');
+                  }} className="p-3 bg-[#161a33] border border-[#2a3055] hover:border-pink-500/60 rounded-xl cursor-pointer">
+                    <div className="flex justify-between gap-2"><span className="text-[10px] text-slate-400">{product.category} / {normalized(product.subcategory)}</span><span className="text-xs font-bold text-emerald-400">₹{product.price}</span></div>
+                    <p className="text-xs font-bold text-white mt-1">{product.name}</p>
+                    <span className="mt-2 text-[11px] font-semibold text-pink-400 flex items-center gap-1"><Plus className="w-3.5 h-3.5" /> Add to Bill</span>
                   </div>
                 ))}
               </div>
