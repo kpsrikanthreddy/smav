@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Cloud,
   RefreshCw,
@@ -51,6 +51,14 @@ export const SyncDashboard: React.FC<SyncDashboardProps> = ({
   onPullSupabaseSync
 }) => {
   const isStale = localCatalogRevision < serverCatalogRevision;
+  const [liveStatus, setLiveStatus] = useState<any>(null);
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/supabase/status').then(r => r.ok ? r.json() : Promise.reject()).then(data => {
+      if (!cancelled) setLiveStatus(data);
+    }).catch(() => { if (!cancelled) setLiveStatus(null); });
+    return () => { cancelled = true; };
+  }, [lastSyncTime, isPullingSupabase]);
 
   return (
     <div className="space-y-6">
@@ -110,7 +118,7 @@ export const SyncDashboard: React.FC<SyncDashboardProps> = ({
             </h4>
           </div>
           <span className="text-[11px] text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded-full font-semibold">
-            ● Supabase Live Invalidation Active
+            {liveStatus?.last_sync ? 'Last upstream pull: ' + new Date(liveStatus.last_sync).toLocaleString() : 'Upstream sync not verified'}
           </span>
         </div>
 
@@ -124,7 +132,7 @@ export const SyncDashboard: React.FC<SyncDashboardProps> = ({
                   The Glossy Looks Salon & Spa
                 </span>
                 <span className="text-[10px] bg-rose-500/10 text-rose-300 border border-rose-500/20 px-2 py-0.5 rounded-full font-mono">
-                  Active Supabase
+                  Configured upstream
                 </span>
               </div>
               <p className="text-[11px] text-slate-400 mb-2">Authoritative Database URL:</p>
@@ -133,18 +141,18 @@ export const SyncDashboard: React.FC<SyncDashboardProps> = ({
               </div>
               <div className="mt-3 grid grid-cols-2 gap-2 text-center text-xs">
                 <div className="bg-slate-900/60 p-2 rounded-lg border border-slate-800/60">
-                  <div className="font-bold text-white">204 Active Services</div>
+                  <div className="font-bold text-white">{liveStatus?.last_sync ? liveStatus.the_glossy_looks?.services_count : "—"} Active Services</div>
                   <div className="text-[10px] text-slate-400">Salon, Makeup, Spa, Nails</div>
                 </div>
                 <div className="bg-slate-900/60 p-2 rounded-lg border border-slate-800/60">
-                  <div className="font-bold text-white">4 Live Stylists</div>
-                  <div className="text-[10px] text-slate-400">Madu, paleti, Deepika, Deena</div>
+                  <div className="font-bold text-white">{liveStatus?.last_sync ? liveStatus.the_glossy_looks?.stylists_count : "—"} Live Stylists</div>
+                  <div className="text-[10px] text-slate-400">From upstream staff API</div>
                 </div>
               </div>
             </div>
             <div className="mt-3 pt-2 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-400">
               <span>Upstream: <code className="text-slate-300">glossylooks.in/api</code></span>
-              <span className="text-emerald-400 font-medium">Synchronized</span>
+              <span className="text-emerald-400 font-medium">{liveStatus?.last_sync ? "Last pull recorded" : "Not verified"}</span>
             </div>
           </div>
 
@@ -157,7 +165,7 @@ export const SyncDashboard: React.FC<SyncDashboardProps> = ({
                   MOZZ / Starters4U Restaurant
                 </span>
                 <span className="text-[10px] bg-amber-500/10 text-amber-300 border border-amber-500/20 px-2 py-0.5 rounded-full font-mono">
-                  Active Supabase
+                  Configured upstream
                 </span>
               </div>
               <p className="text-[11px] text-slate-400 mb-2">Authoritative Database URL:</p>
@@ -166,18 +174,18 @@ export const SyncDashboard: React.FC<SyncDashboardProps> = ({
               </div>
               <div className="mt-3 grid grid-cols-2 gap-2 text-center text-xs">
                 <div className="bg-slate-900/60 p-2 rounded-lg border border-slate-800/60">
-                  <div className="font-bold text-white">73 Menu Items</div>
-                  <div className="text-[10px] text-slate-400">Chinese Starters, Pizzas, Momos</div>
+                  <div className="font-bold text-white">{liveStatus?.last_sync ? liveStatus.mozz_starters4u?.menu_items_count : "—"} Menu Items</div>
+                  <div className="text-[10px] text-slate-400">From upstream menu API</div>
                 </div>
                 <div className="bg-slate-900/60 p-2 rounded-lg border border-slate-800/60">
-                  <div className="font-bold text-white">Gachibowli Flagship</div>
+                  <div className="font-bold text-white">Outlet registry required</div>
                   <div className="text-[10px] text-slate-400">Dine-in, Takeaway, KOT</div>
                 </div>
               </div>
             </div>
             <div className="mt-3 pt-2 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-400">
               <span>Upstream: <code className="text-slate-300">starters4u.in/api</code></span>
-              <span className="text-emerald-400 font-medium">Synchronized</span>
+              <span className="text-emerald-400 font-medium">{liveStatus?.last_sync ? "Last pull recorded" : "Not verified"}</span>
             </div>
           </div>
         </div>

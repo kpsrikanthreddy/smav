@@ -57,6 +57,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
 }) => {
   const category = session.activeOutlet.category;
   const [activePosView, setActivePosView] = useState<'billing' | 'catalog' | 'secondary'>('billing');
+  const [catalogError, setCatalogError] = useState<string | null>(null);
 
   // Salon Data
   const [salonServices, setSalonServices] = useState<SalonService[]>([]);
@@ -96,6 +97,11 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
           headers: { Authorization: `Bearer ${session.token}` }
         });
         const data = await res.json();
+        if (!res.ok || !data.success) {
+          setCatalogError(data.message || 'Catalog unavailable. Check outlet registration and upstream API.');
+          return;
+        }
+        setCatalogError(null);
         if (data.success) {
           if (data.category === 'salon') {
             setSalonServices(data.services || []);
@@ -128,6 +134,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
         }
       } catch (e) {
         console.error(e);
+        setCatalogError('Could not load POS catalog from SMAV backend.');
       }
     };
 
@@ -285,6 +292,8 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+      {catalogError && <div role="alert" className="lg:col-span-12 rounded-lg border border-red-500/50 bg-red-950/40 p-3 text-red-200">{catalogError}</div>}
+
       {/* Left 7 Cols: Counter Terminal Frame */}
       <div className="lg:col-span-7 bg-[#121629] border border-[#1e2540] rounded-2xl shadow-2xl overflow-hidden flex flex-col">
         

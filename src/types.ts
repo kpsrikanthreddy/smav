@@ -41,6 +41,8 @@ export interface UserSession {
   deviceId: string;
   createdAt: string;
   expiresAt?: string;
+  supabaseToken?: string;
+  platformRole?: string;
   // Backward compatibility fields
   user_id?: string;
   user_name?: string;
