@@ -62,6 +62,8 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
   // Salon Data
   const [salonServices, setSalonServices] = useState<SalonService[]>([]);
   const [stylists, setStylists] = useState<Stylist[]>([]);
+  const [stylistError, setStylistError] = useState<string | null>(null);
+  const [billSaveError, setBillSaveError] = useState<string | null>(null);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [salonCart, setSalonCart] = useState<SalonCartItem[]>([]);
   const [customerName, setCustomerName] = useState('Ananya Sharma');
@@ -137,14 +139,10 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
         if (data.success) {
           if (data.category === 'salon') {
             setSalonServices(data.services || []);
-            setStylists(data.stylists || []);
+            setStylists((data.stylists || []).filter((st: Stylist) => st.isAvailable !== false));
+            setStylistError(data.stylistError || ((data.stylists || []).length ? null : 'No active stylists returned from the Glossy Looks staff API.'));
             setAppointments(data.appointments || []);
-            if (data.services && data.services.length >= 2 && salonCart.length === 0) {
-              setSalonCart([
-                { service: data.services[0], stylist: data.stylists?.[0] || null, quantity: 1, discountPercent: 10, addedPrice: data.services[0].price, addedRevision: data.services[0].revision },
-                { service: data.services[1], stylist: data.stylists?.[1] || null, quantity: 1, discountPercent: 0, addedPrice: data.services[1].price, addedRevision: data.services[1].revision }
-              ]);
-            }
+            // Never prepopulate a bill or silently assign the first stylist.
           } else if (data.category === 'restaurant') {
             setRestaurantMenu(data.menu || []);
             setRestaurantTables(data.tables || []);
@@ -193,8 +191,13 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
   const retailGrandTotal = retailTaxable + retailTax;
 
   // Print Salon Bill
-  const handlePrintSalonBill = () => {
+  const handlePrintSalonBill = async () => {
     if (salonCart.length === 0) return;
+    if (salonCart.some(item => !item.stylist?.id)) {
+      setBillSaveError('Select a stylist for every service before printing.');
+      return;
+    }
+    setBillSaveError(null);
     const billNumber = `TGL-${session.activeOutlet.code.toUpperCase()}-${Date.now().toString().slice(-6)}`;
     const bill = {
       billNumber,
@@ -208,7 +211,9 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
         name: c.service.name,
         price: c.addedPrice,
         quantity: c.quantity,
-        stylist: c.stylist?.name || 'Assigned Stylist'
+        serviceId: c.service.id,
+        stylistId: c.stylist!.id,
+        stylist: c.stylist!.name
       })),
       subtotal: salonSubtotal,
       discount: salonDiscount,
@@ -225,17 +230,23 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
 
     setActiveReceiptPreview(bill);
 
-    // Sync or queue
+    // Persist selected stylist IDs with bill line items before claiming sync success.
+    const payload = { bills: [{ bill: { ...bill, id: billNumber, outletId: session.activeOutlet.id }, items: bill.items, idempotency_key: `IDEM_${billNumber}` }] };
     if (isOnline) {
-      fetch('/api/mobile/sync/bills', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          bills: [{ bill: { ...bill, billNumber, outletId: session.activeOutlet.id }, items: bill.items, idempotency_key: `IDEM_${billNumber}` }]
-        })
-      });
+      try {
+        const response = await fetch('/api/mobile/sync/bills', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` },
+          body: JSON.stringify(payload)
+        });
+        const result = await response.json();
+        if (!response.ok || !result.success) throw new Error(result.message || 'Bill could not be saved');
+      } catch (error) {
+        setBillSaveError(`Bill not saved to database: ${error instanceof Error ? error.message : 'Unknown error'}. Do not reprint as a new sale.`);
+      }
     } else {
-      setOfflineQueue(prev => [...prev, bill]);
+      setOfflineQueue(prev => [...prev, payload]);
+      setBillSaveError('Offline: bill is queued in this session only. Durable offline storage is not yet implemented.');
     }
   };
 
@@ -453,9 +464,22 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                       <div key={idx} className="bg-[#161a33] border border-[#2a3055] rounded-xl p-3 flex items-center justify-between gap-3 text-xs">
                         <div className="flex-1">
                           <p className="font-bold text-white">{item.service.name}</p>
-                          <p className="text-[11px] text-slate-400">
-                            Stylist: {item.stylist?.name || 'Any Available'} • Price: ₹{item.addedPrice}
-                          </p>
+                          <label className="mt-2 block text-[11px] text-slate-300" htmlFor={`stylist-${idx}`}>Assigned stylist for this service</label>
+                          <select
+                            id={`stylist-${idx}`}
+                            aria-label={`Stylist for ${item.service.name}`}
+                            value={item.stylist?.id || ''}
+                            onChange={e => {
+                              const chosen = stylists.find(st => st.id === e.target.value) || null;
+                              setSalonCart(prev => prev.map((line, i) => i === idx ? { ...line, stylist: chosen } : line));
+                              setBillSaveError(null);
+                            }}
+                            className="mt-1 w-full max-w-sm rounded-lg border border-[#3a4267] bg-[#10162a] px-2 py-2 text-white"
+                          >
+                            <option value="">Select stylist (required)</option>
+                            {stylists.map(st => <option key={st.id} value={st.id}>{st.name}</option>)}
+                          </select>
+                          <p className="text-[11px] text-slate-400">Price: ₹{item.addedPrice}</p>
                         </div>
                         <div className="flex items-center gap-2">
                           <span className="font-bold text-white font-mono">₹{item.addedPrice * item.quantity}</span>
@@ -470,6 +494,8 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                     ))}
                   </div>
 
+                  {stylistError && <p role="alert" className="text-xs text-amber-400">{stylistError}</p>}
+                  {billSaveError && <p role="alert" className="text-xs text-rose-400">{billSaveError}</p>}
                   {/* Customer Information */}
                   <div className="grid grid-cols-2 gap-3 text-xs pt-2">
                     <div>
@@ -505,7 +531,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
 
                   <button
                     onClick={handlePrintSalonBill}
-                    disabled={salonCart.length === 0}
+                    disabled={salonCart.length === 0 || salonCart.some(line => !line.stylist?.id)}
                     className="w-full py-3.5 rounded-xl bg-gradient-to-r from-pink-500 to-orange-500 hover:brightness-110 text-white font-bold text-sm flex items-center justify-center gap-2 shadow-lg transition"
                   >
                     <Printer className="w-4 h-4" />
@@ -691,7 +717,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                   <div
                     key={srv.id}
                     onClick={() => {
-                      setSalonCart(prev => [...prev, { service: srv, stylist: stylists[0] || null, quantity: 1, discountPercent: 0, addedPrice: srv.price, addedRevision: srv.revision }]);
+                      setSalonCart(prev => [...prev, { service: srv, stylist: null, quantity: 1, discountPercent: 0, addedPrice: srv.price, addedRevision: srv.revision }]);
                       setActivePosView('billing');
                     }}
                     className="p-3 bg-[#161a33] border border-[#2a3055] hover:border-pink-500/60 rounded-xl cursor-pointer transition flex flex-col justify-between"

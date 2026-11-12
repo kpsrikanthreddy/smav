@@ -295,17 +295,6 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           <p className="text-xs text-slate-400 mt-1">
             Secure Enterprise Authentication Gateway
           </p>
-
-          {/* Central Supabase Status Badge */}
-          <button
-            type="button"
-            onClick={() => setIsConfigModalOpen(true)}
-            className="mt-2.5 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium bg-[#171c38] hover:bg-[#1f264d] border border-[#2b3561] text-slate-300 transition"
-          >
-            <span className={`w-2 h-2 rounded-full ${supabaseStatus?.isConfigured ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
-            <span>Central Supabase: {supabaseStatus?.isConfigured ? 'Active' : 'Configure'}</span>
-            <ChevronRight className="w-3 h-3 text-slate-400" />
-          </button>
         </div>
 
         {/* Error Alert Display */}

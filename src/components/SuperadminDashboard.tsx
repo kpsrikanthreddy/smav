@@ -23,9 +23,11 @@ import {
   Lock,
   UserPlus,
   Database,
-  RefreshCw
+  RefreshCw,
+  Sparkles
 } from 'lucide-react';
 import { Outlet, BusinessCategory, UserSession, AuditLogEntry, TestResultItem } from '../types';
+import { PortalAuthDashboard } from './PortalAuthDashboard';
 
 interface SuperadminDashboardProps {
   session: UserSession;
@@ -38,7 +40,7 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
   onLaunchOutletPos,
   onLogout
 }) => {
-  const [activeTab, setActiveTab] = useState<'outlets' | 'admins' | 'reports' | 'audit' | 'tests' | 'supabase'>('outlets');
+  const [activeTab, setActiveTab] = useState<'outlets' | 'admins' | 'reports' | 'audit' | 'tests' | 'supabase' | 'portal_auth'>('outlets');
   const [outlets, setOutlets] = useState<Outlet[]>([]);
   const [reportsSummary, setReportsSummary] = useState<any>(null);
   const [adminsList, setAdminsList] = useState<any[]>([]);
@@ -324,6 +326,7 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
       <div className="flex items-center gap-2 border-b border-slate-800 pb-2 overflow-x-auto text-xs">
         {[
           { id: 'outlets', label: `Registered Outlets (${outlets.length})`, icon: Building2 },
+          { id: 'portal_auth', label: 'Multi-Portal Shared Auth & Testing', icon: Sparkles },
           { id: 'admins', label: `Outlet Administrators (${adminsList.length})`, icon: KeyRound },
           { id: 'reports', label: 'Authorized Network Reports', icon: TrendingUp },
           { id: 'audit', label: `Security Audit Logs (${auditLogs.length})`, icon: History },
@@ -880,6 +883,16 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
             </div>
           </div>
         </div>
+      )}
+
+      {/* ============================================================================== */}
+      {/* TAB 7: MULTI-PORTAL SHARED AUTH & TESTING                                      */}
+      {/* ============================================================================== */}
+      {activeTab === 'portal_auth' && (
+        <PortalAuthDashboard
+          session={session}
+          onLaunchOutletPos={onLaunchOutletPos}
+        />
       )}
 
       {/* ============================================================================== */}
