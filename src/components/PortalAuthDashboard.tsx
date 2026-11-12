@@ -87,11 +87,12 @@ export const PortalAuthDashboard: React.FC<PortalAuthDashboardProps> = ({
     setIsSubmittingGl(true);
     setGlResult(null);
     try {
+      const authHeader = session.supabaseToken || session.token;
       const res = await fetch('/api/central-auth/staff/provision', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-SMAV-Gateway-Secret': 'smav-enterprise-portal-secret-2026'
+          Authorization: `Bearer ${authHeader}`
         },
         body: JSON.stringify({
           ...glForm,
@@ -115,11 +116,12 @@ export const PortalAuthDashboard: React.FC<PortalAuthDashboardProps> = ({
     setIsSubmittingMozz(true);
     setMozzResult(null);
     try {
+      const authHeader = session.supabaseToken || session.token;
       const res = await fetch('/api/central-auth/staff/provision', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-SMAV-Gateway-Secret': 'smav-enterprise-portal-secret-2026'
+          Authorization: `Bearer ${authHeader}`
         },
         body: JSON.stringify({
           ...mozzForm,
@@ -143,13 +145,14 @@ export const PortalAuthDashboard: React.FC<PortalAuthDashboardProps> = ({
     setDuplicateTestResult(null);
     try {
       const sharedEmail = 'multi.partner@enterprise.in';
+      const authHeader = session.supabaseToken || session.token;
       
       // Step 1: Provision for Glossy Looks
       const step1 = await fetch('/api/central-auth/staff/provision', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-SMAV-Gateway-Secret': 'smav-enterprise-portal-secret-2026'
+          Authorization: `Bearer ${authHeader}`
         },
         body: JSON.stringify({
           email: sharedEmail,
@@ -166,7 +169,7 @@ export const PortalAuthDashboard: React.FC<PortalAuthDashboardProps> = ({
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-SMAV-Gateway-Secret': 'smav-enterprise-portal-secret-2026'
+          Authorization: `Bearer ${authHeader}`
         },
         body: JSON.stringify({
           email: sharedEmail,
@@ -195,11 +198,12 @@ export const PortalAuthDashboard: React.FC<PortalAuthDashboardProps> = ({
   // Toggle staff status
   const handleToggleStaffStatus = async (staff: any) => {
     try {
+      const authHeader = session.supabaseToken || session.token;
       await fetch('/api/central-auth/staff/status', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-SMAV-Gateway-Secret': 'smav-enterprise-portal-secret-2026'
+          Authorization: `Bearer ${authHeader}`
         },
         body: JSON.stringify({
           userId: staff.id,

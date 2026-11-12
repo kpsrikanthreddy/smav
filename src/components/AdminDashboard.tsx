@@ -16,6 +16,7 @@ import {
   SlidersHorizontal
 } from 'lucide-react';
 import { UserSession } from '../types';
+import { identityAdminService } from '../services/identityAdminService';
 
 interface AdminDashboardProps {
   session: UserSession;
@@ -50,19 +51,32 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     password: ''
   });
 
-  // Password reset feedback
+  // Action state and feedback (Edge Function / API)
   const [resetFeedback, setResetFeedback] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionSuccess, setActionSuccess] = useState<string | null>(null);
+  const [isActionLoading, setIsActionLoading] = useState(false);
 
   const fetchAdminData = async () => {
     try {
       const headers = { Authorization: `Bearer ${session.token}` };
+
+      // If user has Supabase token, list staff via Edge Function or backend
+      if (session.supabaseToken) {
+        const edgeStaff = await identityAdminService.listStaff(session.supabaseToken, session.activeOutlet.code);
+        if (edgeStaff.success && Array.isArray(edgeStaff.staff)) {
+          setStaffList(edgeStaff.staff);
+        }
+      }
 
       const [staffRes, repRes] = await Promise.all([
         fetch('/api/admin/staff', { headers }).then(r => r.json()).catch(() => ({ staff: [] })),
         fetch('/api/admin/reports', { headers }).then(r => r.json()).catch(() => null)
       ]);
 
-      if (staffRes.staff) setStaffList(staffRes.staff);
+      if (staffRes.staff && (!session.supabaseToken || staffList.length === 0)) {
+        setStaffList(staffRes.staff);
+      }
       if (repRes) setReports(repRes);
 
       // Fetch catalog
@@ -90,64 +104,134 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   const handleCreateStaff = async (e: React.FormEvent) => {
     e.preventDefault();
+    setIsActionLoading(true);
+    setActionError(null);
+    setActionSuccess(null);
     try {
-      const res = await fetch('/api/admin/staff', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session.token}`
-        },
-        body: JSON.stringify(newStaffForm)
-      });
-      if (res.ok) {
-        setIsAddStaffOpen(false);
-        setNewStaffForm({
-          fullName: '',
-          email: '',
-          phone: '',
-          role: 'staff',
-          specificTitle: session.activeOutlet.category === 'salon' ? 'Salon Receptionist' : 'Cashier',
-          password: ''
+      if (session.supabaseToken) {
+        const res = await identityAdminService.createOutletStaff(session.supabaseToken, {
+          email: newStaffForm.email.trim(),
+          fullName: newStaffForm.fullName.trim(),
+          phone: newStaffForm.phone.trim(),
+          outletCode: session.activeOutlet.code,
+          temporaryPassword: newStaffForm.password || undefined
         });
-        fetchAdminData();
+
+        if (res.success) {
+          setIsAddStaffOpen(false);
+          setActionSuccess(res.message || `Staff member "${newStaffForm.email}" created successfully.`);
+          setNewStaffForm({
+            fullName: '',
+            email: '',
+            phone: '',
+            role: 'staff',
+            specificTitle: session.activeOutlet.category === 'salon' ? 'Salon Receptionist' : 'Cashier',
+            password: ''
+          });
+          fetchAdminData();
+        } else {
+          setActionError(res.error || 'Failed to create staff');
+        }
+      } else {
+        const res = await fetch('/api/admin/staff', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${session.token}`
+          },
+          body: JSON.stringify(newStaffForm)
+        });
+        const data = await res.json();
+        if (res.ok && data.success) {
+          setIsAddStaffOpen(false);
+          setActionSuccess('Staff created successfully.');
+          setNewStaffForm({
+            fullName: '',
+            email: '',
+            phone: '',
+            role: 'staff',
+            specificTitle: session.activeOutlet.category === 'salon' ? 'Salon Receptionist' : 'Cashier',
+            password: ''
+          });
+          fetchAdminData();
+        } else {
+          setActionError(data.message || 'Failed to create staff');
+        }
       }
-    } catch (e) {
-      console.error(e);
+    } catch (e: any) {
+      setActionError(e.message);
+    } finally {
+      setIsActionLoading(false);
     }
   };
 
-  const handleResetStaffPassword = async (staffId: string, staffName: string) => {
+  const handleResetStaffPassword = async (staffId: string, staffName: string, staffEmail?: string) => {
+    setIsActionLoading(true);
+    setActionError(null);
     try {
-      const res = await fetch(`/api/admin/staff/${staffId}/reset-password`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session.token}`
-        },
-        body: JSON.stringify({})
-      });
-      const data = await res.json();
-      if (data.success) {
-        setResetFeedback(`Password for ${staffName} reset to: ${data.temporaryPassword}`);
+      if (session.supabaseToken) {
+        const res = await identityAdminService.resetPassword(session.supabaseToken, {
+          userId: staffId,
+          email: staffEmail,
+          outletCode: session.activeOutlet.code
+        });
+
+        if (res.success) {
+          if (res.recoveryLink) {
+            setResetFeedback(`Password recovery link generated for ${staffName}: ${res.recoveryLink}`);
+          } else {
+            setResetFeedback(res.message || `Password reset link sent to ${staffName}.`);
+          }
+        } else {
+          setActionError(res.error || 'Password reset failed');
+        }
+      } else {
+        const res = await fetch(`/api/admin/staff/${staffId}/reset-password`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${session.token}`
+          },
+          body: JSON.stringify({})
+        });
+        const data = await res.json();
+        if (data.success) {
+          setResetFeedback(`Password for ${staffName} reset to: ${data.temporaryPassword}`);
+        } else {
+          setActionError(data.message || 'Reset failed');
+        }
       }
-    } catch (e) {
-      console.error(e);
+    } catch (e: any) {
+      setActionError(e.message);
+    } finally {
+      setIsActionLoading(false);
     }
   };
 
   const handleToggleStaffStatus = async (staffId: string, currentActive: boolean) => {
+    setIsActionLoading(true);
     try {
-      await fetch(`/api/admin/staff/${staffId}/status`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session.token}`
-        },
-        body: JSON.stringify({ isActive: !currentActive })
-      });
+      if (session.supabaseToken) {
+        await identityAdminService.setStaffStatus(session.supabaseToken, {
+          userId: staffId,
+          outletCode: session.activeOutlet.code,
+          isActive: !currentActive
+        });
+      } else {
+        await fetch(`/api/admin/staff/${staffId}/status`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${session.token}`
+          },
+          body: JSON.stringify({ isActive: !currentActive })
+        });
+      }
       fetchAdminData();
-    } catch (e) {
+    } catch (e: any) {
       console.error(e);
+    } finally {
+      setIsActionLoading(false);
     }
   };
 
@@ -253,10 +337,24 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </button>
           </div>
 
+          {actionError && (
+            <div className="p-3 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs flex items-center justify-between">
+              <span>{actionError}</span>
+              <button onClick={() => setActionError(null)} className="text-xs underline">Dismiss</button>
+            </div>
+          )}
+
+          {actionSuccess && (
+            <div className="p-3 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-xs flex items-center justify-between">
+              <span>{actionSuccess}</span>
+              <button onClick={() => setActionSuccess(null)} className="text-xs underline">Dismiss</button>
+            </div>
+          )}
+
           {resetFeedback && (
             <div className="p-3 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-xs font-mono flex items-center justify-between">
-              <span>{resetFeedback}</span>
-              <button onClick={() => setResetFeedback(null)} className="text-xs underline">Dismiss</button>
+              <span className="break-all">{resetFeedback}</span>
+              <button onClick={() => setResetFeedback(null)} className="text-xs underline ml-2">Dismiss</button>
             </div>
           )}
 
@@ -272,7 +370,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               </thead>
               <tbody className="divide-y divide-slate-800/80">
                 {staffList.map(staff => (
-                  <tr key={staff.id} className="hover:bg-slate-800/30 transition">
+                  <tr key={staff.id || staff.userId} className="hover:bg-slate-800/30 transition">
                     <td className="p-4">
                       <div className="font-bold text-white">{staff.fullName}</div>
                       <div className="text-slate-400 font-mono text-[11px]">{staff.email}</div>
@@ -285,7 +383,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     </td>
                     <td className="p-4">
                       <button
-                        onClick={() => handleToggleStaffStatus(staff.id, staff.isActive)}
+                        onClick={() => handleToggleStaffStatus(staff.id || staff.userId, staff.isActive)}
                         className={`px-2 py-0.5 rounded text-[10px] font-bold transition ${
                           staff.isActive ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
                         }`}
@@ -295,7 +393,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     </td>
                     <td className="p-4 text-right space-x-2">
                       <button
-                        onClick={() => handleResetStaffPassword(staff.id, staff.fullName)}
+                        onClick={() => handleResetStaffPassword(staff.id || staff.userId, staff.fullName, staff.email)}
                         className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-400 text-xs font-semibold transition"
                       >
                         Reset Password

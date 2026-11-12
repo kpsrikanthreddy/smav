@@ -1,15 +1,17 @@
 /**
- * MOZZ / Starters4U Admin Portal - Central SMAV Auth Gateway Adapter
+ * MOZZ / Starters4U Admin Portal - Central SMAV Auth & Edge Function Adapter
  * File: integrations/mozz/mozz_smav_auth_adapter.ts
  *
  * Use this adapter inside MOZZ / Starters4U Admin Portal codebase (www.starters4u.in).
  * When a restaurant owner or manager creates, updates, deactivates, or resets a staff member,
- * this adapter securely synchronizes their identity with the Central SMAV Supabase Auth.
+ * this adapter securely synchronizes their identity with Central SMAV Supabase Auth
+ * via the `smav-identity-admin` Supabase Edge Function.
  *
  * Operational rules:
  * 1. Plaintext passwords are NEVER stored in MOZZ database or transmitted insecurely.
  * 2. If a staff user already exists in Central Auth, their identity is linked without duplicate accounts.
  * 3. MOZZ staff are strictly assigned to outlet_mozz_gach and restaurant POS.
+ * 4. Never exposes or requires Supabase service_role keys in client bundles.
  */
 
 export interface MozzStaffPayload {
@@ -17,63 +19,109 @@ export interface MozzStaffPayload {
   email: string;
   fullName: string;
   phone?: string;
-  role: 'staff' | 'admin';
+  role: 'OWNER' | 'MANAGER' | 'CASHIER' | 'WAITER' | 'ADMIN' | 'STAFF' | string;
+  username?: string;
+  isActive?: boolean;
   temporaryPassword?: string;
 }
 
 export interface CentralAuthResponse {
   success: boolean;
   message: string;
-  centralUserId?: string;
+  userId?: string;
   isNewUser?: boolean;
-  isLinked?: boolean;
+  recoveryLink?: string;
   outletCode?: string;
-  activationToken?: string;
+  results?: any[];
 }
 
 export class MozzSmavAuthAdapter {
-  private centralGatewayUrl: string;
-  private gatewaySecret: string;
+  private edgeFunctionUrl: string;
+  private integrationKey: string;
   private outletCode: string = 'mozz';
 
-  constructor(config?: { centralGatewayUrl?: string; gatewaySecret?: string; outletCode?: string }) {
-    this.centralGatewayUrl = config?.centralGatewayUrl || process.env.SMAV_GATEWAY_URL || 'https://smav-print-agent.internal';
-    this.gatewaySecret = config?.gatewaySecret || process.env.SMAV_GATEWAY_SECRET || '';
+  constructor(config?: { edgeFunctionUrl?: string; integrationKey?: string; outletCode?: string }) {
+    this.edgeFunctionUrl =
+      config?.edgeFunctionUrl ||
+      process.env.SMAV_EDGE_FUNCTION_URL ||
+      'https://qykdwswatopylzvqhgog.supabase.co/functions/v1/smav-identity-admin';
+    this.integrationKey = config?.integrationKey || process.env.MOZZ_INTEGRATION_KEY || '';
     if (config?.outletCode) this.outletCode = config.outletCode;
   }
 
   /**
-   * When an owner/manager adds a staff member in MOZZ Admin Portal,
-   * call this method to provision or link the user in Central SMAV Auth.
+   * Synchronize a newly created or updated staff member from MOZZ Admin Portal
+   * directly to Central SMAV Supabase Auth and RBAC roles.
    */
-  async provisionOrLinkStaff(staff: MozzStaffPayload): Promise<CentralAuthResponse> {
+  async syncStaffMember(staff: MozzStaffPayload): Promise<CentralAuthResponse> {
     try {
-      const response = await fetch(`${this.centralGatewayUrl}/api/central-auth/staff/provision`, {
+      const response = await fetch(this.edgeFunctionUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-SMAV-Gateway-Secret': this.gatewaySecret
+          'X-Business-Source': 'mozz',
+          'X-Integration-Key': this.integrationKey,
         },
         body: JSON.stringify({
-          email: staff.email.trim().toLowerCase(),
-          fullName: staff.fullName.trim(),
-          phone: staff.phone || '',
-          role: staff.role || 'staff',
-          outletCode: this.outletCode,
-          businessSource: 'mozz',
-          externalStaffId: staff.externalStaffId,
-          temporaryPassword: staff.temporaryPassword
-        })
+          action: 'sync-mozz',
+          staff: [
+            {
+              id: staff.externalStaffId,
+              email: staff.email.trim().toLowerCase(),
+              name: staff.fullName.trim(),
+              phone: staff.phone || '',
+              role: staff.role || 'CASHIER',
+              username: staff.username || staff.email.split('@')[0],
+              isActive: staff.isActive !== false,
+            },
+          ],
+        }),
       });
 
       const data = await response.json();
-      return data;
+      return {
+        success: data.success,
+        message: data.message || (data.success ? 'Staff synchronized successfully' : data.error),
+        results: data.results,
+      };
     } catch (error: any) {
-      console.error('[MOZZ SMAV Adapter] Provisioning failed:', error);
+      console.error('[MOZZ SMAV Adapter] Synchronization failed:', error);
       return {
         success: false,
-        message: `Failed to reach Central SMAV Auth Gateway: ${error.message}`
+        message: `Failed to reach Central SMAV Edge Function: ${error.message}`,
       };
+    }
+  }
+
+  /**
+   * Batch synchronize all active staff members from MOZZ / Starters4U.
+   */
+  async syncAllStaff(staffList: MozzStaffPayload[]): Promise<CentralAuthResponse> {
+    try {
+      const response = await fetch(this.edgeFunctionUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Business-Source': 'mozz',
+          'X-Integration-Key': this.integrationKey,
+        },
+        body: JSON.stringify({
+          action: 'sync-mozz',
+          staff: staffList.map((st) => ({
+            id: st.externalStaffId,
+            email: st.email.trim().toLowerCase(),
+            name: st.fullName.trim(),
+            phone: st.phone || '',
+            role: st.role || 'CASHIER',
+            username: st.username || st.email.split('@')[0],
+            isActive: st.isActive !== false,
+          })),
+        }),
+      });
+
+      return await response.json();
+    } catch (error: any) {
+      return { success: false, message: error.message };
     }
   }
 
@@ -82,17 +130,20 @@ export class MozzSmavAuthAdapter {
    */
   async setStaffActiveStatus(emailOrUserId: string, isActive: boolean): Promise<CentralAuthResponse> {
     try {
-      const response = await fetch(`${this.centralGatewayUrl}/api/central-auth/staff/status`, {
+      const isEmail = emailOrUserId.includes('@');
+      const response = await fetch(this.edgeFunctionUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-SMAV-Gateway-Secret': this.gatewaySecret
+          'X-Business-Source': 'mozz',
+          'X-Integration-Key': this.integrationKey,
         },
         body: JSON.stringify({
-          email: emailOrUserId,
+          action: 'set-status',
+          ...(isEmail ? { email: emailOrUserId } : { userId: emailOrUserId }),
           outletCode: this.outletCode,
-          isActive
-        })
+          isActive,
+        }),
       });
 
       return await response.json();
@@ -102,56 +153,30 @@ export class MozzSmavAuthAdapter {
   }
 
   /**
-   * Initiate a secure password reset / activation link for a MOZZ restaurant staff member.
+   * Initiate a secure password reset / activation link for a MOZZ staff member.
    */
   async requestPasswordReset(email: string): Promise<CentralAuthResponse> {
     try {
-      const response = await fetch(`${this.centralGatewayUrl}/api/central-auth/staff/reset-password`, {
+      const response = await fetch(this.edgeFunctionUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-SMAV-Gateway-Secret': this.gatewaySecret
+          'X-Business-Source': 'mozz',
+          'X-Integration-Key': this.integrationKey,
         },
         body: JSON.stringify({
+          action: 'reset-password',
           email: email.trim().toLowerCase(),
-          outletCode: this.outletCode
-        })
-      });
-
-      return await response.json();
-    } catch (error: any) {
-      return { success: false, message: error.message };
-    }
-  }
-
-  /**
-   * Controlled migration for legacy staff who exist in MOZZ database
-   * but do not yet have a Central Supabase Auth login.
-   */
-  async migrateLegacyStaff(staff: {
-    externalStaffId: string;
-    email: string;
-    fullName: string;
-    phone?: string;
-  }): Promise<CentralAuthResponse> {
-    try {
-      const response = await fetch(`${this.centralGatewayUrl}/api/central-auth/staff/migrate-legacy`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-SMAV-Gateway-Secret': this.gatewaySecret
-        },
-        body: JSON.stringify({
-          email: staff.email.trim().toLowerCase(),
-          fullName: staff.fullName,
-          phone: staff.phone || '',
           outletCode: this.outletCode,
-          businessSource: 'mozz',
-          externalStaffId: staff.externalStaffId
-        })
+        }),
       });
 
-      return await response.json();
+      const data = await response.json();
+      return {
+        success: data.success,
+        message: data.message || data.error,
+        recoveryLink: data.recoveryLink,
+      };
     } catch (error: any) {
       return { success: false, message: error.message };
     }
