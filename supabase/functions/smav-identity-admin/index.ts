@@ -648,25 +648,38 @@ Deno.serve(async (req: Request) => {
 
           const { smavRole, title } = mapPortalRoleToSmav(rawRole, 'glossylooks');
 
-          // 1. Find or create in Auth
-          let user = await findAuthUser({ email });
-          let isNewUser = false;
-
+          // Resolve a stable external staff ID before email. Never provision Auth users
+          // during background sync: email changes must not create duplicate identities.
+          const externalKey = String(externalStaffId || '').trim();
+          if (!externalKey) {
+            syncResults.push({ email, status: 'error', error: 'Stable external staff ID required; no account created' });
+            continue;
+          }
+          const { data: mapped, error: mapError } = await supabaseAdmin
+            .from('smav_external_identities')
+            .select('auth_user_id')
+            .eq('source', 'glossylooks')
+            .eq('external_id', externalKey)
+            .maybeSingle();
+          if (mapError) {
+            syncResults.push({ email, status: 'error', error: 'Identity lookup failed; no account created' });
+            continue;
+          }
+          let user = mapped?.auth_user_id
+            ? await findAuthUser({ id: String(mapped.auth_user_id) })
+            : await findAuthUser({ email });
+          const isNewUser = false;
           if (!user) {
-            isNewUser = true;
-            const tempPassword = `Glossy@${crypto.randomUUID().substring(0, 8)}!`;
-            const { data: created, error: createErr } = await supabaseAdmin.auth.admin.createUser({
-              email,
-              password: tempPassword,
-              email_confirm: true,
-              user_metadata: { full_name: name, external_role: rawRole, source: 'glossylooks' },
-            });
-            if (!createErr && created?.user) {
-              user = created.user;
-            } else {
-              syncResults.push({ email, status: 'error', error: createErr?.message || 'Auth creation failed' });
-              continue;
-            }
+            syncResults.push({ email, status: 'error', error: 'No matching central account. Provision explicitly through authorized create-staff; no account created' });
+            continue;
+          }
+          if (mapped && user.id !== mapped.auth_user_id) {
+            syncResults.push({ email, status: 'error', error: 'Identity mapping is invalid; administrator review required' });
+            continue;
+          }
+          if (String(user.email || '').trim().toLowerCase() !== email) {
+            syncResults.push({ email, status: 'error', error: 'Email differs from linked central identity. Use authorized update-email on the existing UUID; no account created' });
+            continue;
           }
 
           // 2. Requirement 4: Protect existing SUPERADMIN profile from being overwritten
@@ -703,7 +716,8 @@ Deno.serve(async (req: Request) => {
             const identError = await saveExternalIdentity('glossylooks', String(externalStaffId || username), user.id, String(username).trim().toLowerCase(), email);
 
             if (identError) {
-              console.warn('[smav-identity-admin] Identity map error:', identError.message);
+              syncResults.push({ email, status: 'error', error: 'Identity mapping failed; administrator review required' });
+              continue;
             }
           }
 
@@ -757,25 +771,38 @@ Deno.serve(async (req: Request) => {
 
           const { smavRole, title } = mapPortalRoleToSmav(rawRole, 'mozz');
 
-          // 1. Find or create in Auth
-          let user = await findAuthUser({ email });
-          let isNewUser = false;
-
+          // Resolve a stable external staff ID before email. Never provision Auth users
+          // during background sync: email changes must not create duplicate identities.
+          const externalKey = String(externalStaffId || '').trim();
+          if (!externalKey) {
+            syncResults.push({ email, status: 'error', error: 'Stable external staff ID required; no account created' });
+            continue;
+          }
+          const { data: mapped, error: mapError } = await supabaseAdmin
+            .from('smav_external_identities')
+            .select('auth_user_id')
+            .eq('source', 'mozz')
+            .eq('external_id', externalKey)
+            .maybeSingle();
+          if (mapError) {
+            syncResults.push({ email, status: 'error', error: 'Identity lookup failed; no account created' });
+            continue;
+          }
+          let user = mapped?.auth_user_id
+            ? await findAuthUser({ id: String(mapped.auth_user_id) })
+            : await findAuthUser({ email });
+          const isNewUser = false;
           if (!user) {
-            isNewUser = true;
-            const tempPassword = `Mozz@${crypto.randomUUID().substring(0, 8)}!`;
-            const { data: created, error: createErr } = await supabaseAdmin.auth.admin.createUser({
-              email,
-              password: tempPassword,
-              email_confirm: true,
-              user_metadata: { full_name: name, external_role: rawRole, source: 'mozz' },
-            });
-            if (!createErr && created?.user) {
-              user = created.user;
-            } else {
-              syncResults.push({ email, status: 'error', error: createErr?.message || 'Auth creation failed' });
-              continue;
-            }
+            syncResults.push({ email, status: 'error', error: 'No matching central account. Provision explicitly through authorized create-staff; no account created' });
+            continue;
+          }
+          if (mapped && user.id !== mapped.auth_user_id) {
+            syncResults.push({ email, status: 'error', error: 'Identity mapping is invalid; administrator review required' });
+            continue;
+          }
+          if (String(user.email || '').trim().toLowerCase() !== email) {
+            syncResults.push({ email, status: 'error', error: 'Email differs from linked central identity. Use authorized update-email on the existing UUID; no account created' });
+            continue;
           }
 
           // 2. Requirement 4: Protect existing SUPERADMIN profile from being overwritten
@@ -812,7 +839,8 @@ Deno.serve(async (req: Request) => {
             const identError = await saveExternalIdentity('mozz', String(externalStaffId || username), user.id, String(username).trim().toLowerCase(), email);
 
             if (identError) {
-              console.warn('[smav-identity-admin] Identity map error:', identError.message);
+              syncResults.push({ email, status: 'error', error: 'Identity mapping failed; administrator review required' });
+              continue;
             }
           }
 
