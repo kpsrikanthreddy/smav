@@ -81,7 +81,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!emailOrId.trim() || !password.trim()) {
-      setErrorMessage('Please enter both email/user ID and password.');
+      setErrorMessage('Please enter both email address and password.');
       setErrorDetails(null);
       return;
     }
@@ -118,7 +118,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       }
 
       if (data.multiBusiness && data.availableOutlets) {
-        onMultiBusinessFound(data.availableOutlets, data.tempToken || '', data.availableOutlets[0]?.outletId || '');
+        onMultiBusinessFound(data.availableOutlets, data.tempToken || '', data.userId || data.session?.userId || '');
         setIsLoading(false);
         return;
       }
@@ -314,16 +314,17 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
 
         {/* Login Form */}
         <form onSubmit={handleSubmit} className="space-y-4">
-          {/* Field 1: Email Address / User ID */}
+          {/* Field 1: Email Address (Email login first) */}
           <div>
             <label className="text-xs font-semibold text-slate-300 mb-1.5 block">
-              Email Address / User ID
+              Email Address
             </label>
             <input
-              type="text"
+              type="email"
               value={emailOrId}
               onChange={(e) => setEmailOrId(e.target.value)}
-              placeholder="Enter registered email or user ID"
+              placeholder="name@company.com"
+              autoComplete="email"
               required
               autoFocus
               className="w-full rounded-xl bg-[#161a33]/90 border border-[#2a3055] text-white placeholder-slate-500 px-4 py-3 text-sm focus:outline-none focus:border-[#ff3b80] focus:ring-1 focus:ring-[#ff3b80]/40 transition"

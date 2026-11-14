@@ -66,8 +66,8 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
   const [billSaveError, setBillSaveError] = useState<string | null>(null);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [salonCart, setSalonCart] = useState<SalonCartItem[]>([]);
-  const [customerName, setCustomerName] = useState('Ananya Sharma');
-  const [customerPhone, setCustomerPhone] = useState('9848011223');
+  const [customerName, setCustomerName] = useState('');
+  const [customerPhone, setCustomerPhone] = useState('');
   const [paymentMode, setPaymentMode] = useState('upi');
 
   // Restaurant Data
@@ -146,20 +146,8 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
           } else if (data.category === 'restaurant') {
             setRestaurantMenu(data.menu || []);
             setRestaurantTables(data.tables || []);
-            if (data.menu && data.menu.length >= 2 && restaurantCart.length === 0) {
-              setRestaurantCart([
-                { item: data.menu[0], variantName: 'Regular Portion', unitPrice: data.menu[0].basePrice, quantity: 2, notes: 'Medium spicy', addedPrice: data.menu[0].basePrice, addedRevision: data.menu[0].revision },
-                { item: data.menu[1], variantName: 'Regular Portion', unitPrice: data.menu[1].basePrice, quantity: 1, notes: 'Extra crispy', addedPrice: data.menu[1].basePrice, addedRevision: data.menu[1].revision }
-              ]);
-            }
           } else {
             setRetailProducts(data.products || []);
-            if (data.products && data.products.length >= 2 && retailCart.length === 0) {
-              setRetailCart([
-                { product: data.products[0], quantity: 1, discountPercent: 5, addedPrice: data.products[0].price, addedRevision: data.products[0].revision },
-                { product: data.products[1], quantity: 1, discountPercent: 0, addedPrice: data.products[1].price, addedRevision: data.products[1].revision }
-              ]);
-            }
           }
         }
       } catch (e) {
@@ -289,7 +277,10 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
     if (isOnline) {
       fetch('/api/mobile/sync/orders', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.token}`
+        },
         body: JSON.stringify({
           orders: [{ order: { ...order, orderNumber, tokenNumber, outletId: session.activeOutlet.id }, items: order.items, idempotency_key: `IDEM_${orderNumber}` }]
         })
@@ -504,6 +495,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                         type="text"
                         value={customerName}
                         onChange={e => setCustomerName(e.target.value)}
+                        placeholder="Walk-in Customer"
                         className="w-full bg-[#161a33] border border-[#2a3055] rounded-xl px-3 py-2 text-white"
                       />
                     </div>
@@ -513,6 +505,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                         type="text"
                         value={customerPhone}
                         onChange={e => setCustomerPhone(e.target.value)}
+                        placeholder="Optional mobile number"
                         className="w-full bg-[#161a33] border border-[#2a3055] rounded-xl px-3 py-2 text-white"
                       />
                     </div>

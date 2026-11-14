@@ -122,29 +122,25 @@ Abstracted backend interfaces in `server/interfaces.ts`:
 - `POST /api/mobile/sync/orders`: Offline order synchronization with idempotency checks
 - `GET /api/realtime/catalog-events`: Server-Sent Events stream for instant invalidation
 
-### 5. Automated Tests API
-- `GET /api/tests/run`: Executes test suite verifying login, routing, password rejection, tenant isolation, and reset lifecycle.
-
----
-
 ## 🗃️ Database SQL Migrations
 
-Located in `database/migrations/`:
-1. `001_smav_print_agent.sql`: Core tables, devices, bills, orders, print jobs.
-2. `002_multi_tenant_auth_permissions.sql`: Staff credentials, business memberships, appointments, tables.
-3. `003_unified_catalog_sync.sql`: Monotonic catalog revision sequence, Realtime publications.
-4. `004_central_smav_auth_gateway.sql`: Central outlet registry (`smav_outlet_registry`), central identity directory (`smav_identity_directory`), password reset tokens, security audit logs (`smav_audit_logs`), and RLS policies.
+Active migrations located in `database/migrations/`:
+- `001`–`009`, `glossylooks_central_auth_link.sql`, `mozz_central_auth_link.sql`: Core POS, multi-tenant auth, catalog sync, RBAC, and portal links.
+- `011_phase1_central_login_roles_rls.sql`: Phase 1 Central Login, 3 visible roles (`SUPERADMIN`, `ADMIN`, `POS_BILLING`), non-recursive RLS, and `smav_external_identities` access policies.
+- `archive/`: Archived unapplied scripts (`004_central_smav_auth_gateway.sql`, `010_central_edge_identity_and_sync.sql`).
 
 ---
 
-## 📱 Android Native Integration
+## 📱 Print Agents Integration
 
-The native Android app under `android/app/` features:
-- Jetpack Compose implementation of the dark navy login card matching `/public/assets/aistudio/image_30ae1713.png`.
+The native Android app under `agents/android/app/` features:
+- Jetpack Compose implementation of the dark navy login card.
 - Role-based navigation to Superadmin, Admin, or POS screens.
 - Offline Room SQLite database and WorkManager background sync.
 - Bluetooth ESC/POS printer manager with 58mm and 80mm column width formatting.
-- Downloadable directly from the Web UI via `Download Android Project (.ZIP)`.
+- Downloadable directly from the Web UI via `Download Android App (.ZIP)`.
+
+Windows ESC/POS agent workspace placeholder is located under `agents/windows/`.
 
 ---
 

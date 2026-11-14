@@ -53,14 +53,15 @@ supabase functions deploy smav-identity-admin --no-verify-jwt
 
 ## 3. Database Migration Deployment
 
-Open your **Central SMAV Supabase Dashboard → SQL Editor** (`https://qykdwswatopylzvqhgog.supabase.co`) and run the additive migration:
+Open your **Central SMAV Supabase Dashboard → SQL Editor** (`https://qykdwswatopylzvqhgog.supabase.co`) and run the additive Phase 1 migration:
 
-* **File**: `database/migrations/010_central_edge_identity_and_sync.sql`
+* **File**: `database/migrations/011_phase1_central_login_roles_rls.sql`
 
-This migration creates:
-1. `public.smav_external_identities`: Maps usernames, external staff IDs, and business sources to central Auth accounts without exposing directory lists.
-2. Row Level Security policies guaranteeing tenant boundary isolation.
-3. Fast indexes on `(username, source)`, `email`, and `external_staff_id`.
+This migration enforces:
+1. Non-recursive `SECURITY DEFINER` RLS helper functions across `smav_profiles`, `smav_outlets`, `smav_user_outlet_roles`, `smav_devices`, `smav_audit_logs`, `smav_salon_bills`, and `smav_external_identities`.
+2. Strict `STAFF`-only management by outlet `ADMIN`s (`SUPERADMIN`-exclusive `ADMIN` grant/revoke).
+3. Trusted `service_role`-only writes to `smav_audit_logs`.
+*(Obsolete unapplied scripts `004_central_smav_auth_gateway.sql` and `010_central_edge_identity_and_sync.sql` have been moved to `database/migrations/archive/`.)*
 
 ---
 

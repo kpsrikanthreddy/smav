@@ -15,7 +15,7 @@ import {
   Trash2,
   SlidersHorizontal
 } from 'lucide-react';
-import { UserSession } from '../types';
+import { UserSession, getVisibleRole } from '../types';
 import { identityAdminService } from '../services/identityAdminService';
 
 interface AdminDashboardProps {
@@ -60,12 +60,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const fetchAdminData = async () => {
     try {
       const headers = { Authorization: `Bearer ${session.token}` };
+      let loadedFromEdge = false;
 
       // If user has Supabase token, list staff via Edge Function or backend
       if (session.supabaseToken) {
         const edgeStaff = await identityAdminService.listStaff(session.supabaseToken, session.activeOutlet.code);
         if (edgeStaff.success && Array.isArray(edgeStaff.staff)) {
           setStaffList(edgeStaff.staff);
+          loadedFromEdge = true;
         }
       }
 
@@ -74,24 +76,24 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         fetch('/api/admin/reports', { headers }).then(r => r.json()).catch(() => null)
       ]);
 
-      if (staffRes.staff && (!session.supabaseToken || staffList.length === 0)) {
+      if (staffRes.staff && !loadedFromEdge) {
         setStaffList(staffRes.staff);
       }
-      if (repRes) setReports(repRes);
+      if (repRes && repRes.success !== false) setReports(repRes);
 
-      // Fetch catalog
+      // Fetch catalog (requires authenticated headers)
       if (session.activeOutlet.category === 'salon') {
-        const srvRes = await fetch('/api/salon/services');
+        const srvRes = await fetch('/api/salon/services', { headers });
         const srvData = await srvRes.json();
-        setCatalogItems(srvData.services || []);
+        if (srvRes.ok) setCatalogItems(srvData.services || []);
       } else if (session.activeOutlet.category === 'restaurant') {
-        const menuRes = await fetch('/api/restaurant/menu');
+        const menuRes = await fetch('/api/restaurant/menu', { headers });
         const menuData = await menuRes.json();
-        setCatalogItems(menuData.menu || []);
+        if (menuRes.ok) setCatalogItems(menuData.menu || []);
       } else {
-        const syncRes = await fetch(`/api/catalog/sync?business_id=${session.activeOutlet.id}`);
+        const syncRes = await fetch(`/api/catalog/sync?business_id=${session.activeOutlet.id}`, { headers });
         const syncData = await syncRes.json();
-        setCatalogItems(syncData.changes || []);
+        if (syncRes.ok) setCatalogItems(syncData.changes || []);
       }
     } catch (e) {
       console.error(e);
@@ -210,15 +212,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   const handleToggleStaffStatus = async (staffId: string, currentActive: boolean) => {
     setIsActionLoading(true);
+    setActionError(null);
     try {
       if (session.supabaseToken) {
-        await identityAdminService.setStaffStatus(session.supabaseToken, {
+        const res = await identityAdminService.setStaffStatus(session.supabaseToken, {
           userId: staffId,
           outletCode: session.activeOutlet.code,
           isActive: !currentActive
         });
+        if (!res.success) {
+          setActionError(res.error || 'Failed to update staff status.');
+          return;
+        }
       } else {
-        await fetch(`/api/admin/staff/${staffId}/status`, {
+        const res = await fetch(`/api/admin/staff/${staffId}/status`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -226,10 +233,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           },
           body: JSON.stringify({ isActive: !currentActive })
         });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.success === false) {
+          setActionError(data.message || 'Failed to update staff status.');
+          return;
+        }
       }
       fetchAdminData();
     } catch (e: any) {
-      console.error(e);
+      setActionError(e.message || 'Failed to update staff status.');
     } finally {
       setIsActionLoading(false);
     }
@@ -327,13 +339,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       {activeTab === 'staff' && (
         <div className="space-y-4">
           <div className="flex items-center justify-between">
-            <h3 className="text-sm font-bold text-white">Staff Members for {session.activeOutlet.name}</h3>
+            <h3 className="text-sm font-bold text-white">POS Billing & Outlet Users for {session.activeOutlet.name}</h3>
             <button
               onClick={() => setIsAddStaffOpen(true)}
               className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-pink-600 hover:bg-pink-500 text-white text-xs font-semibold shadow transition"
             >
               <UserPlus className="w-3.5 h-3.5" />
-              + Add Staff Member
+              + Add POS_BILLING User
             </button>
           </div>
 
@@ -377,8 +389,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       {staff.phone && <div className="text-slate-500 text-[10px]">{staff.phone}</div>}
                     </td>
                     <td className="p-4">
-                      <span className="font-semibold text-slate-200 capitalize">
-                        {staff.memberships?.[0]?.specificTitle || staff.role}
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider border ${
+                        getVisibleRole(staff.displayRole || staff.role) === 'ADMIN'
+                          ? 'bg-sky-500/15 text-sky-300 border-sky-500/30'
+                          : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                      }`}>
+                        {getVisibleRole(staff.displayRole || staff.role)}
                       </span>
                     </td>
                     <td className="p-4">
@@ -594,7 +610,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-[#121629] border border-[#1e2540] rounded-2xl p-6 max-w-md w-full shadow-2xl space-y-4">
             <div className="flex items-center justify-between pb-2 border-b border-slate-800">
-              <h3 className="text-base font-bold text-white">Add Outlet Staff Member</h3>
+              <h3 className="text-base font-bold text-white">Add POS_BILLING User</h3>
               <button onClick={() => setIsAddStaffOpen(false)} className="text-slate-400 hover:text-white">✕</button>
             </div>
 

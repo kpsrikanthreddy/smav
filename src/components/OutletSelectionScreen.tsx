@@ -1,16 +1,17 @@
 import React from 'react';
 import { Scissors, Utensils, ShoppingBag, Building2, ArrowRight, ShieldCheck, LogOut } from 'lucide-react';
-import { UserOutletMembership, UserSession } from '../types';
+import { UserOutletMembership, getVisibleRole } from '../types';
 
 interface OutletSelectionScreenProps {
   availableOutlets: UserOutletMembership[];
   tempToken: string;
-  onSelectOutlet: (outletId: string) => void;
+  onSelectOutlet: (outletId: string, tempToken: string) => void;
   onLogout: () => void;
 }
 
 export const OutletSelectionScreen: React.FC<OutletSelectionScreenProps> = ({
   availableOutlets,
+  tempToken,
   onSelectOutlet,
   onLogout
 }) => {
@@ -73,7 +74,7 @@ export const OutletSelectionScreen: React.FC<OutletSelectionScreenProps> = ({
           {availableOutlets.map((outlet) => (
             <div
               key={outlet.outletId}
-              onClick={() => onSelectOutlet(outlet.outletId)}
+              onClick={() => onSelectOutlet(outlet.outletId, tempToken)}
               className={`p-4 rounded-2xl border transition-all cursor-pointer flex items-center justify-between gap-4 group ${getCategoryTheme(outlet.outletCategory)}`}
             >
               <div className="flex items-center gap-3.5">
@@ -90,7 +91,7 @@ export const OutletSelectionScreen: React.FC<OutletSelectionScreenProps> = ({
                     </span>
                   </div>
                   <p className="text-xs text-slate-400 mt-0.5">
-                    Role: <span className="text-white font-medium capitalize">{outlet.specificTitle || outlet.role}</span>
+                    Role: <span className="text-white font-semibold">{getVisibleRole(outlet.displayRole || outlet.role)}</span>
                     {outlet.isPrimary && <span className="ml-2 text-sky-400 font-semibold">• Primary</span>}
                   </p>
                 </div>

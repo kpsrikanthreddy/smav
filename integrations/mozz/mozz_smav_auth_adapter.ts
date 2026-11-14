@@ -10,7 +10,7 @@
  * Operational rules:
  * 1. Plaintext passwords are NEVER stored in MOZZ database or transmitted insecurely.
  * 2. If a staff user already exists in Central Auth, their identity is linked without duplicate accounts.
- * 3. MOZZ staff are strictly assigned to outlet_mozz_gach and restaurant POS.
+ * 3. MOZZ staff are strictly assigned to the active outlet resolved from central smav_outlets using outlet code mozz and restaurant POS.
  * 4. Never exposes or requires Supabase service_role keys in client bundles.
  */
 

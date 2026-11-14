@@ -1,5 +1,13 @@
 export type UserRole = 'superadmin' | 'admin' | 'staff';
+export type VisibleRole = 'SUPERADMIN' | 'ADMIN' | 'POS_BILLING';
 export type BusinessCategory = 'restaurant' | 'salon' | 'retail' | 'other';
+
+export function getVisibleRole(role?: string): VisibleRole {
+  const r = (role || '').trim().toLowerCase();
+  if (r === 'superadmin') return 'SUPERADMIN';
+  if (r === 'admin' || r === 'owner' || r === 'manager') return 'ADMIN';
+  return 'POS_BILLING';
+}
 
 export interface Outlet {
   id: string;
@@ -24,6 +32,7 @@ export interface UserOutletMembership {
   outletName: string;
   outletCategory: BusinessCategory;
   role: UserRole;
+  displayRole?: VisibleRole;
   specificTitle?: string;
   permissions: string[];
   isPrimary: boolean;
@@ -35,7 +44,9 @@ export interface UserSession {
   email: string;
   fullName: string;
   role: UserRole;
+  displayRole?: VisibleRole;
   activeOutlet: Outlet;
+  assignedOutlets?: UserOutletMembership[];
   specificTitle: string;
   permissions: string[];
   deviceId: string;
@@ -210,10 +221,4 @@ export interface AuditLogEntry {
   ipAddress?: string;
   details: Record<string, any>;
   timestamp: string;
-}
-
-export interface TestResultItem {
-  test: string;
-  status: 'PASSED' | 'FAILED';
-  details: string;
 }

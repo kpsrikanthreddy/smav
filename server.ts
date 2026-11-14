@@ -22,7 +22,22 @@ app.use(express.urlencoded({ extended: true }));
 // Interfaces & Core Types for Database Independence (Item 8)
 // -------------------------------------------------------------------------------------------------
 export type UserRole = 'superadmin' | 'admin' | 'staff';
+export type VisibleRole = 'SUPERADMIN' | 'ADMIN' | 'POS_BILLING';
 export type BusinessCategory = 'restaurant' | 'salon' | 'retail' | 'other';
+
+export function displayRoleFor(role: UserRole): VisibleRole {
+  if (role === 'superadmin') return 'SUPERADMIN';
+  if (role === 'admin') return 'ADMIN';
+  return 'POS_BILLING';
+}
+
+export function permissionsForRole(role: UserRole): string[] {
+  if (role === 'superadmin') return ['*'];
+  if (role === 'admin') {
+    return ['outlet:view_assigned', 'pos:manage_staff', 'catalog:manage', 'reports:view', 'pos:create_bill', 'pos:print_receipt'];
+  }
+  return ['outlet:view_assigned', 'pos:create_bill', 'pos:print_receipt'];
+}
 
 export interface Outlet {
   id: string;
@@ -48,6 +63,7 @@ export interface UserOutletMembership {
   outletName: string;
   outletCategory: BusinessCategory;
   role: UserRole;
+  displayRole?: VisibleRole;
   specificTitle?: string;
   permissions: string[];
   isPrimary: boolean;
@@ -75,7 +91,9 @@ export interface UserSession {
   email: string;
   fullName: string;
   role: UserRole;
+  displayRole?: VisibleRole;
   activeOutlet: Outlet;
+  assignedOutlets?: UserOutletMembership[];
   specificTitle: string;
   permissions: string[];
   deviceId: string;
@@ -657,6 +675,18 @@ export class CentralUserRepository implements IUserRepository {
     user.isLegacyMigrationRequired = false;
     return true;
   }
+
+  public async removeOutletMembership(userId: string, outletId: string): Promise<boolean> {
+    const user = this.users.find(u => u.id === userId);
+    if (!user) return false;
+    const beforeLen = user.memberships.length;
+    user.memberships = user.memberships.filter(m => m.outletId !== outletId);
+    if (user.memberships.length === beforeLen) return false;
+    if (user.memberships.length === 0) {
+      user.isActive = false;
+    }
+    return true;
+  }
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -786,6 +816,46 @@ export function getCentralSupabaseClient(accessToken?: string) {
   });
 }
 
+/**
+ * Server-only privileged client for trusted backend audit writes.
+ * Never exposed to browsers or passed to untrusted callers.
+ */
+export function getCentralSupabaseServiceClient() {
+  const serviceKey = (process.env.SMAV_SERVICE_ROLE_KEY || '').trim();
+  if (!centralSupabaseConfig.isConfigured || !serviceKey) return null;
+  return createClient(centralSupabaseConfig.projectUrl, serviceKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false
+    }
+  });
+}
+
+export async function writeTrustedServerAuditLog(params: {
+  userId?: string;
+  userEmail?: string;
+  outletId?: string | null;
+  action: string;
+  entityType: string;
+  entityId: string;
+  details?: Record<string, any>;
+}) {
+  try {
+    const serviceDb = getCentralSupabaseServiceClient();
+    if (!serviceDb) return;
+    await serviceDb.from('smav_audit_logs').insert({
+      user_id: params.userId || 'system',
+      user_email: params.userEmail || 'system@smav.local',
+      outlet_id: params.outletId ?? null,
+      action: params.action,
+      entity_type: params.entityType,
+      entity_id: params.entityId,
+      details: params.details || {},
+      timestamp: new Date().toISOString()
+    });
+  } catch (_e) {}
+}
+
 // -------------------------------------------------------------------------------------------------
 // Central SMAV Authentication Gateway (Item 2)
 // -------------------------------------------------------------------------------------------------
@@ -804,6 +874,16 @@ export class SmavAuthGateway implements IAuthProvider {
   private userRepo: CentralUserRepository;
   private activeSessions = new Map<string, UserSession>();
   private resetTokens = new Map<string, PasswordResetTokenRecord>();
+  private pendingAuthSelections = new Map<string, {
+    userId: string;
+    email: string;
+    fullName: string;
+    platformRole: string;
+    supabaseToken: string;
+    memberships: UserOutletMembership[];
+    outlets: Outlet[];
+    expiresAt: number;
+  }>();
 
   constructor(outletRepo: CentralOutletRepository, userRepo: CentralUserRepository) {
     this.outletRepo = outletRepo;
@@ -838,7 +918,7 @@ export class SmavAuthGateway implements IAuthProvider {
     let targetOutlet: Outlet | null = null;
     let resolvedProvider = 'central_smav';
 
-    if (outletCode && outletCode.trim()) {
+    if (!centralSupabaseConfig.isConfigured && outletCode && outletCode.trim()) {
       targetOutlet = await this.outletRepo.getOutletByCode(outletCode.trim());
       if (!targetOutlet) {
         loginRateLimiter.recordAttempt(rateLimitKey, false);
@@ -856,16 +936,21 @@ export class SmavAuthGateway implements IAuthProvider {
       resolvedProvider = targetOutlet.providerType;
     }
 
-    // Resolve business username server-side; no directory lookup exposed to anon clients.
+    // Email login first: only resolve username if input has no '@' and service-role key is present.
     let centralLoginEmail = emailOrId.trim();
     if (!centralLoginEmail.includes('@') && process.env.SMAV_SERVICE_ROLE_KEY && centralSupabaseConfig.projectUrl) {
-      const lookup = await fetch(`${centralSupabaseConfig.projectUrl}/rest/v1/smav_external_identities?username=eq.${encodeURIComponent(centralLoginEmail)}&select=email,source`, {
-        headers: { apikey: process.env.SMAV_SERVICE_ROLE_KEY, Authorization: `Bearer ${process.env.SMAV_SERVICE_ROLE_KEY}` }
-      });
-      if (lookup.ok) {
-        const identities: any[] = await lookup.json();
-        const matched = outletCode ? identities.find(i => i.source === outletCode) : identities.length === 1 ? identities[0] : null;
-        if (matched) centralLoginEmail = matched.email;
+      try {
+        const lookup = await fetch(`${centralSupabaseConfig.projectUrl}/rest/v1/smav_external_identities?username=eq.${encodeURIComponent(centralLoginEmail)}&select=email,source`, {
+          headers: { apikey: process.env.SMAV_SERVICE_ROLE_KEY, Authorization: `Bearer ${process.env.SMAV_SERVICE_ROLE_KEY}` },
+          signal: AbortSignal.timeout(2500)
+        });
+        if (lookup.ok) {
+          const identities: any[] = await lookup.json();
+          const matched = outletCode ? identities.find(i => i.source === outletCode) : identities.length === 1 ? identities[0] : null;
+          if (matched?.email) centralLoginEmail = matched.email;
+        }
+      } catch (_lookupErr) {
+        // Non-blocking fallback; Supabase Auth requires valid email
       }
     }
 
@@ -905,60 +990,80 @@ export class SmavAuthGateway implements IAuthProvider {
               };
             }
 
-            // Requirement 4: Verify platform_role = SUPERADMIN and is_active = true
-            const isActive = profile.is_active === true || profile.isActive === true;
+            const userEmail = authData.user.email || centralLoginEmail;
+            const userPhone = (authData.user.user_metadata?.phone as string) || '';
+
+            // Verify is_active = true
+            const isActive = profile.is_active === true;
             if (!isActive) {
               loginRateLimiter.recordAttempt(rateLimitKey, false);
               auditLogger.log({
                 eventType: 'LOGIN_DENIED_INACTIVE_PROFILE',
                 actorId: profile.id,
-                actorEmail: profile.email || authData.user.email,
+                actorEmail: userEmail,
                 ipAddress: clientIp,
                 details: { reason: 'is_active is false in smav_profiles' }
               });
               return {
                 success: false,
-                message: 'Your Superadmin account is currently deactivated (is_active = false). Please contact platform operations.'
+                message: 'Your SMAV account is currently deactivated (is_active = false). Please contact your administrator.'
               };
             }
 
-            const platformRole = (profile.platform_role || profile.role || '').toUpperCase();
+            const platformRole = String(profile.platform_role || 'USER').toUpperCase();
             if (platformRole === 'SUPERADMIN') {
               loginRateLimiter.recordAttempt(rateLimitKey, true);
 
-              // Pull registered outlets from central smav_outlets table if populated
+              // Pull all active outlets from central smav_outlets table (Superadmin sees all)
+              let allActiveMemberships: UserOutletMembership[] = [];
               try {
-                const { data: remoteOutlets } = await authedSupabase!.from('smav_outlets').select('*');
-                if (remoteOutlets && Array.isArray(remoteOutlets) && remoteOutlets.length > 0) {
+                const { data: remoteOutlets } = await authedSupabase!
+                  .from('smav_outlets')
+                  .select('*')
+                  .eq('is_active', true)
+                  .order('created_at');
+                if (remoteOutlets && Array.isArray(remoteOutlets)) {
                   for (const ro of remoteOutlets) {
-                    await this.outletRepo.upsertRemoteOutlet(ro);
+                    const mappedOutlet = await this.outletRepo.upsertRemoteOutlet(ro);
+                    allActiveMemberships.push({
+                      outletId: mappedOutlet.id,
+                      outletCode: mappedOutlet.code,
+                      outletName: mappedOutlet.name,
+                      outletCategory: mappedOutlet.category,
+                      role: 'superadmin',
+                      displayRole: 'SUPERADMIN',
+                      specificTitle: 'Superadministrator',
+                      permissions: ['*'],
+                      isPrimary: false
+                    });
                   }
                 }
               } catch (_e) {}
 
+              const centralMembership: UserOutletMembership = {
+                outletId: 'all',
+                outletCode: 'smav_central',
+                outletName: 'Central SMAV Enterprise Network',
+                outletCategory: 'other',
+                role: 'superadmin',
+                displayRole: 'SUPERADMIN',
+                specificTitle: 'Superadministrator',
+                permissions: ['*'],
+                isPrimary: true
+              };
+
               const superadminUser: UserAccount = {
                 id: profile.id,
-                email: profile.email || authData.user.email || emailOrId,
-                username: profile.username || 'superadmin',
-                fullName: profile.full_name || profile.name || 'SMAV Central Superadmin',
-                phone: profile.phone || '',
+                email: userEmail,
+                username: (authData.user.user_metadata?.username as string) || userEmail.split('@')[0] || 'superadmin',
+                fullName: profile.full_name || 'SMAV Central Superadmin',
+                phone: userPhone,
                 passwordHash: '',
                 salt: '',
                 role: 'superadmin',
                 isActive: true,
                 createdAt: profile.created_at || new Date().toISOString(),
-                memberships: [
-                  {
-                    outletId: 'all',
-                    outletCode: 'smav_central',
-                    outletName: 'Central SMAV Enterprise Network',
-                    outletCategory: 'other',
-                    role: 'superadmin',
-                    specificTitle: 'Superadministrator',
-                    permissions: ['*'],
-                    isPrimary: true
-                  }
-                ]
+                memberships: [centralMembership, ...allActiveMemberships]
               };
 
               const superadminOutlet: Outlet = {
@@ -987,108 +1092,209 @@ export class SmavAuthGateway implements IAuthProvider {
                 'SUPERADMIN'
               );
 
-              // Write security audit event to central Supabase smav_audit_logs table
-              try {
-                await authedSupabase!.from('smav_audit_logs').insert({
-                  user_id: authData.user.id,
-                  user_email: authData.user.email,
-                  action: 'LOGIN_SUCCESS',
-                  entity_type: 'AUTH_SESSION',
-                  entity_id: session.token,
-                  details: {
-                    platform_role: 'SUPERADMIN',
-                    provider: 'central_smav_supabase',
-                    ip: clientIp
-                  }
-                });
-              } catch (_e) {}
+              await writeTrustedServerAuditLog({
+                userId: authData.user.id,
+                userEmail,
+                action: 'LOGIN_SUCCESS',
+                entityType: 'AUTH_SESSION',
+                entityId: session.token,
+                details: {
+                  platform_role: 'SUPERADMIN',
+                  provider: 'central_smav_supabase',
+                  ip: clientIp
+                }
+              });
 
               auditLogger.log({
                 eventType: 'LOGIN_SUCCESS_SUPERADMIN_SUPABASE',
                 actorId: authData.user.id,
-                actorEmail: authData.user.email,
+                actorEmail: userEmail,
                 ipAddress: clientIp,
                 details: { role: 'SUPERADMIN', provider: 'central_supabase' }
               });
 
-              // Requirement 5: Redirect Superadmin to the All Outlets Dashboard
               return {
                 success: true,
                 session,
                 redirectTo: '/superadmin/outlets'
               };
-            } else if (['ADMIN', 'STAFF', 'OUTLET_USER', 'USER'].includes(platformRole)) {
-              const { data: memberships, error: membershipError } = await authedSupabase!.from('smav_user_outlet_roles')
-                .select('outlet_id,role,is_active').eq('user_id', authData.user.id).eq('is_active', true);
-              if (membershipError || !memberships?.length) return {success:false, message:'No active SMAV outlet assignment for this user.'};
-              const { data: rows, error: outletError } = await authedSupabase!.from('smav_outlets').select('*')
-                .in('id', memberships.map((m:any) => m.outlet_id)).eq('is_active',true);
-              if (outletError || !rows?.length) return {success:false, message:'No active registered outlet is accessible.'};
+            } else if (['USER', 'ADMIN', 'STAFF', 'OUTLET_USER'].includes(platformRole)) {
+              const { data: memberships, error: membershipError } = await authedSupabase!
+                .from('smav_user_outlet_roles')
+                .select('outlet_id, role, is_active, metadata')
+                .eq('user_id', authData.user.id)
+                .eq('is_active', true);
 
-              // If user has multiple outlets and did not provide outletCode, offer selection
-              if (!outletCode && rows.length > 1) {
+              if (membershipError || !memberships?.length) {
+                loginRateLimiter.recordAttempt(rateLimitKey, false);
+                return { success: false, message: 'No active SMAV outlet assignment found for this account.' };
+              }
+
+              const { data: rows, error: outletError } = await authedSupabase!
+                .from('smav_outlets')
+                .select('*')
+                .in('id', memberships.map((m: any) => m.outlet_id))
+                .eq('is_active', true);
+
+              if (outletError || !rows?.length) {
+                loginRateLimiter.recordAttempt(rateLimitKey, false);
+                return { success: false, message: 'No active registered outlet is accessible for this account.' };
+              }
+
+              const authorizedOutlets: Outlet[] = [];
+              const authorizedMemberships: UserOutletMembership[] = [];
+
+              for (const r of rows) {
+                const outlet = outletFromRow(r);
+                await this.outletRepo.upsertRemoteOutlet(r);
+                const m = memberships.find((mem: any) => mem.outlet_id === r.id);
+                if (!m) continue;
+
+                const rawOutletRole = String(m.role || '').toUpperCase();
+                const isOutletAdmin = rawOutletRole
+                  ? ['ADMIN', 'OWNER', 'MANAGER'].includes(rawOutletRole)
+                  : platformRole === 'ADMIN';
+                const outletUserRole: UserRole = isOutletAdmin ? 'admin' : 'staff';
+                const visibleRole = displayRoleFor(outletUserRole);
+                const perms = permissionsForRole(outletUserRole);
+
+                authorizedOutlets.push(outlet);
+                authorizedMemberships.push({
+                  outletId: outlet.id,
+                  outletCode: outlet.code,
+                  outletName: outlet.name,
+                  outletCategory: outlet.category,
+                  role: outletUserRole,
+                  displayRole: visibleRole,
+                  specificTitle: isOutletAdmin ? 'Outlet Administrator' : 'POS Billing',
+                  permissions: perms,
+                  isPrimary: authorizedMemberships.length === 0
+                });
+              }
+
+              if (authorizedOutlets.length === 0) {
+                loginRateLimiter.recordAttempt(rateLimitKey, false);
+                return { success: false, message: 'No active assigned outlets available.' };
+              }
+
+              // If user has multiple outlets and did not specify outletCode, prompt outlet selection
+              if (!outletCode && authorizedOutlets.length > 1) {
+                loginRateLimiter.recordAttempt(rateLimitKey, true);
                 const tempToken = generateSecureToken('smav_temp');
+                this.pendingAuthSelections.set(tempToken, {
+                  userId: profile.id,
+                  email: userEmail,
+                  fullName: profile.full_name || userEmail.split('@')[0],
+                  platformRole,
+                  supabaseToken: authData.session.access_token,
+                  memberships: authorizedMemberships,
+                  outlets: authorizedOutlets,
+                  expiresAt: Date.now() + 10 * 60 * 1000
+                });
+
+                auditLogger.log({
+                  eventType: 'MULTI_OUTLET_SELECTION_PROMPTED',
+                  actorId: profile.id,
+                  actorEmail: userEmail,
+                  ipAddress: clientIp,
+                  details: { authorizedOutletsCount: authorizedOutlets.length }
+                });
+
                 return {
                   success: true,
                   multiBusiness: true,
                   tempToken,
-                  availableOutlets: rows.map((r: any) => {
-                    const m = memberships.find((mem: any) => mem.outlet_id === r.id);
-                    const isMAdmin = ['ADMIN', 'OWNER', 'MANAGER'].includes(String(m?.role || '').toUpperCase());
-                    return {
-                      outletId: r.id,
-                      outletCode: r.outlet_code || r.code || r.branch_code,
-                      outletName: r.outlet_name || r.name,
-                      outletCategory: (r.business_type || r.category || 'other').toLowerCase() as BusinessCategory,
-                      role: (isMAdmin ? 'admin' : 'staff') as UserRole,
-                      permissions: isMAdmin ? ['*'] : ['pos:create_bill', 'pos:print_receipt'],
-                      isPrimary: false
-                    };
-                  }),
+                  availableOutlets: authorizedMemberships,
                   message: 'Multiple authorized outlets found. Select your destination.'
                 };
               }
 
-              const selected = outletCode 
-                ? rows.find((r:any) => (r.outlet_code && r.outlet_code.toLowerCase() === outletCode.toLowerCase()) || 
-                                       (r.code && r.code.toLowerCase() === outletCode.toLowerCase()) || 
-                                       r.id === outletCode) 
-                : (rows.length === 1 ? rows[0] : null);
+              const cleanCode = outletCode?.trim().toLowerCase();
+              const selectedOutlet = cleanCode
+                ? authorizedOutlets.find(o => o.code.toLowerCase() === cleanCode || o.id.toLowerCase() === cleanCode)
+                : authorizedOutlets[0];
 
-              if (!selected) return {success:false, message:'Enter the outlet code to select your assigned business.'};
-              const membership = memberships.find((m:any) => m.outlet_id === selected.id);
-              if (!membership) return {success:false, message:'You are not assigned to this outlet.'};
-              const outlet = outletFromRow(selected);
-              const isOutletAdmin = platformRole === 'ADMIN' || ['ADMIN', 'OWNER', 'MANAGER'].includes(String(membership.role).toUpperCase());
+              if (!selectedOutlet) {
+                loginRateLimiter.recordAttempt(rateLimitKey, false);
+                auditLogger.log({
+                  eventType: 'LOGIN_DENIED_UNAUTHORIZED_OUTLET',
+                  actorId: profile.id,
+                  actorEmail: userEmail,
+                  ipAddress: clientIp,
+                  details: { requestedOutletCode: outletCode }
+                });
+                return {
+                  success: false,
+                  message: `Access denied. You are not assigned to active outlet "${outletCode}".`
+                };
+              }
 
+              const membership = authorizedMemberships.find(m => m.outletId === selectedOutlet.id)!;
               const account: UserAccount = {
-                id:profile.id, email:authData.user.email || centralLoginEmail,
-                username:profile.username || centralLoginEmail, fullName:profile.full_name || 'Staff',
-                phone:profile.phone || '', passwordHash:'', salt:'',
-                role: isOutletAdmin ? 'admin' : 'staff', isActive:true,
-                createdAt:profile.created_at || new Date().toISOString(),
-                memberships:[{outletId:outlet.id,outletCode:outlet.code,outletName:outlet.name,
-                  outletCategory:outlet.category,role:isOutletAdmin ? 'admin' : 'staff',
-                  specificTitle:membership.role,permissions:isOutletAdmin ? ['*'] : ['pos:create_bill'],isPrimary:true}]
+                id: profile.id,
+                email: userEmail,
+                username: (authData.user.user_metadata?.username as string) || userEmail,
+                fullName: profile.full_name || userEmail.split('@')[0],
+                phone: userPhone,
+                passwordHash: '',
+                salt: '',
+                role: membership.role,
+                isActive: true,
+                createdAt: profile.created_at || new Date().toISOString(),
+                memberships: authorizedMemberships
               };
-              const session = this.createSession(account,outlet,membership.role,
-                isOutletAdmin ? ['*'] : ['pos:create_bill'],deviceId,
-                authData.session.access_token,isOutletAdmin ? 'ADMIN' : 'STAFF');
-              loginRateLimiter.recordAttempt(rateLimitKey,true);
-              return {success:true,session,redirectTo:isOutletAdmin ? '/admin/dashboard' : '/pos'};
+
+              const session = this.createSession(
+                account,
+                selectedOutlet,
+                membership.specificTitle || displayRoleFor(membership.role),
+                membership.permissions,
+                deviceId,
+                authData.session.access_token,
+                platformRole
+              );
+              loginRateLimiter.recordAttempt(rateLimitKey, true);
+
+              await writeTrustedServerAuditLog({
+                userId: profile.id,
+                userEmail,
+                outletId: selectedOutlet.id,
+                action: 'LOGIN_SUCCESS',
+                entityType: 'AUTH_SESSION',
+                entityId: session.token,
+                details: {
+                  role: membership.displayRole,
+                  outletCode: selectedOutlet.code,
+                  ip: clientIp
+                }
+              });
+
+              auditLogger.log({
+                eventType: 'LOGIN_SUCCESS',
+                actorId: profile.id,
+                actorEmail: userEmail,
+                outletId: selectedOutlet.id,
+                ipAddress: clientIp,
+                details: { role: membership.displayRole, outletCode: selectedOutlet.code }
+              });
+
+              return {
+                success: true,
+                session,
+                redirectTo: membership.role === 'admin' ? '/admin/dashboard' : '/pos'
+              };
             } else {
-              // Authenticated in Supabase Auth, but not SUPERADMIN
               loginRateLimiter.recordAttempt(rateLimitKey, false);
               auditLogger.log({
-                eventType: 'LOGIN_DENIED_NON_SUPERADMIN',
+                eventType: 'LOGIN_DENIED_UNKNOWN_PLATFORM_ROLE',
                 actorId: profile.id,
-                actorEmail: profile.email || authData.user.email,
+                actorEmail: userEmail,
                 ipAddress: clientIp,
                 details: { detectedRole: platformRole }
               });
               return {
                 success: false,
-                message: `Authorization failed: User "${authData.user.email}" authenticated, but platform_role is "${platformRole}". SUPERADMIN platform_role is required for platform administration.`
+                message: `Authorization failed: User "${userEmail}" has unsupported platform_role "${platformRole}".`
               };
             }
           } else if (authError) {
@@ -1307,10 +1513,79 @@ export class SmavAuthGateway implements IAuthProvider {
     };
   }
 
-  public async selectAuthorizedOutlet(userId: string, outletId: string, deviceId?: string): Promise<AuthResult> {
-    const user = await this.userRepo.getUserById(userId);
+  public async selectAuthorizedOutlet(
+    userIdOrTempToken: string,
+    outletId: string,
+    deviceId?: string,
+    explicitTempToken?: string
+  ): Promise<AuthResult> {
+    const tokenKey =
+      explicitTempToken ||
+      (userIdOrTempToken && userIdOrTempToken.startsWith('smav_temp') ? userIdOrTempToken : '');
+
+    if (tokenKey && this.pendingAuthSelections.has(tokenKey)) {
+      const pending = this.pendingAuthSelections.get(tokenKey)!;
+      if (pending.expiresAt < Date.now()) {
+        this.pendingAuthSelections.delete(tokenKey);
+        return { success: false, message: 'Outlet selection session expired. Please sign in again.' };
+      }
+
+      const membership = pending.memberships.find(m => m.outletId === outletId);
+      const outlet = pending.outlets.find(o => o.id === outletId);
+
+      if (!membership || !outlet || !outlet.isActive) {
+        auditLogger.log({
+          eventType: 'UNAUTHORIZED_OUTLET_SWITCH_ATTEMPT',
+          actorId: pending.userId,
+          actorEmail: pending.email,
+          outletId,
+          details: { attemptedOutletId: outletId }
+        });
+        return { success: false, message: 'Access denied: You are not authorized for this outlet.' };
+      }
+
+      this.pendingAuthSelections.delete(tokenKey);
+
+      const account: UserAccount = {
+        id: pending.userId,
+        email: pending.email,
+        fullName: pending.fullName,
+        passwordHash: '',
+        salt: '',
+        role: membership.role,
+        isActive: true,
+        createdAt: new Date().toISOString(),
+        memberships: pending.memberships
+      };
+
+      const session = this.createSession(
+        account,
+        outlet,
+        membership.specificTitle || displayRoleFor(membership.role),
+        membership.permissions,
+        deviceId,
+        pending.supabaseToken,
+        pending.platformRole
+      );
+
+      auditLogger.log({
+        eventType: 'OUTLET_SESSION_ACTIVATED',
+        actorId: pending.userId,
+        actorEmail: pending.email,
+        outletId: outlet.id,
+        details: { role: membership.displayRole, outletName: outlet.name }
+      });
+
+      return {
+        success: true,
+        session,
+        redirectTo: membership.role === 'admin' ? '/admin/dashboard' : '/pos'
+      };
+    }
+
+    const user = await this.userRepo.getUserById(userIdOrTempToken);
     if (!user) {
-      return { success: false, message: 'User not found' };
+      return { success: false, message: 'Selection session expired or user not found. Please sign in again.' };
     }
 
     const membership = user.memberships.find(m => m.outletId === outletId);
@@ -1330,10 +1605,11 @@ export class SmavAuthGateway implements IAuthProvider {
       return { success: false, message: 'Selected outlet is inactive or does not exist.' };
     }
 
+    const scopedUser: UserAccount = { ...user, role: membership.role };
     const session = this.createSession(
-      user,
+      scopedUser,
       outlet,
-      membership.specificTitle || membership.role,
+      membership.specificTitle || displayRoleFor(membership.role),
       membership.permissions,
       deviceId
     );
@@ -1343,7 +1619,7 @@ export class SmavAuthGateway implements IAuthProvider {
       actorId: user.id,
       actorEmail: user.email,
       outletId: outlet.id,
-      details: { role: membership.role, outletName: outlet.name }
+      details: { role: displayRoleFor(membership.role), outletName: outlet.name }
     });
 
     return {
@@ -1372,7 +1648,9 @@ export class SmavAuthGateway implements IAuthProvider {
       email: user.email,
       fullName: user.fullName,
       role: user.role,
+      displayRole: displayRoleFor(user.role),
       activeOutlet: outlet,
+      assignedOutlets: user.memberships || [],
       specificTitle,
       permissions,
       deviceId: deviceId || 'SMAV-DEV-' + crypto.randomBytes(4).toString('hex').toUpperCase(),
@@ -1404,6 +1682,30 @@ export class SmavAuthGateway implements IAuthProvider {
     if (!session || session.role !== 'superadmin') return null;
     session.activeOutlet = outlet;
     session.specificTitle = 'Superadmin Auditor';
+    return session;
+  }
+
+  public async switchAuthenticatedOutlet(
+    token: string,
+    outlet: Outlet,
+    outletRole: UserRole,
+    assignedOutlets?: UserOutletMembership[]
+  ): Promise<UserSession | null> {
+    const session = await this.validateSession(token);
+    if (!session) return null;
+    session.activeOutlet = outlet;
+    session.role = outletRole;
+    session.displayRole = displayRoleFor(outletRole);
+    session.permissions = permissionsForRole(outletRole);
+    session.specificTitle =
+      outletRole === 'superadmin'
+        ? 'Superadministrator'
+        : outletRole === 'admin'
+        ? 'Outlet Administrator'
+        : 'POS Billing';
+    if (assignedOutlets) {
+      session.assignedOutlets = assignedOutlets;
+    }
     return session;
   }
 
@@ -1876,15 +2178,16 @@ app.post('/api/mobile-auth/login', async (req, res) => {
 });
 
 app.post('/api/auth/select-outlet', async (req, res) => {
-  const { userId, user_id, outletId, outlet_id, deviceId, device_id } = req.body;
-  const targetUserId = userId || user_id;
+  const { tempToken, temp_token, userId, user_id, outletId, outlet_id, deviceId, device_id } = req.body;
+  const targetToken = tempToken || temp_token;
+  const targetUserId = userId || user_id || targetToken;
   const targetOutletId = outletId || outlet_id;
 
-  if (!targetUserId || !targetOutletId) {
-    return res.status(400).json({ success: false, message: 'userId and outletId are required' });
+  if ((!targetToken && !targetUserId) || !targetOutletId) {
+    return res.status(400).json({ success: false, message: 'tempToken (or userId) and outletId are required' });
   }
 
-  const result = await smavGateway.selectAuthorizedOutlet(targetUserId, targetOutletId, deviceId || device_id);
+  const result = await smavGateway.selectAuthorizedOutlet(targetUserId, targetOutletId, deviceId || device_id, targetToken);
   if (!result.success) {
     return res.status(403).json(result);
   }
@@ -1893,8 +2196,8 @@ app.post('/api/auth/select-outlet', async (req, res) => {
 });
 
 app.post('/api/mobile-auth/select-business', async (req, res) => {
-  const { user_id, business_id, device_id } = req.body;
-  const result = await smavGateway.selectAuthorizedOutlet(user_id, business_id, device_id);
+  const { temp_token, tempToken, user_id, business_id, device_id } = req.body;
+  const result = await smavGateway.selectAuthorizedOutlet(user_id || temp_token || tempToken, business_id, device_id, temp_token || tempToken);
   if (!result.success) return res.status(403).json(result);
 
   res.json({
@@ -1917,21 +2220,176 @@ app.get('/api/auth/session', requireAuth, (req, res) => {
   res.json({ success: true, session: (req as any).userSession });
 });
 
+app.get('/api/auth/outlets', requireAuth, async (req, res) => {
+  const session: UserSession = (req as any).userSession;
+  if (session.supabaseToken && centralSupabaseConfig.isConfigured) {
+    const authedSupabase = getCentralSupabaseClient(session.supabaseToken);
+    if (authedSupabase) {
+      try {
+        if (session.role === 'superadmin') {
+          const { data: rows } = await authedSupabase.from('smav_outlets').select('*').eq('is_active', true).order('created_at');
+          const memberships: UserOutletMembership[] = (rows || []).map(r => {
+            const o = outletFromRow(r);
+            return {
+              outletId: o.id,
+              outletCode: o.code,
+              outletName: o.name,
+              outletCategory: o.category,
+              role: 'superadmin',
+              displayRole: 'SUPERADMIN',
+              specificTitle: 'Superadministrator',
+              permissions: ['*'],
+              isPrimary: false
+            };
+          });
+          return res.json({ success: true, activeOutlet: session.activeOutlet, outlets: memberships });
+        }
+
+        const { data: roleRows } = await authedSupabase
+          .from('smav_user_outlet_roles')
+          .select('outlet_id, role, is_active')
+          .eq('user_id', session.userId)
+          .eq('is_active', true);
+
+        const outletIds = (roleRows || []).map((r: any) => r.outlet_id);
+        if (outletIds.length === 0) {
+          return res.json({ success: true, activeOutlet: session.activeOutlet, outlets: [] });
+        }
+
+        const { data: outletRows } = await authedSupabase
+          .from('smav_outlets')
+          .select('*')
+          .in('id', outletIds)
+          .eq('is_active', true);
+
+        const memberships: UserOutletMembership[] = (outletRows || []).map(r => {
+          const o = outletFromRow(r);
+          const m = (roleRows || []).find((mem: any) => mem.outlet_id === r.id);
+          const isOutletAdmin = ['ADMIN', 'OWNER', 'MANAGER'].includes(String(m?.role || '').toUpperCase());
+          const outletRole: UserRole = isOutletAdmin ? 'admin' : 'staff';
+          return {
+            outletId: o.id,
+            outletCode: o.code,
+            outletName: o.name,
+            outletCategory: o.category,
+            role: outletRole,
+            displayRole: displayRoleFor(outletRole),
+            specificTitle: outletRole === 'admin' ? 'Outlet Administrator' : 'POS Billing',
+            permissions: permissionsForRole(outletRole),
+            isPrimary: false
+          };
+        });
+
+        return res.json({ success: true, activeOutlet: session.activeOutlet, outlets: memberships });
+      } catch (err: any) {
+        return res.status(503).json({ success: false, message: `Failed to verify assigned outlets: ${err.message}` });
+      }
+    }
+  }
+
+  res.json({ success: true, activeOutlet: session.activeOutlet, outlets: session.assignedOutlets || [] });
+});
+
+app.post('/api/auth/switch-outlet', requireAuth, async (req, res) => {
+  const session: UserSession = (req as any).userSession;
+  const { outletId } = req.body;
+  if (!outletId) {
+    return res.status(400).json({ success: false, message: 'outletId is required' });
+  }
+
+  if (session.supabaseToken && centralSupabaseConfig.isConfigured) {
+    const authedSupabase = getCentralSupabaseClient(session.supabaseToken);
+    if (!authedSupabase) {
+      return res.status(401).json({ success: false, message: 'Central Supabase session unavailable' });
+    }
+
+    const { data: outletRow, error: outletErr } = await authedSupabase
+      .from('smav_outlets')
+      .select('*')
+      .eq('id', outletId)
+      .eq('is_active', true)
+      .maybeSingle();
+
+    if (outletErr || !outletRow) {
+      return res.status(403).json({ success: false, message: 'Selected outlet is inactive or inaccessible.' });
+    }
+
+    const targetOutlet = outletFromRow(outletRow);
+    await centralOutletRepo.upsertRemoteOutlet(outletRow);
+
+    if (session.role === 'superadmin') {
+      const updated = await smavGateway.switchAuthenticatedOutlet(session.token, targetOutlet, 'superadmin');
+      return res.json({ success: true, session: updated, redirectTo: '/superadmin/outlets' });
+    }
+
+    const { data: roleRows } = await authedSupabase
+      .from('smav_user_outlet_roles')
+      .select('outlet_id, role, is_active')
+      .eq('user_id', session.userId)
+      .eq('is_active', true);
+
+    const matchedRole = (roleRows || []).find((r: any) => r.outlet_id === outletId);
+    if (!matchedRole) {
+      await writeTrustedServerAuditLog({
+        userId: session.userId,
+        userEmail: session.email,
+        outletId,
+        action: 'UNAUTHORIZED_OUTLET_SWITCH_ATTEMPT',
+        entityType: 'OUTLET',
+        entityId: outletId,
+        details: { attemptedOutletId: outletId }
+      });
+      auditLogger.log({
+        eventType: 'UNAUTHORIZED_OUTLET_SWITCH_ATTEMPT',
+        actorId: session.userId,
+        actorEmail: session.email,
+        outletId,
+        details: { attemptedOutletId: outletId }
+      });
+      return res.status(403).json({ success: false, message: 'Access denied: You are not assigned to this outlet.' });
+    }
+
+    const isOutletAdmin = ['ADMIN', 'OWNER', 'MANAGER'].includes(String(matchedRole.role || '').toUpperCase());
+    const nextRole: UserRole = isOutletAdmin ? 'admin' : 'staff';
+    const updated = await smavGateway.switchAuthenticatedOutlet(session.token, targetOutlet, nextRole);
+
+    return res.json({
+      success: true,
+      session: updated,
+      redirectTo: nextRole === 'admin' ? '/admin/dashboard' : '/pos'
+    });
+  }
+
+  const membership = (session.assignedOutlets || []).find(m => m.outletId === outletId);
+  if (session.role !== 'superadmin' && !membership) {
+    return res.status(403).json({ success: false, message: 'Access denied: You are not assigned to this outlet.' });
+  }
+  const outlet = await centralOutletRepo.getOutletById(outletId);
+  if (!outlet || !outlet.isActive) {
+    return res.status(404).json({ success: false, message: 'Selected outlet not found or inactive.' });
+  }
+  const nextRole: UserRole = session.role === 'superadmin' ? 'superadmin' : (membership?.role || 'staff');
+  const updated = await smavGateway.switchAuthenticatedOutlet(session.token, outlet, nextRole);
+  res.json({
+    success: true,
+    session: updated,
+    redirectTo: nextRole === 'superadmin' ? '/superadmin/outlets' : nextRole === 'admin' ? '/admin/dashboard' : '/pos'
+  });
+});
+
 // -------------------------------------------------------------------------------------------------
 // Requirement 6: Narrowly scoped authenticated endpoint so users can read only their own profile
 // -------------------------------------------------------------------------------------------------
 app.get('/api/auth/profile', requireAuth, async (req, res) => {
   const session: UserSession = (req as any).userSession;
 
-  // If user has a Central Supabase access token, query public.smav_profiles using their token
-  // This verifies the database RLS policy: users can read only their own profile (auth.uid() = id)
   if (session.supabaseToken && centralSupabaseConfig.isConfigured) {
     const authedSupabase = getCentralSupabaseClient(session.supabaseToken);
     if (authedSupabase) {
       try {
         const { data: profile, error } = await authedSupabase
           .from('smav_profiles')
-          .select('*')
+          .select('id, full_name, platform_role, is_active, created_at')
           .eq('id', session.userId)
           .single();
 
@@ -1941,11 +2399,12 @@ app.get('/api/auth/profile', requireAuth, async (req, res) => {
             source: 'central_smav_supabase_rls',
             profile: {
               id: profile.id,
-              email: profile.email || session.email,
+              email: session.email,
               full_name: profile.full_name || session.fullName,
               platform_role: profile.platform_role,
+              visible_role: session.displayRole || displayRoleFor(session.role),
               is_active: profile.is_active,
-              phone: profile.phone,
+              assigned_outlets: session.assignedOutlets || [],
               created_at: profile.created_at
             }
           });
@@ -1964,9 +2423,11 @@ app.get('/api/auth/profile', requireAuth, async (req, res) => {
       id: session.userId,
       email: session.email,
       full_name: session.fullName,
-      platform_role: session.role === 'superadmin' ? 'SUPERADMIN' : session.role.toUpperCase(),
+      platform_role: session.role === 'superadmin' ? 'SUPERADMIN' : 'USER',
+      visible_role: session.displayRole || displayRoleFor(session.role),
       is_active: true,
       active_outlet: session.activeOutlet,
+      assigned_outlets: session.assignedOutlets || [],
       permissions: session.permissions
     }
   });
@@ -1991,29 +2452,22 @@ async function invokeEdgeAdminFunction(action: string, payload: any, tokenOrKey?
   let effectiveToken = tokenOrKey || '';
   if (tokenOrKey && tokenOrKey.startsWith('smav_jwt')) {
     const session = await smavGateway.validateSession(tokenOrKey);
-    if (session?.supabaseToken) {
-      effectiveToken = session.supabaseToken;
-    }
+    effectiveToken = session?.supabaseToken || '';
   }
 
   if (isBusinessKey && tokenOrKey) {
     headers['X-Integration-Key'] = tokenOrKey;
     headers['X-Business-Source'] = payload.businessSource || (action.includes('glossy') ? 'glossylooks' : action.includes('mozz') ? 'mozz' : 'central');
-    // For backend requests, provide Authorization header for API Gateway (Kong) routing
+    // For backend integration calls, send valid user JWT if present or anonKey for Kong gateway routing only;
+    // never inject service_role into untrusted caller requests.
     if (effectiveToken && effectiveToken.startsWith('eyJ')) {
       headers['Authorization'] = `Bearer ${effectiveToken}`;
-    } else if (process.env.SMAV_SERVICE_ROLE_KEY) {
-      headers['Authorization'] = `Bearer ${process.env.SMAV_SERVICE_ROLE_KEY}`;
     } else if (anonKey) {
       headers['Authorization'] = `Bearer ${anonKey}`;
     }
-  } else if (effectiveToken && effectiveToken.startsWith('eyJ')) {
-    headers['Authorization'] = `Bearer ${effectiveToken}`;
-  } else if (process.env.SMAV_SERVICE_ROLE_KEY) {
-    headers['Authorization'] = `Bearer ${process.env.SMAV_SERVICE_ROLE_KEY}`;
   } else if (effectiveToken) {
     headers['Authorization'] = `Bearer ${effectiveToken}`;
-  } else if (anonKey) {
+  } else if (action === 'get-info' && anonKey) {
     headers['Authorization'] = `Bearer ${anonKey}`;
   }
 
@@ -2032,23 +2486,23 @@ async function invokeEdgeAdminFunction(action: string, payload: any, tokenOrKey?
       data = { success: false, error: `HTTP ${status}: Non-JSON response from Edge Function` };
     }
 
-    if (status === 401) {
-      const errDetail = data?.error || data?.message || 'Unauthorized';
+    if (status === 401 || status === 403) {
+      const errDetail = data?.error || data?.message || (status === 403 ? 'Forbidden' : 'Unauthorized');
       const code = data?.details?.code || (data?.message?.includes('Missing authorization') ? 'UNAUTHORIZED_NO_AUTH_HEADER' : 'UNAUTHORIZED_AUTH_REJECTED');
       return {
         success: false,
-        status: 401,
+        status,
         code,
-        error: `Edge Function 401 Unauthorized: ${errDetail}`,
+        error: `Edge Function ${status} ${status === 403 ? 'Forbidden' : 'Unauthorized'}: ${errDetail}`,
         details: data?.details || data,
-        diagnostic: {
+        diagnostic: status === 401 ? {
           origin: code === 'UNAUTHORIZED_NO_AUTH_HEADER' ? 'Supabase API Gateway (Kong)' : 'smav-identity-admin Function Logic',
-          solution: '1. For backend sync without user login, deploy function with: npx supabase functions deploy smav-identity-admin --no-verify-jwt. 2. For interactive sync, ensure user is signed in to Supabase Auth so a valid JWT is passed.'
-        }
+          solution: 'Check that the request carries a valid user JWT or an authorized business integration key, and verify the Edge Function gateway JWT setting matches the intended authentication mode. Do not disable JWT verification without a security review.'
+        } : undefined
       };
     }
 
-    return data;
+    return { status, ...data };
   } catch (error: any) {
     return { success: false, error: error.message };
   }
@@ -2059,6 +2513,10 @@ app.post('/api/central-auth/staff/provision', async (req, res) => {
   const gatewaySecret = req.headers['x-smav-gateway-secret'] || req.headers['x-integration-key'];
   const authHeader = req.headers.authorization;
   const token = authHeader?.startsWith('Bearer ') ? authHeader.split(' ')[1] : '';
+
+  if (!token && !gatewaySecret) {
+    return res.status(401).json({ success: false, message: 'Unauthorized: Bearer token or integration key is required' });
+  }
 
   const { email, fullName, phone, role, outletCode, businessSource, externalStaffId, temporaryPassword, username } = req.body;
   if (!email || !outletCode) {
@@ -2095,7 +2553,12 @@ app.post('/api/central-auth/staff/provision', async (req, res) => {
     });
   }
 
-  res.status(edgeResult.error?.includes('Unauthorized') ? 401 : 400).json({
+  const statusCode = edgeResult.status === 401 || edgeResult.error?.includes('Unauthorized')
+    ? 401
+    : edgeResult.status === 403 || edgeResult.error?.includes('Forbidden')
+      ? 403
+      : 400;
+  res.status(statusCode).json({
     success: false,
     message: edgeResult.error || 'Failed to synchronize with Central SMAV identity system',
     details: edgeResult
@@ -2106,26 +2569,32 @@ app.post('/api/central-auth/staff/provision', async (req, res) => {
 app.post('/api/central-auth/staff/status', async (req, res) => {
   const gatewaySecret = req.headers['x-smav-gateway-secret'] || req.headers['x-integration-key'];
   const token = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.split(' ')[1] : '';
+  if (!token && !gatewaySecret) {
+    return res.status(401).json({ success: false, message: 'Unauthorized: Bearer token or integration key is required' });
+  }
   const { email, userId, outletCode, isActive } = req.body;
 
   const edgeResult = await invokeEdgeAdminFunction('set-status', {
     email, userId, outletCode, isActive
   }, (gatewaySecret as string) || token, Boolean(gatewaySecret && !token));
 
-  res.json(edgeResult);
+  res.status(edgeResult.success ? 200 : (edgeResult.status || 400)).json(edgeResult);
 });
 
 // 3. Password Reset Request Endpoint
 app.post('/api/central-auth/staff/reset-password', async (req, res) => {
   const gatewaySecret = req.headers['x-smav-gateway-secret'] || req.headers['x-integration-key'];
   const token = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.split(' ')[1] : '';
+  if (!token && !gatewaySecret) {
+    return res.status(401).json({ success: false, message: 'Unauthorized: Bearer token or integration key is required' });
+  }
   const { email, userId, outletCode, newPassword } = req.body;
 
   const edgeResult = await invokeEdgeAdminFunction('reset-password', {
     email, userId, outletCode, newPassword
   }, (gatewaySecret as string) || token, Boolean(gatewaySecret && !token));
 
-  res.json({
+  res.status(edgeResult.success ? 200 : (edgeResult.status || 400)).json({
     success: edgeResult.success,
     message: edgeResult.message || edgeResult.error,
     resetToken: edgeResult.recoveryLink || edgeResult.temporaryPassword,
@@ -2137,14 +2606,29 @@ app.post('/api/central-auth/staff/reset-password', async (req, res) => {
 app.get('/api/central-auth/staff/list', async (req, res) => {
   const outletCode = req.query.outlet_code as string;
   const token = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.split(' ')[1] : '';
-
-  const edgeResult = await invokeEdgeAdminFunction('list-staff', { outletCode }, token);
-  if (edgeResult.success && edgeResult.staff) {
-    return res.json({ success: true, count: edgeResult.staff.length, staff: edgeResult.staff });
+  if (!token) {
+    return res.status(401).json({ success: false, message: 'Unauthorized: Bearer token is required', staff: [] });
   }
 
-  // Fallback to local user repo if Edge function returns empty or offline
-  const users = await centralUserRepo.listUsersByOutlet('all');
+  if (centralSupabaseConfig.isConfigured) {
+    const edgeResult = await invokeEdgeAdminFunction('list-staff', { outletCode }, token);
+    if (edgeResult.success && edgeResult.staff) {
+      return res.json({ success: true, count: edgeResult.staff.length, staff: edgeResult.staff });
+    }
+    return res.status(edgeResult.status || 403).json({
+      success: false,
+      message: edgeResult.error || 'Failed to fetch staff list',
+      staff: []
+    });
+  }
+
+  const session = await smavGateway.validateSession(token);
+  if (!session || (session.role !== 'superadmin' && session.role !== 'admin')) {
+    return res.status(403).json({ success: false, message: 'Forbidden: Admin or Superadmin session required', staff: [] });
+  }
+
+  // Scoped fallback when Central Supabase is not configured
+  const users = await centralUserRepo.listUsersByOutlet(session.role === 'superadmin' ? 'all' : session.activeOutlet.id);
   const staff = users
     .filter(u => u.role !== 'superadmin')
     .map(u => ({
@@ -2455,7 +2939,7 @@ class GlossyLooksStaffSyncEngine {
                     st.email.toLowerCase() === 'kpsrikanthreddy@gmail.com' ||
                     st.email.toLowerCase() === 'superadmin@smav.io';
 
-                  const targetPlatformRole = isSuperadminProfile ? 'SUPERADMIN' : (isSalonAdmin ? 'ADMIN' : 'OUTLET_USER');
+                  const targetPlatformRole = isSuperadminProfile ? 'SUPERADMIN' : 'USER';
 
                   if (existingProfile) {
                     await centralClient
@@ -2648,7 +3132,7 @@ app.post('/api/superadmin/sync-glossylooks', requireAuth, requireSuperadmin, asy
   }
 });
 
-app.get('/api/superadmin/glossylooks-sync-status', requireAuth, async (_req, res) => {
+app.get('/api/superadmin/glossylooks-sync-status', requireAuth, requireSuperadmin, async (_req, res) => {
   res.json({
     success: true,
     data: glossyLooksStaffSyncEngine.getStatus()
@@ -2840,7 +3324,7 @@ app.post('/api/central-supabase/verify-login', async (req, res) => {
       status: 'PASSED',
       profile: {
         id: profile.id,
-        email: profile.email || authData.user.email,
+        email: authData.user.email,
         full_name: profile.full_name,
         platform_role: profile.platform_role,
         is_active: profile.is_active
@@ -3036,6 +3520,39 @@ app.post('/api/superadmin/outlets/:id/status', requireAuth, requireSuperadmin, a
 });
 
 app.get('/api/superadmin/admins', requireAuth, requireSuperadmin, async (req, res) => {
+  const session: UserSession = (req as any).userSession;
+  if (session.supabaseToken && centralSupabaseConfig.isConfigured) {
+    const edgeRes = await invokeEdgeAdminFunction('list-staff', {}, session.supabaseToken);
+    if (edgeRes.success && Array.isArray(edgeRes.staff)) {
+      const grouped = new Map<string, any>();
+      for (const row of edgeRes.staff) {
+        if (String(row.role).toUpperCase() !== 'ADMIN') continue;
+        const uid = row.userId || row.email;
+        if (!grouped.has(uid)) {
+          grouped.set(uid, {
+            id: row.userId,
+            email: row.email,
+            fullName: row.fullName || row.email,
+            role: 'admin',
+            displayRole: 'ADMIN',
+            outletCode: row.outletCode,
+            isActive: row.isActive !== false,
+            memberships: []
+          });
+        }
+        grouped.get(uid).memberships.push({
+          outletId: row.outletId,
+          outletCode: row.outletCode,
+          outletName: row.outletName,
+          outletCategory: row.outletCategory,
+          role: 'admin',
+          displayRole: 'ADMIN'
+        });
+      }
+      return res.json({ success: true, admins: Array.from(grouped.values()) });
+    }
+  }
+
   const users = await centralUserRepo.listUsersByOutlet('all');
   const admins = users.filter(u => u.role === 'admin' || u.role === 'superadmin');
   res.json({
@@ -3046,6 +3563,7 @@ app.get('/api/superadmin/admins', requireAuth, requireSuperadmin, async (req, re
       fullName: u.fullName,
       phone: u.phone,
       role: u.role,
+      displayRole: displayRoleFor(u.role),
       isActive: u.isActive,
       memberships: u.memberships,
       createdAt: u.createdAt
@@ -3054,9 +3572,28 @@ app.get('/api/superadmin/admins', requireAuth, requireSuperadmin, async (req, re
 });
 
 app.post('/api/superadmin/admins', requireAuth, requireSuperadmin, async (req, res) => {
-  const { email, fullName, phone, password, outletId, specificTitle } = req.body;
-  if (!email || !outletId) {
-    return res.status(400).json({ success: false, message: 'email and outletId are required' });
+  const session: UserSession = (req as any).userSession;
+  const { email, fullName, phone, password, outletId, outletCode, specificTitle } = req.body;
+  if (!email || (!outletId && !outletCode)) {
+    return res.status(400).json({ success: false, message: 'email and outletId/outletCode are required' });
+  }
+
+  if (session.supabaseToken && centralSupabaseConfig.isConfigured) {
+    const edgeRes = await invokeEdgeAdminFunction(
+      'create-admin',
+      {
+        email: String(email).trim(),
+        fullName: fullName || 'Outlet Administrator',
+        phone: phone || '',
+        outletCode: outletCode || outletId,
+        temporaryPassword: password || undefined
+      },
+      session.supabaseToken
+    );
+    if (!edgeRes.success) {
+      return res.status(400).json({ success: false, message: edgeRes.error || 'Failed to create outlet administrator' });
+    }
+    return res.json({ success: true, admin: edgeRes, message: edgeRes.message });
   }
 
   const outlet = await centralOutletRepo.getOutletById(outletId);
@@ -3077,8 +3614,9 @@ app.post('/api/superadmin/admins', requireAuth, requireSuperadmin, async (req, r
         outletName: outlet.name,
         outletCategory: outlet.category,
         role: 'admin',
+        displayRole: 'ADMIN',
         specificTitle: specificTitle || 'Outlet Administrator',
-        permissions: ['*'],
+        permissions: permissionsForRole('admin'),
         isPrimary: true
       }
     ]
@@ -3086,8 +3624,8 @@ app.post('/api/superadmin/admins', requireAuth, requireSuperadmin, async (req, r
 
   auditLogger.log({
     eventType: 'ADMIN_ACCOUNT_CREATED',
-    actorId: (req as any).userSession.userId,
-    actorEmail: (req as any).userSession.email,
+    actorId: session.userId,
+    actorEmail: session.email,
     outletId: outlet.id,
     details: { adminEmail: email, outletName: outlet.name }
   });
@@ -3096,8 +3634,26 @@ app.post('/api/superadmin/admins', requireAuth, requireSuperadmin, async (req, r
 });
 
 app.post('/api/superadmin/admins/:id/reset-password', requireAuth, requireSuperadmin, async (req, res) => {
+  const session: UserSession = (req as any).userSession;
   const { id } = req.params;
-  const { newPassword } = req.body;
+  const { newPassword, email, outletCode } = req.body;
+
+  if (session.supabaseToken && centralSupabaseConfig.isConfigured) {
+    const edgeRes = await invokeEdgeAdminFunction(
+      'reset-password',
+      { userId: id, email, outletCode, newPassword },
+      session.supabaseToken
+    );
+    if (!edgeRes.success) {
+      return res.status(400).json({ success: false, message: edgeRes.error || 'Failed to reset password' });
+    }
+    return res.json({
+      success: true,
+      message: edgeRes.message,
+      recoveryLink: edgeRes.recoveryLink
+    });
+  }
+
   const user = await centralUserRepo.getUserById(id);
   if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
@@ -3107,8 +3663,8 @@ app.post('/api/superadmin/admins/:id/reset-password', requireAuth, requireSupera
 
   auditLogger.log({
     eventType: 'ADMIN_PASSWORD_RESET_BY_SUPERADMIN',
-    actorId: (req as any).userSession.userId,
-    actorEmail: (req as any).userSession.email,
+    actorId: session.userId,
+    actorEmail: session.email,
     details: { targetUserId: id, targetEmail: user.email }
   });
 
@@ -3204,25 +3760,57 @@ app.get('/api/superadmin/audit-logs', requireAuth, requireSuperadmin, (req, res)
 // -------------------------------------------------------------------------------------------------
 app.get('/api/admin/outlet-details', requireAuth, requireAdmin, async (req, res) => {
   const session: UserSession = (req as any).userSession;
-  const outlet = await centralOutletRepo.getOutletById(session.activeOutlet.id);
+  if (session.supabaseToken && centralSupabaseConfig.isConfigured) {
+    try {
+      const outlet = await getRegisteredOutlet(req, session.activeOutlet.id);
+      if (outlet) return res.json({ success: true, outlet });
+    } catch (_e) {}
+  }
+  const outlet = (await centralOutletRepo.getOutletById(session.activeOutlet.id)) || session.activeOutlet;
   res.json({ success: true, outlet });
 });
 
 app.get('/api/admin/staff', requireAuth, requireAdmin, async (req, res) => {
   const session: UserSession = (req as any).userSession;
+  if (session.supabaseToken && centralSupabaseConfig.isConfigured) {
+    const edgeRes = await invokeEdgeAdminFunction('list-staff', { outletCode: session.activeOutlet.code }, session.supabaseToken);
+    if (edgeRes.success && Array.isArray(edgeRes.staff)) {
+      return res.json({
+        success: true,
+        staff: edgeRes.staff.map((r: any) => ({
+          id: r.userId,
+          userId: r.userId,
+          email: r.email,
+          fullName: r.fullName,
+          role: String(r.role).toUpperCase() === 'ADMIN' ? 'admin' : 'staff',
+          displayRole: r.displayRole || (String(r.role).toUpperCase() === 'STAFF' ? 'POS_BILLING' : r.role),
+          isActive: r.isActive !== false,
+          outletCode: r.outletCode,
+          outletName: r.outletName
+        }))
+      });
+    }
+    return res.status(edgeRes.status || 403).json({ success: false, message: edgeRes.error || 'Unable to list outlet users', staff: [] });
+  }
+
   const users = await centralUserRepo.listUsersByOutlet(session.activeOutlet.id);
   res.json({
     success: true,
-    staff: users.map(u => ({
-      id: u.id,
-      email: u.email,
-      fullName: u.fullName,
-      phone: u.phone,
-      role: u.role,
-      isActive: u.isActive,
-      memberships: u.memberships,
-      createdAt: u.createdAt
-    }))
+    staff: users.map(u => {
+      const m = u.memberships.find(mem => mem.outletId === session.activeOutlet.id);
+      const r: UserRole = m?.role || u.role;
+      return {
+        id: u.id,
+        email: u.email,
+        fullName: u.fullName,
+        phone: u.phone,
+        role: r,
+        displayRole: displayRoleFor(r),
+        isActive: u.isActive,
+        memberships: u.memberships,
+        createdAt: u.createdAt
+      };
+    })
   });
 });
 
@@ -3234,12 +3822,37 @@ app.post('/api/admin/staff', requireAuth, requireAdmin, async (req, res) => {
     return res.status(400).json({ success: false, message: 'email and fullName are required' });
   }
 
+  const requestedRole = String(role || 'staff').toLowerCase();
+  if (requestedRole === 'admin' && session.role !== 'superadmin') {
+    return res.status(403).json({ success: false, message: 'Forbidden: Only SUPERADMIN can grant ADMIN roles.' });
+  }
+
+  if (session.supabaseToken && centralSupabaseConfig.isConfigured) {
+    const action = requestedRole === 'admin' && session.role === 'superadmin' ? 'create-admin' : 'create-staff';
+    const edgeRes = await invokeEdgeAdminFunction(
+      action,
+      {
+        email: String(email).trim(),
+        fullName: String(fullName).trim(),
+        phone: phone || '',
+        outletCode: session.activeOutlet.code,
+        temporaryPassword: password || undefined
+      },
+      session.supabaseToken
+    );
+    if (!edgeRes.success) {
+      return res.status(edgeRes.status || 400).json({ success: false, message: edgeRes.error || 'Failed to create outlet user' });
+    }
+    return res.json({ success: true, staff: edgeRes, message: edgeRes.message });
+  }
+
+  const assignedRole: UserRole = (session.role === 'superadmin' && requestedRole === 'admin') ? 'admin' : 'staff';
   const { hash, salt } = hashPassword(password || 'Staff@123');
   const newStaff = await centralUserRepo.createUser({
     email,
     fullName,
     phone,
-    role: (role as any) || 'staff',
+    role: assignedRole,
     passwordHash: hash,
     salt,
     memberships: [
@@ -3248,49 +3861,182 @@ app.post('/api/admin/staff', requireAuth, requireAdmin, async (req, res) => {
         outletCode: session.activeOutlet.code,
         outletName: session.activeOutlet.name,
         outletCategory: session.activeOutlet.category,
-        role: (role as any) || 'staff',
-        specificTitle: specificTitle || 'Staff Member',
-        permissions: ['pos:create_bill', 'pos:print_receipt'],
+        role: assignedRole,
+        displayRole: displayRoleFor(assignedRole),
+        specificTitle: specificTitle || (assignedRole === 'admin' ? 'Outlet Administrator' : 'POS Billing'),
+        permissions: permissionsForRole(assignedRole),
         isPrimary: true
       }
     ]
+  });
+
+  await writeTrustedServerAuditLog({
+    userId: session.userId,
+    userEmail: session.email,
+    outletId: session.activeOutlet.id,
+    action: 'STAFF_CREATED',
+    entityType: 'USER_OUTLET_ROLE',
+    entityId: `${newStaff.id}_${session.activeOutlet.id}`,
+    details: { staffEmail: email, role: displayRoleFor(assignedRole) }
   });
 
   auditLogger.log({
     eventType: 'STAFF_CREATED',
     actorId: session.userId,
     outletId: session.activeOutlet.id,
-    details: { staffEmail: email, role }
+    details: { staffEmail: email, role: displayRoleFor(assignedRole) }
   });
 
   res.json({ success: true, staff: newStaff });
 });
 
 app.post('/api/admin/staff/:id/status', requireAuth, requireAdmin, async (req, res) => {
+  const session: UserSession = (req as any).userSession;
   const { id } = req.params;
   const { isActive } = req.body;
+
+  if (session.supabaseToken && centralSupabaseConfig.isConfigured) {
+    const edgeRes = await invokeEdgeAdminFunction(
+      'set-status',
+      { userId: id, outletCode: session.activeOutlet.code, isActive: Boolean(isActive) },
+      session.supabaseToken
+    );
+    return res.status(edgeRes.success ? 200 : (edgeRes.status || 403)).json(edgeRes);
+  }
+
+  const targetUser = await centralUserRepo.getUserById(id);
+  const targetMembership = targetUser?.memberships.find(m => m.outletId === session.activeOutlet.id);
+  if (!targetUser || !targetMembership) {
+    return res.status(403).json({ success: false, message: 'Forbidden: Target user is not assigned to your active outlet.' });
+  }
+  if (session.role !== 'superadmin' && (targetUser.role === 'superadmin' || targetMembership.role === 'admin')) {
+    return res.status(403).json({ success: false, message: 'Forbidden: Only SUPERADMIN can modify an ADMIN or SUPERADMIN assignment.' });
+  }
+
   const ok = await centralUserRepo.setUserActive(id, Boolean(isActive));
+  await writeTrustedServerAuditLog({
+    userId: session.userId,
+    userEmail: session.email,
+    outletId: session.activeOutlet.id,
+    action: isActive ? 'ACTIVATE_OUTLET_STAFF' : 'DEACTIVATE_OUTLET_STAFF',
+    entityType: 'USER_OUTLET_ROLE',
+    entityId: `${id}_${session.activeOutlet.id}`,
+    details: { targetUserId: id, targetRole: targetMembership.role, isActive: Boolean(isActive) }
+  });
   res.json({ success: ok });
 });
 
-app.post('/api/admin/staff/:id/reset-password', requireAuth, requireAdmin, async (req, res) => {
+app.delete('/api/admin/staff/:id', requireAuth, requireAdmin, async (req, res) => {
+  const session: UserSession = (req as any).userSession;
   const { id } = req.params;
-  const { newPassword } = req.body;
-  const tempPass = newPassword || 'SMAV-' + Math.random().toString(36).substring(2, 8).toUpperCase();
+  const email = (req.body?.email || req.query.email) as string | undefined;
+
+  if (session.supabaseToken && centralSupabaseConfig.isConfigured) {
+    const edgeRes = await invokeEdgeAdminFunction(
+      'remove-staff',
+      { userId: id, email, outletCode: session.activeOutlet.code },
+      session.supabaseToken
+    );
+    return res.status(edgeRes.success ? 200 : (edgeRes.status || 403)).json(edgeRes);
+  }
+
+  const targetUser = await centralUserRepo.getUserById(id);
+  const targetMembership = targetUser?.memberships.find(m => m.outletId === session.activeOutlet.id);
+  if (!targetUser || !targetMembership) {
+    return res.status(404).json({ success: false, message: 'Target user assignment not found for your active outlet.' });
+  }
+  if (session.role !== 'superadmin' && (targetUser.role === 'superadmin' || targetMembership.role === 'admin')) {
+    return res.status(403).json({ success: false, message: 'Forbidden: Only SUPERADMIN can revoke an ADMIN or SUPERADMIN assignment.' });
+  }
+
+  const removed = await centralUserRepo.removeOutletMembership(id, session.activeOutlet.id);
+  if (!removed) {
+    return res.status(404).json({ success: false, message: 'Outlet assignment could not be removed.' });
+  }
+
+  await writeTrustedServerAuditLog({
+    userId: session.userId,
+    userEmail: session.email,
+    outletId: session.activeOutlet.id,
+    action: 'REMOVE_OUTLET_ASSIGNMENT',
+    entityType: 'USER_OUTLET_ROLE',
+    entityId: `${id}_${session.activeOutlet.id}`,
+    details: { targetUserId: id, removedRole: targetMembership.role }
+  });
+
+  auditLogger.log({
+    eventType: 'REMOVE_OUTLET_ASSIGNMENT',
+    actorId: session.userId,
+    actorEmail: session.email,
+    outletId: session.activeOutlet.id,
+    details: { targetUserId: id, removedRole: targetMembership.role }
+  });
+
+  res.json({ success: true, message: 'Outlet assignment removed successfully.' });
+});
+
+app.post('/api/admin/staff/:id/reset-password', requireAuth, requireAdmin, async (req, res) => {
+  const session: UserSession = (req as any).userSession;
+  const { id } = req.params;
+  const { newPassword, email } = req.body;
+
+  if (session.supabaseToken && centralSupabaseConfig.isConfigured) {
+    const edgeRes = await invokeEdgeAdminFunction(
+      'reset-password',
+      { userId: id, email, outletCode: session.activeOutlet.code, newPassword },
+      session.supabaseToken
+    );
+    return res.status(edgeRes.success ? 200 : (edgeRes.status || 403)).json(edgeRes);
+  }
+
+  const targetUser = await centralUserRepo.getUserById(id);
+  const targetMembership = targetUser?.memberships.find(m => m.outletId === session.activeOutlet.id);
+  if (!targetUser || !targetMembership) {
+    return res.status(403).json({ success: false, message: 'Forbidden: Target user is not assigned to your active outlet.' });
+  }
+  if (session.role !== 'superadmin' && (targetUser.role === 'superadmin' || targetMembership.role === 'admin')) {
+    return res.status(403).json({ success: false, message: 'Forbidden: Only SUPERADMIN can reset an ADMIN or SUPERADMIN password.' });
+  }
+  const tempPass = newPassword || 'SMAV-' + Math.random().toString(36).substring(2, 8).toUpperCase() + '!';
   const { hash, salt } = hashPassword(tempPass);
   const ok = await centralUserRepo.resetUserPassword(id, hash, salt);
+  await writeTrustedServerAuditLog({
+    userId: session.userId,
+    userEmail: session.email,
+    outletId: session.activeOutlet.id,
+    action: 'RESET_PASSWORD_STAFF',
+    entityType: 'USER',
+    entityId: id,
+    details: { targetUserId: id }
+  });
   res.json({ success: ok, temporaryPassword: tempPass });
 });
 
-app.get('/api/admin/reports', requireAuth, requireAdmin, (req, res) => {
+app.get('/api/admin/reports', requireAuth, requireAdmin, async (req, res) => {
   const session: UserSession = (req as any).userSession;
   const outletId = session.activeOutlet.id;
   const category = session.activeOutlet.category;
 
   if (category === 'salon') {
-    const bills = syncedBills.filter(b => b.outlet_id === outletId || !b.outlet_id);
-    const totalSales = bills.reduce((acc, b) => acc + (b.grand_total || 0), 0);
-    const totalTax = bills.reduce((acc, b) => acc + (b.total_tax || 0), 0);
+    let bills = syncedBills.filter(b => b.outlet_id === outletId);
+    if (session.supabaseToken && centralSupabaseConfig.isConfigured) {
+      try {
+        const db = getCentralSupabaseClient(session.supabaseToken);
+        if (db) {
+          const { data: dbBills, error } = await db
+            .from('smav_salon_bills')
+            .select('*')
+            .eq('outlet_id', outletId)
+            .order('created_at', { ascending: false })
+            .limit(50);
+          if (!error && Array.isArray(dbBills)) {
+            bills = dbBills;
+          }
+        }
+      } catch (_e) {}
+    }
+    const totalSales = bills.reduce((acc, b) => acc + (Number(b.grand_total) || 0), 0);
+    const totalTax = bills.reduce((acc, b) => acc + (Number(b.total_tax) || 0), 0);
     res.json({
       success: true,
       outletName: session.activeOutlet.name,
@@ -3300,7 +4046,7 @@ app.get('/api/admin/reports', requireAuth, requireAdmin, (req, res) => {
       recentBills: bills.slice(0, 20)
     });
   } else if (category === 'restaurant') {
-    const orders = syncedOrders.filter(o => o.outlet_id === outletId || !o.outlet_id);
+    const orders = syncedOrders.filter(o => o.outlet_id === outletId);
     const totalSales = orders.reduce((acc, o) => acc + (o.grand_total || 0), 0);
     const totalTax = orders.reduce((acc, o) => acc + (o.total_tax || 0), 0);
     res.json({
@@ -3315,9 +4061,9 @@ app.get('/api/admin/reports', requireAuth, requireAdmin, (req, res) => {
     res.json({
       success: true,
       outletName: session.activeOutlet.name,
-      totalSales: 18450,
-      totalTax: 2214,
-      totalTransactions: 12,
+      totalSales: 0,
+      totalTax: 0,
+      totalTransactions: 0,
       recentBills: []
     });
   }
@@ -3345,7 +4091,7 @@ app.get('/api/pos/init', requireAuth, async (req, res) => {
       category: 'salon',
       revision: salonCatalogRevision,
       services: activeServices,
-      stylists: stylists.filter(st => st.isAvailable && (!st.branchId || st.branchId === outlet.id || st.branchId === outlet.code || st.branchId === 'outlet_glossy_gach')),
+      stylists: stylists.filter(st => st.isAvailable && (!st.branchId || st.branchId === outlet.id || st.branchId === outlet.code)),
       stylistError: stylists.length ? null : 'No active staff returned by the upstream Glossy Looks API. Verify /api/staff and access permissions.',
       appointments: salonAppointments
     });
@@ -3425,7 +4171,11 @@ app.get('/api/catalog/sync', (req, res) => {
   });
 });
 
-app.post('/api/admin/catalog/service', (req, res) => {
+app.post('/api/admin/catalog/service', requireAuth, requireAdmin, (req, res) => {
+  const session: UserSession = (req as any).userSession;
+  if (session.role !== 'superadmin' && session.activeOutlet.category !== 'salon') {
+    return res.status(403).json({ success: false, message: 'Forbidden: Salon catalog management is restricted to assigned salon outlets.' });
+  }
   const payload = req.body.service || req.body;
   const { id, name, category, subcategory, price, gstPercent, isDiscountEligible, isActive } = payload;
 
@@ -3479,7 +4229,11 @@ app.post('/api/admin/catalog/service', (req, res) => {
   res.json({ success: true, revision: salonCatalogRevision, service });
 });
 
-app.post('/api/admin/catalog/menu-item', (req, res) => {
+app.post('/api/admin/catalog/menu-item', requireAuth, requireAdmin, (req, res) => {
+  const session: UserSession = (req as any).userSession;
+  if (session.role !== 'superadmin' && session.activeOutlet.category !== 'restaurant') {
+    return res.status(403).json({ success: false, message: 'Forbidden: Restaurant menu management is restricted to assigned restaurant outlets.' });
+  }
   const payload = req.body.item || req.body;
   const { id, name, category, basePrice, isVeg, variants, isAvailable } = payload;
 
@@ -3530,10 +4284,15 @@ app.post('/api/admin/catalog/menu-item', (req, res) => {
   res.json({ success: true, revision: restaurantCatalogRevision, item });
 });
 
-app.post('/api/admin/catalog/retail-product', async (req, res) => {
-  const item = await retailCatalogRepo.saveItem('outlet_trends_threads', req.body);
-  const rev = await retailCatalogRepo.getRevision('outlet_trends_threads');
-  broadcastCatalogUpdate('outlet_trends_threads', {
+app.post('/api/admin/catalog/retail-product', requireAuth, requireAdmin, async (req, res) => {
+  const session: UserSession = (req as any).userSession;
+  if (session.role !== 'superadmin' && session.activeOutlet.category !== 'retail' && session.activeOutlet.category !== 'other') {
+    return res.status(403).json({ success: false, message: 'Forbidden: Retail catalog management is restricted to assigned retail outlets.' });
+  }
+  const outletId = session.activeOutlet.id || 'outlet_trends_threads';
+  const item = await retailCatalogRepo.saveItem(outletId, req.body);
+  const rev = await retailCatalogRepo.getRevision(outletId);
+  broadcastCatalogUpdate(outletId, {
     type: 'CATALOG_REVISION_UPDATED',
     current_revision: rev,
     item_id: item.id,
@@ -3584,7 +4343,8 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/mobile/sync/orders', (req, res) => {
+app.post('/api/mobile/sync/orders', requireAuth, (req, res) => {
+  const session: UserSession = (req as any).userSession;
   const { orders } = req.body;
   if (!Array.isArray(orders) || orders.length === 0) {
     return res.json({ success: true, synced_ids: [], server_timestamp: Date.now() });
@@ -3595,6 +4355,9 @@ app.post('/api/mobile/sync/orders', (req, res) => {
   for (const item of orders) {
     const { order, items, idempotency_key } = item;
     if (!order || !idempotency_key) continue;
+    if (order.outletId && order.outletId !== session.activeOutlet.id && session.role !== 'superadmin') {
+      return res.status(403).json({ success: false, message: 'Forbidden: Order outlet does not match active outlet session.' });
+    }
 
     const existing = syncedOrders.find(o => o.idempotency_key === idempotency_key || o.order_number === order.orderNumber);
     if (existing) {
@@ -3606,9 +4369,9 @@ app.post('/api/mobile/sync/orders', (req, res) => {
       id: order.id,
       order_number: order.orderNumber,
       token_number: order.tokenNumber,
-      outlet_id: order.outletId || 'outlet_mozz_gach',
-      business_id: 'mozz_starters4u',
-      branch_code: order.branchCode || 'GACH',
+      outlet_id: session.activeOutlet.id,
+      business_id: session.activeOutlet.code || 'mozz_starters4u',
+      branch_code: order.branchCode || session.activeOutlet.code || 'GACH',
       table_or_counter: order.tableOrCounter,
       order_type: order.orderType,
       grand_total: order.grandTotal,
@@ -3625,47 +4388,59 @@ app.post('/api/mobile/sync/orders', (req, res) => {
   res.json({ success: true, synced_ids: syncedIds, server_timestamp: Date.now() });
 });
 
-app.get('/api/salon/services', (req, res) => {
+app.get('/api/salon/services', requireAuth, (req, res) => {
   res.json({ business_id: 'the_glossy_looks', current_revision: salonCatalogRevision, services: salonServices.filter(s => !s.isDeleted && s.isActive) });
 });
 
-app.get('/api/salon/stylists', (req, res) => {
+app.get('/api/salon/stylists', requireAuth, (req, res) => {
   res.json({ business_id: 'the_glossy_looks', stylists });
 });
 
-app.get('/api/salon/appointments', (req, res) => {
+app.get('/api/salon/appointments', requireAuth, (req, res) => {
   res.json({ business_id: 'the_glossy_looks', appointments: salonAppointments });
 });
 
-app.get('/api/restaurant/menu', (req, res) => {
+app.get('/api/restaurant/menu', requireAuth, (req, res) => {
   res.json({ business_id: 'mozz_starters4u', current_revision: restaurantCatalogRevision, menu: restaurantMenu.filter(m => !m.isDeleted && m.isAvailable) });
 });
 
-app.get('/api/restaurant/tables', (req, res) => {
+app.get('/api/restaurant/tables', requireAuth, (req, res) => {
   res.json({ business_id: 'mozz_starters4u', tables: restaurantTables });
 });
 
-app.get('/api/restaurant/orders/pending', (req, res) => {
+app.get('/api/restaurant/orders/pending', requireAuth, (req, res) => {
   res.json({ business_id: 'mozz_starters4u', pending_orders: pendingRestaurantOrders });
 });
 
-app.get('/api/admin/devices', (req, res) => {
-  res.json({ devices: pairedDevices });
+app.get('/api/admin/devices', requireAuth, requireAdmin, (req, res) => {
+  const session: UserSession = (req as any).userSession;
+  const devices = session.role === 'superadmin'
+    ? pairedDevices
+    : pairedDevices.filter(d => d.outlet_id === session.activeOutlet.id || d.outlet_code === session.activeOutlet.code);
+  res.json({ devices });
 });
 
-app.get('/api/admin/bills', (req, res) => {
-  res.json({ bills: syncedBills });
+app.get('/api/admin/bills', requireAuth, requireAdmin, (req, res) => {
+  const session: UserSession = (req as any).userSession;
+  const bills = session.role === 'superadmin'
+    ? syncedBills
+    : syncedBills.filter(b => b.outlet_id === session.activeOutlet.id);
+  res.json({ bills });
 });
 
-app.get('/api/admin/orders', (req, res) => {
-  res.json({ orders: syncedOrders });
+app.get('/api/admin/orders', requireAuth, requireAdmin, (req, res) => {
+  const session: UserSession = (req as any).userSession;
+  const orders = session.role === 'superadmin'
+    ? syncedOrders
+    : syncedOrders.filter(o => o.outlet_id === session.activeOutlet.id);
+  res.json({ orders });
 });
 
-app.get('/api/admin/whatsapp-queue', (req, res) => {
+app.get('/api/admin/whatsapp-queue', requireAuth, requireAdmin, (req, res) => {
   res.json({ queue: whatsappQueue });
 });
 
-app.get('/api/admin/sync-status', (req, res) => {
+app.get('/api/admin/sync-status', requireAuth, requireAdmin, (req, res) => {
   res.json({
     supabase_configured: true,
     last_supabase_sync: lastSupabaseSyncTimestamp,
@@ -3721,154 +4496,11 @@ app.post('/api/supabase/sync', async (req, res) => {
   }
 });
 
-// -------------------------------------------------------------------------------------------------
-// 6. Automated Authentication & Tenant Isolation Test Runner
-// -------------------------------------------------------------------------------------------------
-app.get('/api/tests/run', async (req, res) => {
-  if (centralSupabaseConfig.isConfigured) return res.status(404).json({ success: false, message: 'Demo authentication tests disabled for connected projects' });
-  const results: Array<{ test: string; status: 'PASSED' | 'FAILED'; details: string }> = [];
-
-  try {
-    const saRes = await smavGateway.authenticate({
-      emailOrId: 'superadmin@smav.io',
-      password: 'SmavSuper@2026!'
-    });
-    if (saRes.success && saRes.session?.role === 'superadmin' && saRes.redirectTo === '/superadmin/outlets') {
-      results.push({ test: 'Central Superadmin Login & Route Resolution', status: 'PASSED', details: 'Role SUPERADMIN verified server-side, redirected to /superadmin/outlets' });
-    } else {
-      results.push({ test: 'Central Superadmin Login & Route Resolution', status: 'FAILED', details: saRes.message || 'Failed' });
-    }
-  } catch (e: any) {
-    results.push({ test: 'Central Superadmin Login', status: 'FAILED', details: e.message });
-  }
-
-  try {
-    const glRes = await smavGateway.authenticate({
-      emailOrId: 'ananya@glossylooks.com',
-      password: 'salon123'
-    });
-    if (glRes.success && glRes.session?.role === 'staff' && glRes.session?.activeOutlet.category === 'salon') {
-      results.push({ test: 'Glossy Looks Salon Staff Provider Adapter', status: 'PASSED', details: `Assigned to ${glRes.session.activeOutlet.name}, Role: staff` });
-    } else {
-      results.push({ test: 'Glossy Looks Salon Staff Provider Adapter', status: 'FAILED', details: glRes.message || 'Failed' });
-    }
-  } catch (e: any) {
-    results.push({ test: 'Glossy Looks Staff Login', status: 'FAILED', details: e.message });
-  }
-
-  try {
-    const mozzRes = await smavGateway.authenticate({
-      emailOrId: 'vikram@starters4u.in',
-      password: 'mozz123'
-    });
-    if (mozzRes.success && mozzRes.session?.role === 'staff' && mozzRes.session?.activeOutlet.category === 'restaurant') {
-      results.push({ test: 'Starters4U Restaurant Staff Provider Adapter', status: 'PASSED', details: `Assigned to ${mozzRes.session.activeOutlet.name}, Role: staff` });
-    } else {
-      results.push({ test: 'Starters4U Restaurant Staff Provider Adapter', status: 'FAILED', details: mozzRes.message || 'Failed' });
-    }
-  } catch (e: any) {
-    results.push({ test: 'Starters4U Staff Login', status: 'FAILED', details: e.message });
-  }
-
-  try {
-    const multiRes = await smavGateway.authenticate({
-      emailOrId: 'kpsrikanthreddy@gmail.com',
-      password: 'owner123'
-    });
-    if (multiRes.success && multiRes.multiBusiness && (multiRes.availableOutlets?.length || 0) >= 2) {
-      results.push({ test: 'Multi-Outlet Identity Detection & Selection Flow', status: 'PASSED', details: `Detected ${multiRes.availableOutlets?.length} authorized outlets without manual selection` });
-    } else {
-      results.push({ test: 'Multi-Outlet Identity Detection & Selection Flow', status: 'FAILED', details: multiRes.message || 'Failed' });
-    }
-  } catch (e: any) {
-    results.push({ test: 'Multi-Outlet Detection', status: 'FAILED', details: e.message });
-  }
-
-  try {
-    const badRes = await smavGateway.authenticate({
-      emailOrId: 'ananya@glossylooks.com',
-      password: 'wrong_password_123'
-    });
-    if (!badRes.success && !badRes.session) {
-      results.push({ test: 'Cryptographic Password Verification & Rejection', status: 'PASSED', details: 'Invalid credentials rejected with timing-safe comparison' });
-    } else {
-      results.push({ test: 'Cryptographic Password Verification & Rejection', status: 'FAILED', details: 'Unexpectedly accepted bad password' });
-    }
-  } catch (e: any) {
-    results.push({ test: 'Bad Credentials Rejection', status: 'FAILED', details: e.message });
-  }
-
-  try {
-    const outlets = await centralOutletRepo.listAllOutlets();
-    const categories = new Set(outlets.map(o => o.category));
-    if (categories.has('restaurant') && categories.has('salon') && categories.has('retail')) {
-      results.push({ test: 'Central Database Outlet Registry & Categorization', status: 'PASSED', details: `Loaded ${outlets.length} registered outlets across ${categories.size} categories without hardcoding` });
-    } else {
-      results.push({ test: 'Central Database Outlet Registry', status: 'FAILED', details: 'Missing expected categories' });
-    }
-  } catch (e: any) {
-    results.push({ test: 'Tenant Isolation', status: 'FAILED', details: e.message });
-  }
-
-  try {
-    const reqRes = await smavGateway.requestPasswordReset('ananya@glossylooks.com');
-    if (reqRes.success && reqRes.resetToken) {
-      const confirmRes = await smavGateway.confirmPasswordReset(reqRes.resetToken, 'salon123');
-      if (confirmRes.success) {
-        results.push({ test: 'Secure Time-Limited Password Reset Token Lifecycle', status: 'PASSED', details: 'Generated 15-min token, validated, updated salted hash, and revoked sessions' });
-      } else {
-        results.push({ test: 'Password Reset Lifecycle', status: 'FAILED', details: confirmRes.message });
-      }
-    } else {
-      results.push({ test: 'Password Reset Request', status: 'FAILED', details: reqRes.message });
-    }
-  } catch (e: any) {
-    results.push({ test: 'Password Reset Flow', status: 'FAILED', details: e.message });
-  }
-
-  try {
-    if (centralSupabaseConfig.isConfigured) {
-      const publicSupabase = getCentralSupabaseClient();
-      if (publicSupabase) {
-        const { error } = await publicSupabase.from('smav_profiles').select('id').limit(1);
-        if (!error || error.code === 'PGRST116' || error.message.includes('row-level security')) {
-          results.push({
-            test: 'Central SMAV Supabase Architecture & Table Connectivity',
-            status: 'PASSED',
-            details: `Connected to ${centralSupabaseConfig.projectUrl}. Verified public.smav_profiles RLS boundary.`
-          });
-        } else {
-          results.push({
-            test: 'Central SMAV Supabase Architecture & Table Connectivity',
-            status: 'FAILED',
-            details: error.message
-          });
-        }
-      }
-    } else {
-      results.push({
-        test: 'Central SMAV Supabase Architecture & Table Connectivity',
-        status: 'PASSED',
-        details: 'Gateway initialized & ready for live Supabase Auth via SMAV_SUPABASE_URL and SMAV_SUPABASE_ANON_KEY'
-      });
-    }
-  } catch (e: any) {
-    results.push({ test: 'Central SMAV Supabase Architecture', status: 'FAILED', details: e.message });
-  }
-
-  const allPassed = results.every(r => r.status === 'PASSED');
-  res.json({
-    success: allPassed,
-    summary: `${results.filter(r => r.status === 'PASSED').length}/${results.length} tests passed`,
-    results
-  });
-});
-
 // Downloadable Zip Generator for Android Project
 app.get('/api/download/android-project.zip', async (req, res) => {
   try {
     const zip = new JSZip();
-    const androidDir = path.join(__dirname, 'android');
+    const androidDir = path.join(__dirname, 'agents', 'android');
     const databaseDir = path.join(__dirname, 'database');
 
     function addDirectoryToZip(dirPath: string, zipFolder: JSZip) {

@@ -9,7 +9,6 @@ import {
   Database,
   ArrowRight,
   ShieldCheck,
-  Zap,
   Server,
   ExternalLink,
   Scissors,
@@ -30,7 +29,6 @@ interface SyncDashboardProps {
   lastSyncTime: string | null;
   syncEvents: SyncEventItem[];
   onTriggerSync: () => void;
-  onSimulatePriceBump: () => void;
   onPullSupabaseSync?: () => void;
 }
 
@@ -47,7 +45,6 @@ export const SyncDashboard: React.FC<SyncDashboardProps> = ({
   lastSyncTime,
   syncEvents,
   onTriggerSync,
-  onSimulatePriceBump,
   onPullSupabaseSync
 }) => {
   const isStale = localCatalogRevision < serverCatalogRevision;
@@ -88,14 +85,6 @@ export const SyncDashboard: React.FC<SyncDashboardProps> = ({
               {isPullingSupabase ? 'Syncing Supabase...' : 'Pull Live Supabase Catalog'}
             </button>
           )}
-
-          <button
-            onClick={onSimulatePriceBump}
-            className="flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-sky-300 border border-slate-600/60 px-3.5 py-2 rounded-xl text-xs font-semibold shadow-sm transition"
-          >
-            <Zap className="w-3.5 h-3.5 text-amber-400" />
-            Simulate Cloud Price Update
-          </button>
 
           <button
             onClick={onTriggerSync}
@@ -309,7 +298,7 @@ export const SyncDashboard: React.FC<SyncDashboardProps> = ({
         <div className="p-4 max-h-80 overflow-y-auto space-y-2 font-mono text-xs">
           {syncEvents.length === 0 ? (
             <div className="text-center py-8 text-slate-500">
-              No realtime events captured yet. Click "Simulate Cloud Price Update" above or edit an item in the Catalog Editor.
+              No realtime events captured yet. Catalog updates from Central Supabase will stream here automatically.
             </div>
           ) : (
             syncEvents.map((evt) => (

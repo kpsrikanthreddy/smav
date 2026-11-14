@@ -1,23 +1,17 @@
 import React, { useState, useEffect } from 'react';
 import {
-  ShieldCheck,
-  Building2,
   Users,
   Scissors,
   Utensils,
-  KeyRound,
   CheckCircle2,
   XCircle,
   RefreshCw,
   Sparkles,
-  ExternalLink,
   Code2,
   Copy,
-  Check,
-  AlertTriangle,
-  Play
+  Check
 } from 'lucide-react';
-import { UserSession } from '../types';
+import { UserSession, getVisibleRole } from '../types';
 
 interface PortalAuthDashboardProps {
   session: UserSession;
@@ -28,44 +22,20 @@ export const PortalAuthDashboard: React.FC<PortalAuthDashboardProps> = ({
   session,
   onLaunchOutletPos
 }) => {
-  const [activeSubTab, setActiveSubTab] = useState<'testing' | 'directory' | 'migrations'>('testing');
+  const [activeSubTab, setActiveSubTab] = useState<'directory' | 'migrations'>('directory');
   const [staffList, setStaffList] = useState<any[]>([]);
   const [isLoadingStaff, setIsLoadingStaff] = useState(false);
   const [copiedMigration, setCopiedMigration] = useState<string | null>(null);
-
-  // Glossy Looks Portal Form
-  const [glForm, setGlForm] = useState({
-    email: 'sneha.stylist@glossylooks.in',
-    fullName: 'Sneha Rao (Master Stylist)',
-    phone: '+91 98480 55667',
-    role: 'staff',
-    externalStaffId: 'gl_staff_991',
-    temporaryPassword: 'SalonPass@2026!'
-  });
-  const [glResult, setGlResult] = useState<any>(null);
-  const [isSubmittingGl, setIsSubmittingGl] = useState(false);
-
-  // MOZZ Portal Form
-  const [mozzForm, setMozzForm] = useState({
-    email: 'kiran.cashier@starters4u.in',
-    fullName: 'Kiran Kumar (Billing Counter)',
-    phone: '+91 98480 66778',
-    role: 'staff',
-    externalStaffId: 'mozz_staff_402',
-    temporaryPassword: 'MozzPass@2026!'
-  });
-  const [mozzResult, setMozzResult] = useState<any>(null);
-  const [isSubmittingMozz, setIsSubmittingMozz] = useState(false);
-
-  // Federation / Duplicate test
-  const [duplicateTestResult, setDuplicateTestResult] = useState<any>(null);
-  const [isTestingDuplicate, setIsTestingDuplicate] = useState(false);
+  const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
   // Fetch Central Staff list
   const fetchStaffList = async () => {
     setIsLoadingStaff(true);
     try {
-      const res = await fetch('/api/central-auth/staff/list');
+      const authHeader = session.supabaseToken || session.token;
+      const res = await fetch('/api/central-auth/staff/list', {
+        headers: { Authorization: `Bearer ${authHeader}` }
+      });
       const data = await res.json();
       if (data.success && data.staff) {
         setStaffList(data.staff);
@@ -80,120 +50,6 @@ export const PortalAuthDashboard: React.FC<PortalAuthDashboardProps> = ({
   useEffect(() => {
     fetchStaffList();
   }, []);
-
-  // Handle Glossy Looks staff creation simulation
-  const handleProvisionGl = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setIsSubmittingGl(true);
-    setGlResult(null);
-    try {
-      const authHeader = session.supabaseToken || session.token;
-      const res = await fetch('/api/central-auth/staff/provision', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${authHeader}`
-        },
-        body: JSON.stringify({
-          ...glForm,
-          outletCode: 'glossylooks',
-          businessSource: 'glossylooks'
-        })
-      });
-      const data = await res.json();
-      setGlResult(data);
-      fetchStaffList();
-    } catch (err: any) {
-      setGlResult({ success: false, message: err.message });
-    } finally {
-      setIsSubmittingGl(false);
-    }
-  };
-
-  // Handle MOZZ staff creation simulation
-  const handleProvisionMozz = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setIsSubmittingMozz(true);
-    setMozzResult(null);
-    try {
-      const authHeader = session.supabaseToken || session.token;
-      const res = await fetch('/api/central-auth/staff/provision', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${authHeader}`
-        },
-        body: JSON.stringify({
-          ...mozzForm,
-          outletCode: 'mozz',
-          businessSource: 'mozz'
-        })
-      });
-      const data = await res.json();
-      setMozzResult(data);
-      fetchStaffList();
-    } catch (err: any) {
-      setMozzResult({ success: false, message: err.message });
-    } finally {
-      setIsSubmittingMozz(false);
-    }
-  };
-
-  // Handle Duplicate Identity Prevention Test
-  const handleTestDuplicatePrevention = async () => {
-    setIsTestingDuplicate(true);
-    setDuplicateTestResult(null);
-    try {
-      const sharedEmail = 'multi.partner@enterprise.in';
-      const authHeader = session.supabaseToken || session.token;
-      
-      // Step 1: Provision for Glossy Looks
-      const step1 = await fetch('/api/central-auth/staff/provision', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${authHeader}`
-        },
-        body: JSON.stringify({
-          email: sharedEmail,
-          fullName: 'Multi Business Partner',
-          role: 'admin',
-          outletCode: 'glossylooks',
-          businessSource: 'glossylooks',
-          externalStaffId: 'partner_01'
-        })
-      }).then(r => r.json());
-
-      // Step 2: Provision same email for MOZZ
-      const step2 = await fetch('/api/central-auth/staff/provision', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${authHeader}`
-        },
-        body: JSON.stringify({
-          email: sharedEmail,
-          fullName: 'Multi Business Partner',
-          role: 'admin',
-          outletCode: 'mozz',
-          businessSource: 'mozz',
-          externalStaffId: 'partner_02'
-        })
-      }).then(r => r.json());
-
-      setDuplicateTestResult({
-        success: step2.success && step2.isLinked && !step2.isNewUser,
-        message: 'Shared identity successfully federated across both outlets without duplicate account creation.',
-        step1,
-        step2
-      });
-      fetchStaffList();
-    } catch (err: any) {
-      setDuplicateTestResult({ success: false, message: err.message });
-    } finally {
-      setIsTestingDuplicate(false);
-    }
-  };
 
   // Toggle staff status
   const handleToggleStaffStatus = async (staff: any) => {
@@ -216,18 +72,27 @@ export const PortalAuthDashboard: React.FC<PortalAuthDashboardProps> = ({
     }
   };
 
-  // Password reset test
+  // Password reset action
   const handleResetPassword = async (email: string) => {
+    setFeedback(null);
     try {
+      const authHeader = session.supabaseToken || session.token;
       const res = await fetch('/api/central-auth/staff/reset-password', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authHeader}`
+        },
         body: JSON.stringify({ email })
       });
       const data = await res.json();
-      alert(data.message || 'Password reset link sent to registered email');
+      if (res.ok && data.success !== false) {
+        setFeedback({ type: 'success', message: data.message || `Password reset initiated for ${email}.` });
+      } else {
+        setFeedback({ type: 'error', message: data.message || 'Failed to initiate password reset.' });
+      }
     } catch (e: any) {
-      alert('Error: ' + e.message);
+      setFeedback({ type: 'error', message: e.message || 'Failed to initiate password reset.' });
     }
   };
 
@@ -337,12 +202,29 @@ export const PortalAuthDashboard: React.FC<PortalAuthDashboardProps> = ({
         </div>
       </div>
 
+      {feedback && (
+        <div
+          role="alert"
+          className={`p-3 rounded-xl border text-xs flex items-center gap-2 ${
+            feedback.type === 'success'
+              ? 'bg-emerald-950/40 border-emerald-500/40 text-emerald-300'
+              : 'bg-rose-950/40 border-rose-500/40 text-rose-300'
+          }`}
+        >
+          {feedback.type === 'success' ? (
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+          ) : (
+            <XCircle className="w-4 h-4 text-rose-400 shrink-0" />
+          )}
+          <span>{feedback.message}</span>
+        </div>
+      )}
+
       {/* Sub-Tabs */}
       <div className="flex items-center gap-2 border-b border-slate-800 pb-2 text-xs">
         {[
-          { id: 'testing', label: 'Real Account Creation & POS Verification (Req 18)', icon: Sparkles },
           { id: 'directory', label: `Federated Central Staff Directory (${staffList.length})`, icon: Users },
-          { id: 'migrations', label: 'SQL Migrations & Adapters (Req 17)', icon: Code2 }
+          { id: 'migrations', label: 'SQL Migrations & Adapters', icon: Code2 }
         ].map(tab => (
           <button
             key={tab.id}
@@ -359,254 +241,7 @@ export const PortalAuthDashboard: React.FC<PortalAuthDashboardProps> = ({
         ))}
       </div>
 
-      {/* SUB-TAB 1: LIVE INTERACTIVE TESTING */}
-      {activeSubTab === 'testing' && (
-        <div className="space-y-6">
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            
-            {/* Form 1: The Glossy Looks Staff Creation */}
-            <div className="bg-[#121629] border border-[#1e2540] rounded-2xl p-6 shadow-xl space-y-4">
-              <div className="flex items-center gap-2">
-                <div className="w-7 h-7 rounded-lg bg-rose-500/20 text-rose-400 flex items-center justify-center">
-                  <Scissors className="w-4 h-4" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-bold text-white">The Glossy Looks Portal: Create Staff</h3>
-                  <p className="text-[11px] text-slate-400">Simulates staff user creation in Glossy Looks Admin Portal</p>
-                </div>
-              </div>
-
-              <form onSubmit={handleProvisionGl} className="space-y-3 text-xs">
-                <div>
-                  <label className="text-slate-300 block mb-1 font-medium">Staff Email (Central User ID)</label>
-                  <input
-                    type="email"
-                    value={glForm.email}
-                    onChange={e => setGlForm({ ...glForm, email: e.target.value })}
-                    required
-                    className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] px-3.5 py-2 text-white font-mono focus:outline-none focus:border-rose-500"
-                  />
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="text-slate-300 block mb-1 font-medium">Full Name</label>
-                    <input
-                      type="text"
-                      value={glForm.fullName}
-                      onChange={e => setGlForm({ ...glForm, fullName: e.target.value })}
-                      required
-                      className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] px-3.5 py-2 text-white focus:outline-none focus:border-rose-500"
-                    />
-                  </div>
-                  <div>
-                    <label className="text-slate-300 block mb-1 font-medium">Phone</label>
-                    <input
-                      type="text"
-                      value={glForm.phone}
-                      onChange={e => setGlForm({ ...glForm, phone: e.target.value })}
-                      className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] px-3.5 py-2 text-white focus:outline-none focus:border-rose-500"
-                    />
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="text-slate-300 block mb-1 font-medium">Role</label>
-                    <select
-                      value={glForm.role}
-                      onChange={e => setGlForm({ ...glForm, role: e.target.value })}
-                      className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] px-3.5 py-2 text-white focus:outline-none focus:border-rose-500"
-                    >
-                      <option value="staff">Staff (Stylist / Counter)</option>
-                      <option value="admin">Admin (Branch Manager)</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="text-slate-300 block mb-1 font-medium">Local Staff ID</label>
-                    <input
-                      type="text"
-                      value={glForm.externalStaffId}
-                      onChange={e => setGlForm({ ...glForm, externalStaffId: e.target.value })}
-                      className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] px-3.5 py-2 text-white font-mono focus:outline-none focus:border-rose-500"
-                    />
-                  </div>
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={isSubmittingGl}
-                  className="w-full py-2.5 rounded-xl bg-gradient-to-r from-rose-500 to-pink-500 hover:brightness-110 font-bold text-white shadow-lg shadow-rose-500/20 transition flex items-center justify-center gap-2"
-                >
-                  <Scissors className="w-4 h-4" />
-                  {isSubmittingGl ? 'Provisioning in Central SMAV...' : 'Provision / Link in Central SMAV Auth'}
-                </button>
-              </form>
-
-              {glResult && (
-                <div className={`p-3 rounded-xl border text-xs space-y-1 ${
-                  glResult.success ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300' : 'bg-rose-500/10 border-rose-500/30 text-rose-300'
-                }`}>
-                  <div className="font-bold flex items-center gap-1.5">
-                    {glResult.success ? <CheckCircle2 className="w-4 h-4 text-emerald-400" /> : <XCircle className="w-4 h-4 text-rose-400" />}
-                    {glResult.message}
-                  </div>
-                  {glResult.success && (
-                    <div className="font-mono text-[11px] text-slate-300 pt-1">
-                      Central User ID: {glResult.centralUserId} • Assigned Outlet: {glResult.outletCode} (Category: {glResult.outletCategory})
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-
-            {/* Form 2: MOZZ / Starters4U Staff Creation */}
-            <div className="bg-[#121629] border border-[#1e2540] rounded-2xl p-6 shadow-xl space-y-4">
-              <div className="flex items-center gap-2">
-                <div className="w-7 h-7 rounded-lg bg-amber-500/20 text-amber-400 flex items-center justify-center">
-                  <Utensils className="w-4 h-4" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-bold text-white">MOZZ / Starters4U Portal: Create Staff</h3>
-                  <p className="text-[11px] text-slate-400">Simulates restaurant staff user creation in MOZZ Admin Portal</p>
-                </div>
-              </div>
-
-              <form onSubmit={handleProvisionMozz} className="space-y-3 text-xs">
-                <div>
-                  <label className="text-slate-300 block mb-1 font-medium">Staff Email (Central User ID)</label>
-                  <input
-                    type="email"
-                    value={mozzForm.email}
-                    onChange={e => setMozzForm({ ...mozzForm, email: e.target.value })}
-                    required
-                    className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] px-3.5 py-2 text-white font-mono focus:outline-none focus:border-amber-500"
-                  />
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="text-slate-300 block mb-1 font-medium">Full Name</label>
-                    <input
-                      type="text"
-                      value={mozzForm.fullName}
-                      onChange={e => setMozzForm({ ...mozzForm, fullName: e.target.value })}
-                      required
-                      className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] px-3.5 py-2 text-white focus:outline-none focus:border-amber-500"
-                    />
-                  </div>
-                  <div>
-                    <label className="text-slate-300 block mb-1 font-medium">Phone</label>
-                    <input
-                      type="text"
-                      value={mozzForm.phone}
-                      onChange={e => setMozzForm({ ...mozzForm, phone: e.target.value })}
-                      className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] px-3.5 py-2 text-white focus:outline-none focus:border-amber-500"
-                    />
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="text-slate-300 block mb-1 font-medium">Role</label>
-                    <select
-                      value={mozzForm.role}
-                      onChange={e => setMozzForm({ ...mozzForm, role: e.target.value })}
-                      className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] px-3.5 py-2 text-white focus:outline-none focus:border-amber-500"
-                    >
-                      <option value="staff">Staff (Cashier / Waiter)</option>
-                      <option value="admin">Admin (Restaurant Manager)</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="text-slate-300 block mb-1 font-medium">Local Staff ID</label>
-                    <input
-                      type="text"
-                      value={mozzForm.externalStaffId}
-                      onChange={e => setMozzForm({ ...mozzForm, externalStaffId: e.target.value })}
-                      className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] px-3.5 py-2 text-white font-mono focus:outline-none focus:border-amber-500"
-                    />
-                  </div>
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={isSubmittingMozz}
-                  className="w-full py-2.5 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:brightness-110 font-bold text-white shadow-lg shadow-amber-500/20 transition flex items-center justify-center gap-2"
-                >
-                  <Utensils className="w-4 h-4" />
-                  {isSubmittingMozz ? 'Provisioning in Central SMAV...' : 'Provision / Link in Central SMAV Auth'}
-                </button>
-              </form>
-
-              {mozzResult && (
-                <div className={`p-3 rounded-xl border text-xs space-y-1 ${
-                  mozzResult.success ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300' : 'bg-rose-500/10 border-rose-500/30 text-rose-300'
-                }`}>
-                  <div className="font-bold flex items-center gap-1.5">
-                    {mozzResult.success ? <CheckCircle2 className="w-4 h-4 text-emerald-400" /> : <XCircle className="w-4 h-4 text-rose-400" />}
-                    {mozzResult.message}
-                  </div>
-                  {mozzResult.success && (
-                    <div className="font-mono text-[11px] text-slate-300 pt-1">
-                      Central User ID: {mozzResult.centralUserId} • Assigned Outlet: {mozzResult.outletCode} (Category: {mozzResult.outletCategory})
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Duplicate Identity Prevention Test Box */}
-          <div className="bg-[#121629] border border-[#1e2540] rounded-2xl p-6 shadow-xl space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-4">
-              <div>
-                <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                  <ShieldCheck className="w-4 h-4 text-pink-400" />
-                  Requirement 13 Test: Duplicate Prevention & Verified Identity Federation
-                </h3>
-                <p className="text-xs text-slate-400 mt-0.5">
-                  Proves that provisioning an account that already exists in Central Auth securely links the verified identity to the second outlet without creating duplicate user accounts.
-                </p>
-              </div>
-
-              <button
-                onClick={handleTestDuplicatePrevention}
-                disabled={isTestingDuplicate}
-                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-white transition flex items-center gap-2"
-              >
-                <Play className="w-3.5 h-3.5 text-pink-400" />
-                {isTestingDuplicate ? 'Testing Federation...' : 'Run Duplicate Prevention Test'}
-              </button>
-            </div>
-
-            {duplicateTestResult && (
-              <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-xs space-y-2">
-                <div className="text-emerald-400 font-bold flex items-center gap-2">
-                  <CheckCircle2 className="w-4 h-4" />
-                  {duplicateTestResult.message}
-                </div>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-[11px] font-mono text-slate-300 pt-1">
-                  <div className="p-2.5 rounded-lg bg-slate-900/60 border border-slate-800">
-                    <span className="text-rose-400 block font-semibold mb-1">Step 1: The Glossy Looks</span>
-                    New User Created: <span className="text-white">true</span><br />
-                    Central User ID: <span className="text-white">{duplicateTestResult.step1?.centralUserId}</span><br />
-                    Outlet: <span className="text-white">glossylooks</span>
-                  </div>
-                  <div className="p-2.5 rounded-lg bg-slate-900/60 border border-slate-800">
-                    <span className="text-amber-400 block font-semibold mb-1">Step 2: MOZZ Restaurant</span>
-                    New User Created: <span className="text-emerald-400 font-bold">false (Prevented duplicate!)</span><br />
-                    Identity Linked: <span className="text-emerald-400 font-bold">true</span><br />
-                    Same User ID: <span className="text-white">{duplicateTestResult.step2?.centralUserId}</span>
-                  </div>
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* SUB-TAB 2: FEDERATED STAFF DIRECTORY */}
+      {/* SUB-TAB 1: FEDERATED STAFF DIRECTORY */}
       {activeSubTab === 'directory' && (
         <div className="bg-[#121629] border border-[#1e2540] rounded-2xl p-6 shadow-xl space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-4">
@@ -641,9 +276,11 @@ export const PortalAuthDashboard: React.FC<PortalAuthDashboardProps> = ({
                     </td>
                     <td className="py-3.5 px-4">
                       <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
-                        st.role === 'admin' ? 'bg-sky-500/20 text-sky-400 border border-sky-500/30' : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                        getVisibleRole(st.displayRole || st.role) === 'ADMIN'
+                          ? 'bg-sky-500/20 text-sky-400 border border-sky-500/30'
+                          : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
                       }`}>
-                        {st.role}
+                        {getVisibleRole(st.displayRole || st.role)}
                       </span>
                     </td>
                     <td className="py-3.5 px-4">
@@ -707,16 +344,16 @@ export const PortalAuthDashboard: React.FC<PortalAuthDashboardProps> = ({
         </div>
       )}
 
-      {/* SUB-TAB 3: SQL MIGRATIONS & ADAPTERS */}
+      {/* SUB-TAB 2: SQL MIGRATIONS & ADAPTERS */}
       {activeSubTab === 'migrations' && (
         <div className="bg-[#121629] border border-[#1e2540] rounded-2xl p-6 shadow-xl space-y-6">
           <div>
             <h3 className="text-base font-bold text-white flex items-center gap-2">
               <Code2 className="w-5 h-5 text-pink-400" />
-              SQL Migrations & Portal Integration Adapters (Req 17)
+              SQL Migrations & Portal Integration Adapters
             </h3>
             <p className="text-xs text-slate-400 mt-1">
-              Exact SQL migrations and TypeScript adapters for each respective project database.
+              Active SQL migrations and TypeScript adapters for each respective project database.
               Operational data and tables remain 100% intact.
             </p>
           </div>
@@ -726,19 +363,19 @@ export const PortalAuthDashboard: React.FC<PortalAuthDashboardProps> = ({
             <div className="p-4 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
               <div className="flex items-center justify-between">
                 <div>
-                  <div className="font-bold text-white">1. Central SMAV Supabase Project Migration</div>
-                  <div className="text-[11px] text-slate-400 font-mono">database/migrations/009_shared_portal_authentication_and_linking.sql</div>
+                  <div className="font-bold text-white">1. Central SMAV Supabase Project RLS Migration (Phase 1)</div>
+                  <div className="text-[11px] text-slate-400 font-mono">database/migrations/011_phase1_central_login_roles_rls.sql</div>
                 </div>
                 <button
-                  onClick={() => copyToClipboard(`ALTER TABLE public.smav_user_outlet_roles ADD COLUMN IF NOT EXISTS external_staff_id text;`, 'm1')}
+                  onClick={() => copyToClipboard(`database/migrations/011_phase1_central_login_roles_rls.sql`, 'm1')}
                   className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-[11px] flex items-center gap-1.5"
                 >
                   {copiedMigration === 'm1' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
-                  {copiedMigration === 'm1' ? 'Copied' : 'Copy SQL'}
+                  {copiedMigration === 'm1' ? 'Copied' : 'Copy Path'}
                 </button>
               </div>
               <p className="text-[11px] text-slate-400">
-                Adds <code className="text-pink-300">external_staff_id</code>, <code className="text-pink-300">business_source</code>, and narrow RLS policies for outlet administrators.
+                Configures non-recursive <code className="text-pink-300">SECURITY DEFINER</code> RLS helpers, <code className="text-pink-300">STAFF</code>-only management by outlet <code className="text-pink-300">ADMIN</code>s, trusted audit writes, and <code className="text-pink-300">smav_external_identities</code> access.
               </p>
             </div>
 

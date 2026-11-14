@@ -14,7 +14,7 @@ import {
   Utensils,
   ShoppingBag
 } from 'lucide-react';
-import { UserSession, UserOutletMembership, SyncEventItem } from './types';
+import { UserSession, UserOutletMembership, SyncEventItem, getVisibleRole } from './types';
 import { LoginScreen } from './components/LoginScreen';
 import { OutletSelectionScreen } from './components/OutletSelectionScreen';
 import { SuperadminDashboard } from './components/SuperadminDashboard';
@@ -27,6 +27,9 @@ export default function App() {
   const [session, setSession] = useState<UserSession | null>(null);
   const [multiBusinessOptions, setMultiBusinessOptions] = useState<UserOutletMembership[] | null>(null);
   const [tempUserId, setTempUserId] = useState<string>('');
+  const [tempToken, setTempToken] = useState<string>('');
+  const [isSwitchingOutlet, setIsSwitchingOutlet] = useState<boolean>(false);
+  const [outletSwitchError, setOutletSwitchError] = useState<string | null>(null);
 
   // Active top navigation tab
   const [activeTab, setActiveTab] = useState<'primary' | 'pos' | 'sync' | 'whatsapp'>('primary');
@@ -96,34 +99,39 @@ export default function App() {
   }, [session?.activeOutlet?.id]);
 
   // Handle successful login from LoginScreen
-  const handleLoginSuccess = (userSession: UserSession, redirectTo?: string) => {
+  const handleLoginSuccess = (userSession: UserSession, _redirectTo?: string) => {
     setSession(userSession);
     setMultiBusinessOptions(null);
+    setTempToken('');
+    setTempUserId('');
+    setOutletSwitchError(null);
 
-    // Route based on role (Item 3: Role-Based Redirection)
+    // Route based on verified role
     if (userSession.role === 'superadmin') {
       setActiveTab('primary'); // Superadmin Dashboard
     } else if (userSession.role === 'admin') {
       setActiveTab('primary'); // Admin Dashboard
     } else {
-      setActiveTab('pos'); // Staff POS
+      setActiveTab('pos'); // POS_BILLING: Billing & printing only
     }
   };
 
   // Handle multi-outlet detection
-  const handleMultiBusinessFound = (outlets: UserOutletMembership[], tempToken: string, userId: string) => {
+  const handleMultiBusinessFound = (outlets: UserOutletMembership[], token: string, userId: string) => {
     setMultiBusinessOptions(outlets);
+    setTempToken(token);
     setTempUserId(userId);
   };
 
   // Handle outlet selection from multi-outlet screen
-  const handleSelectOutlet = async (outletId: string) => {
+  const handleSelectOutlet = async (outletId: string, tokenFromScreen?: string) => {
     try {
       const res = await fetch('/api/auth/select-outlet', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          userId: tempUserId,
+          tempToken: tokenFromScreen || tempToken,
+          userId: tempUserId || undefined,
           outletId,
           deviceId: 'SMAV-DEV-MULTI-01'
         })
@@ -131,9 +139,43 @@ export default function App() {
       const data = await res.json();
       if (data.success && data.session) {
         handleLoginSuccess(data.session, data.redirectTo);
+      } else {
+        setOutletSwitchError(data.message || 'Failed to select outlet.');
       }
     } catch (e) {
       console.error(e);
+    }
+  };
+
+  // Switch between assigned outlets when authenticated
+  const handleSwitchAssignedOutlet = async (outletId: string) => {
+    if (!session || !outletId || outletId === session.activeOutlet.id) return;
+    setIsSwitchingOutlet(true);
+    setOutletSwitchError(null);
+    try {
+      const res = await fetch('/api/auth/switch-outlet', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.token}`
+        },
+        body: JSON.stringify({ outletId })
+      });
+      const data = await res.json();
+      if (res.ok && data.success && data.session) {
+        setSession(data.session);
+        if (data.session.role === 'staff') {
+          setActiveTab('pos');
+        } else {
+          setActiveTab('primary');
+        }
+      } else {
+        setOutletSwitchError(data.message || 'Unable to switch outlet.');
+      }
+    } catch (e: any) {
+      setOutletSwitchError(e.message || 'Network error switching outlet.');
+    } finally {
+      setIsSwitchingOutlet(false);
     }
   };
 
@@ -177,10 +219,12 @@ export default function App() {
     return (
       <OutletSelectionScreen
         availableOutlets={multiBusinessOptions}
-        tempToken=""
+        tempToken={tempToken}
         onSelectOutlet={handleSelectOutlet}
         onLogout={() => {
           setMultiBusinessOptions(null);
+          setTempToken('');
+          setTempUserId('');
         }}
       />
     );
@@ -219,20 +263,37 @@ export default function App() {
                     ? 'bg-sky-500/10 text-sky-400 border-sky-500/30'
                     : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
                 }`}>
-                  {session.role.toUpperCase()}
+                  {getVisibleRole(session.displayRole || session.role)}
                 </span>
                 <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
                   Rev #{localCatalogRevision}
                 </span>
               </div>
               <p className="text-xs text-slate-400 truncate max-w-sm sm:max-w-md">
-                {session.activeOutlet.name} • <span className="text-slate-300">{session.fullName}</span> ({session.specificTitle})
+                {session.activeOutlet.name} • <span className="text-slate-300">{session.fullName}</span> ({getVisibleRole(session.displayRole || session.role)})
               </p>
             </div>
           </div>
 
           {/* Right Header Controls */}
           <div className="flex items-center gap-2 sm:gap-3">
+            {session.assignedOutlets && session.assignedOutlets.filter(o => o.outletId !== 'all').length > 1 && (
+              <select
+                aria-label="Switch assigned outlet"
+                value={session.activeOutlet.id}
+                disabled={isSwitchingOutlet}
+                onChange={(e) => handleSwitchAssignedOutlet(e.target.value)}
+                className="bg-[#161a33] border border-[#2a3055] text-slate-200 rounded-xl px-2.5 py-1.5 text-xs focus:outline-none focus:border-pink-500"
+              >
+                {session.assignedOutlets
+                  .filter(o => o.outletId !== 'all')
+                  .map(o => (
+                    <option key={o.outletId} value={o.outletId}>
+                      {o.outletName} ({getVisibleRole(o.displayRole || o.role)})
+                    </option>
+                  ))}
+              </select>
+            )}
             <a
               href="/api/download/android-project.zip"
               download="SMAV-Print-Agent-Android.zip"
@@ -302,18 +363,28 @@ export default function App() {
             </span>
           </button>
 
-          {/* Realtime Sync Tab */}
-          <button
-            onClick={() => setActiveTab('sync')}
-            className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg font-medium transition ${
-              activeTab === 'sync' ? 'bg-slate-800 text-white border border-slate-700 shadow-sm' : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Radio className="w-3.5 h-3.5 text-emerald-400" />
-            <span>Realtime Delta Sync Cursor</span>
-          </button>
+          {/* Realtime Sync Tab (Admin & Superadmin only; POS_BILLING is billing/printing only) */}
+          {session.role !== 'staff' && (
+            <button
+              onClick={() => setActiveTab('sync')}
+              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg font-medium transition ${
+                activeTab === 'sync' ? 'bg-slate-800 text-white border border-slate-700 shadow-sm' : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Radio className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Realtime Delta Sync Cursor</span>
+            </button>
+          )}
         </div>
       </header>
+
+      {outletSwitchError && (
+        <div role="alert" className="max-w-7xl mx-auto w-full px-4 lg:px-8 pt-4">
+          <div className="rounded-xl border border-rose-500/40 bg-rose-950/40 px-4 py-2.5 text-xs text-rose-200">
+            {outletSwitchError}
+          </div>
+        </div>
+      )}
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl mx-auto w-full p-4 lg:p-8">
@@ -352,8 +423,8 @@ export default function App() {
           />
         )}
 
-        {/* VIEW 4: REALTIME SYNC DASHBOARD */}
-        {activeTab === 'sync' && (
+        {/* VIEW 4: REALTIME SYNC DASHBOARD (Admin & Superadmin only) */}
+        {activeTab === 'sync' && session.role !== 'staff' && (
           <div className="space-y-4">
             <div className="bg-[#121629] border border-[#1e2540] rounded-2xl p-6 shadow-xl space-y-3">
               <h2 className="text-lg font-bold text-white flex items-center gap-2">
@@ -377,7 +448,6 @@ export default function App() {
               lastSyncTime={lastSyncTime}
               syncEvents={syncEvents}
               onTriggerSync={() => {}}
-              onSimulatePriceBump={() => {}}
             />
           </div>
         )}
