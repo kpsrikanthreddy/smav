@@ -72,7 +72,8 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
     receiptHeader: '',
     receiptFooter: '',
     providerType: 'custom_outlet' as any,
-    supabaseUrl: ''
+    supabaseUrl: '',
+    syncWebhookUrl: ''
   });
 
   const [editOutletForm, setEditOutletForm] = useState({
@@ -84,22 +85,22 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
     gstin: '',
     receiptHeader: '',
     receiptFooter: '',
-    supabaseUrl: ''
+    supabaseUrl: '',
+    syncWebhookUrl: ''
   });
 
   const [newAdminForm, setNewAdminForm] = useState({
     email: '',
+    username: '',
     fullName: '',
     phone: '',
     outletId: '',
-    specificTitle: 'Outlet Administrator',
-    password: ''
+    initialPassword: ''
   });
 
   const [resetPassFeedback, setResetPassFeedback] = useState<string | null>(null);
-  const [glossySyncStatus, setGlossySyncStatus] = useState<any>(null);
-  const [isSyncingGlossy, setIsSyncingGlossy] = useState(false);
-  const [syncFeedback, setSyncFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [resetTempPassword, setResetTempPassword] = useState('');
+  const [resetConfirmPassword, setResetConfirmPassword] = useState('');
 
   // Fetch initial data
   const fetchData = async () => {
@@ -107,14 +108,13 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
     try {
       const headers = { Authorization: `Bearer ${session.token}` };
 
-      const [outletsRes, reportsRes, adminsRes, auditRes, profileRes, sbStatusRes, glossySyncRes] = await Promise.all([
+      const [outletsRes, reportsRes, adminsRes, auditRes, profileRes, sbStatusRes] = await Promise.all([
         fetch('/api/superadmin/outlets', { headers }).then(r => r.json()).catch(() => ({ outlets: [] })),
         fetch('/api/superadmin/reports', { headers }).then(r => r.json()).catch(() => null),
         fetch('/api/superadmin/admins', { headers }).then(r => r.json()).catch(() => ({ admins: [] })),
         fetch('/api/superadmin/audit-logs', { headers }).then(r => r.json()).catch(() => ({ logs: [] })),
         fetch('/api/auth/profile', { headers }).then(r => r.json()).catch(() => null),
-        fetch('/api/central-supabase/status').then(r => r.json()).catch(() => null),
-        fetch('/api/superadmin/glossylooks-sync-status', { headers }).then(r => r.json()).catch(() => null)
+        fetch('/api/central-supabase/status').then(r => r.json()).catch(() => null)
       ]);
 
       if (outletsRes.success && Array.isArray(outletsRes.outlets)) {
@@ -129,40 +129,11 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
       if (auditRes.logs) setAuditLogs(auditRes.logs);
       if (profileRes?.profile) setUserProfile(profileRes.profile);
       if (sbStatusRes) setSupabaseStatus(sbStatusRes);
-      if (glossySyncRes?.data) setGlossySyncStatus(glossySyncRes.data);
     } catch (e) {
       console.error('Superadmin data fetch error:', e);
       setOutletLoadError('Cannot reach SMAV backend.');
     } finally {
       setIsLoading(false);
-    }
-  };
-
-  const handleTriggerGlossySync = async () => {
-    setIsSyncingGlossy(true);
-    setSyncFeedback(null);
-    try {
-      const res = await fetch('/api/superadmin/sync-glossylooks', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session.token}`
-        }
-      });
-      const data = await res.json();
-      if (data.success) {
-        setSyncFeedback({ type: 'success', message: data.message || 'Glossy Looks staff synchronized successfully.' });
-        fetchData();
-      } else {
-        const errorMsg = data.diagnostic?.solution
-          ? `${data.message || data.error} Note: ${data.diagnostic.solution}`
-          : (data.message || data.error || 'Failed to synchronize Glossy Looks staff.');
-        setSyncFeedback({ type: 'error', message: errorMsg });
-      }
-    } catch (err: any) {
-      setSyncFeedback({ type: 'error', message: err.message || 'Network error triggering sync' });
-    } finally {
-      setIsSyncingGlossy(false);
     }
   };
 
@@ -194,7 +165,8 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
           receiptHeader: '',
           receiptFooter: '',
           providerType: 'custom_outlet',
-          supabaseUrl: ''
+          supabaseUrl: '',
+          syncWebhookUrl: ''
         });
         fetchData();
       }
@@ -244,37 +216,18 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
     }
   };
 
-  // Create Administrator via Edge Function / API
+  // Create Administrator via unified SMAV server sync proxy
   const handleCreateAdmin = async (e: React.FormEvent) => {
     e.preventDefault();
+    setResetPassFeedback(null);
+    if (newAdminForm.initialPassword.length < 8) {
+      setResetPassFeedback('Error: Initial temporary password must be at least 8 characters.');
+      return;
+    }
+
     try {
       const targetOutlet = outlets.find(o => o.id === newAdminForm.outletId);
       const outletCode = targetOutlet?.code || newAdminForm.outletId;
-
-      if (session.supabaseToken) {
-        const edgeRes = await identityAdminService.createOutletAdmin(session.supabaseToken, {
-          email: newAdminForm.email.trim(),
-          fullName: newAdminForm.fullName.trim(),
-          phone: newAdminForm.phone.trim(),
-          outletCode,
-          temporaryPassword: newAdminForm.password || undefined
-        });
-
-        if (edgeRes.success) {
-          setIsAddAdminOpen(false);
-          setResetPassFeedback(
-            edgeRes.activationLink
-              ? `Admin created! Activation link: ${edgeRes.activationLink}`
-              : (edgeRes.message || 'Admin created successfully in Central SMAV.')
-          );
-          setNewAdminForm({ email: '', fullName: '', phone: '', outletId: '', specificTitle: 'Outlet Administrator', password: '' });
-          fetchData();
-          return;
-        } else {
-          setResetPassFeedback(`Error: ${edgeRes.error || 'Failed to create administrator'}`);
-          return;
-        }
-      }
 
       const res = await fetch('/api/superadmin/admins', {
         method: 'POST',
@@ -282,12 +235,24 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
           'Content-Type': 'application/json',
           Authorization: `Bearer ${session.token}`
         },
-        body: JSON.stringify({ ...newAdminForm, outletCode })
+        body: JSON.stringify({
+          email: newAdminForm.email.trim(),
+          username: newAdminForm.username.trim().toLowerCase() || undefined,
+          fullName: newAdminForm.fullName.trim(),
+          phone: newAdminForm.phone.trim(),
+          outletId: newAdminForm.outletId,
+          outletCode,
+          initialPassword: newAdminForm.initialPassword
+        })
       });
-      if (res.ok) {
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
         setIsAddAdminOpen(false);
-        setNewAdminForm({ email: '', fullName: '', phone: '', outletId: '', specificTitle: 'Outlet Administrator', password: '' });
+        setResetPassFeedback(data.message || 'Outlet administrator provisioned in Central SMAV.');
+        setNewAdminForm({ email: '', username: '', fullName: '', phone: '', outletId: '', initialPassword: '' });
         fetchData();
+      } else {
+        setResetPassFeedback(`Error: ${data.message || data.error || 'Failed to create administrator'}`);
       }
     } catch (e: any) {
       console.error(e);
@@ -295,38 +260,38 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
     }
   };
 
-  // Reset Admin Password via Edge Function / API
-  const handleResetAdminPassword = async () => {
+  // Direct temporary password reset for an administrator (must change on first sign-in)
+  const handleResetAdminPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
     if (!selectedAdmin) return;
+    const targetUserId = selectedAdmin.userId || selectedAdmin.id;
+    if (!targetUserId) {
+      setResetPassFeedback('Error: Target Central Auth UUID is missing for this administrator.');
+      return;
+    }
+    if (resetTempPassword.length < 8) {
+      setResetPassFeedback('Error: Temporary password must be at least 8 characters.');
+      return;
+    }
+    if (resetTempPassword !== resetConfirmPassword) {
+      setResetPassFeedback('Error: Password confirmation does not match.');
+      return;
+    }
+
     try {
-      if (session.supabaseToken) {
-        const edgeRes = await identityAdminService.resetPassword(session.supabaseToken, {
-          userId: selectedAdmin.id,
-          email: selectedAdmin.email,
-          outletCode: selectedAdmin.outletCode
-        });
-
-        if (edgeRes.success) {
-          setResetPassFeedback(
-            edgeRes.recoveryLink
-              ? `Password recovery link for ${selectedAdmin.fullName}: ${edgeRes.recoveryLink}`
-              : (edgeRes.message || 'Password reset link sent successfully.')
-          );
-          return;
-        }
-      }
-
-      const res = await fetch(`/api/superadmin/admins/${selectedAdmin.id}/reset-password`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session.token}`
-        },
-        body: JSON.stringify({})
+      const targetOutletCode = selectedAdmin.outletCode || selectedAdmin.memberships?.[0]?.outletCode || 'glossylooks';
+      const res = await identityAdminService.resetOutletUserPassword(session.token, targetUserId, {
+        newPassword: resetTempPassword,
+        email: selectedAdmin.email || undefined,
+        outletCode: targetOutletCode
       });
-      const data = await res.json();
-      if (data.success) {
-        setResetPassFeedback(`Generated temporary credentials: ${data.temporaryPassword}`);
+
+      if (res.success) {
+        setResetTempPassword('');
+        setResetConfirmPassword('');
+        setResetPassFeedback(`${res.message} User must change this temporary password on next sign-in.`);
+      } else {
+        setResetPassFeedback(`Error: ${res.message || res.error || 'Failed to set temporary password'}`);
       }
     } catch (e: any) {
       console.error(e);
@@ -530,7 +495,8 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
                               gstin: outlet.gstin,
                               receiptHeader: outlet.receiptHeader,
                               receiptFooter: outlet.receiptFooter,
-                              supabaseUrl: outlet.supabaseUrl || ''
+                              supabaseUrl: outlet.supabaseUrl || '',
+                              syncWebhookUrl: outlet.syncWebhookUrl || ''
                             });
                             setIsEditOutletOpen(true);
                           }}
@@ -566,30 +532,54 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
           <div className="flex items-center justify-between">
             <h3 className="text-sm font-bold text-white">Registered Outlet Administrators</h3>
             <button
-              onClick={() => setIsAddAdminOpen(true)}
+              onClick={() => {
+                setResetPassFeedback(null);
+                setIsAddAdminOpen(true);
+              }}
               className="px-3.5 py-1.5 rounded-xl bg-pink-600 hover:bg-pink-500 text-white text-xs font-semibold transition"
             >
               + Create Administrator
             </button>
           </div>
 
+          {resetPassFeedback && !isResetPasswordOpen && (
+            <div className={`p-3 rounded-xl border text-xs flex items-center justify-between gap-2 ${
+              resetPassFeedback.startsWith('Error:')
+                ? 'bg-rose-500/15 border-rose-500/30 text-rose-300'
+                : 'bg-emerald-500/15 border-emerald-500/30 text-emerald-300'
+            }`}>
+              <span>{resetPassFeedback}</span>
+              <button onClick={() => setResetPassFeedback(null)} className="underline text-[11px]">Dismiss</button>
+            </div>
+          )}
+
           <div className="bg-[#121629] border border-[#1e2540] rounded-2xl overflow-hidden shadow-xl">
             <table className="w-full text-left text-xs text-slate-300">
               <thead className="bg-[#161a33] text-slate-400 border-b border-[#2a3055] font-semibold">
                 <tr>
-                  <th className="p-4">Admin Name & Email</th>
+                  <th className="p-4">Admin Name, Email & UUID</th>
                   <th className="p-4">Assigned Outlet</th>
                   <th className="p-4">Role Title</th>
-                  <th className="p-4">Status</th>
+                  <th className="p-4">Activation & Status</th>
                   <th className="p-4 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/80">
-                {adminsList.map(admin => (
-                  <tr key={admin.id} className="hover:bg-slate-800/30 transition">
+                {adminsList.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} className="p-8 text-center text-slate-500">
+                      No outlet administrators currently linked in Central SMAV. Use &ldquo;Create Administrator&rdquo; or map an owner via Multi-Portal Shared Auth &amp; Sync.
+                    </td>
+                  </tr>
+                ) : adminsList.map(admin => (
+                  <tr key={admin.userId || admin.id} className="hover:bg-slate-800/30 transition">
                     <td className="p-4">
-                      <div className="font-bold text-white">{admin.fullName}</div>
-                      <div className="text-slate-400 font-mono text-[11px]">{admin.email}</div>
+                      <div className="font-bold text-white">{admin.fullName || 'Unnamed Admin'}</div>
+                      <div className="text-slate-300 font-mono text-[11px]">{admin.email || 'No email'}</div>
+                      {admin.username && (
+                        <div className="text-slate-400 font-mono text-[10px]">username: {admin.username}</div>
+                      )}
+                      <div className="text-slate-500 font-mono text-[10px]">UUID: {admin.userId || admin.id}</div>
                     </td>
                     <td className="p-4">
                       {admin.memberships && admin.memberships.length > 0 ? (
@@ -621,17 +611,26 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
                       </span>
                     </td>
                     <td className="p-4">
-                      <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                        admin.isActive ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
-                      }`}>
-                        {admin.isActive ? 'ACTIVE' : 'DEACTIVATED'}
-                      </span>
+                      <div className="flex flex-col gap-1 items-start">
+                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                          admin.isActive ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
+                        }`}>
+                          {admin.isActive ? 'ACTIVE' : 'DISABLED'}
+                        </span>
+                        {admin.mustChangePassword && admin.isActive && (
+                          <span className="text-[10px] font-medium text-amber-400">
+                            Temp Password Active
+                          </span>
+                        )}
+                      </div>
                     </td>
                     <td className="p-4 text-right">
                       <button
                         onClick={() => {
                           setSelectedAdmin(admin);
                           setResetPassFeedback(null);
+                          setResetTempPassword('');
+                          setResetConfirmPassword('');
                           setIsResetPasswordOpen(true);
                         }}
                         className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-400 text-xs font-semibold transition"
@@ -893,146 +892,13 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
       )}
 
       {/* ============================================================================== */}
-      {/* TAB 7: MULTI-PORTAL SHARED AUTH & TESTING                                      */}
-      {/* ============================================================================== */}
-      {/* ============================================================================== */}
-      {/* TAB 7: MULTI-PORTAL SHARED AUTH & TESTING (Requirement 7)                      */}
+      {/* TAB 7: MULTI-PORTAL SHARED AUTH & SYNC                                         */}
       {/* ============================================================================== */}
       {activeTab === 'portal_auth' && (
-        <div className="space-y-6">
-          {/* Glossy Looks Production Staff Synchronization Banner (Requirements 1, 3, 4, 5, 7) */}
-          <div className="bg-[#121629] border border-pink-500/30 rounded-2xl p-6 shadow-xl space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-4">
-              <div>
-                <div className="flex flex-wrap items-center gap-2 mb-1.5">
-                  <span className="text-[10px] font-bold tracking-wider uppercase px-2.5 py-0.5 rounded-full bg-pink-500/20 text-pink-400 border border-pink-500/30">
-                    Production Salon Integration
-                  </span>
-                  <span className="text-[10px] font-bold uppercase px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 flex items-center gap-1">
-                    <ShieldCheck className="w-3 h-3" />
-                    SUPERADMIN Accounts Preserved
-                  </span>
-                  <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
-                    Auto-Reconciles Every 10 mins
-                  </span>
-                </div>
-                <h2 className="text-lg font-bold text-white flex items-center gap-2">
-                  <Scissors className="w-5 h-5 text-pink-400" />
-                  The Glossy Looks ↔ Central SMAV Staff Synchronization
-                </h2>
-                <p className="text-xs text-slate-400 mt-1 max-w-2xl leading-relaxed">
-                  Active staff from The Glossy Looks production database (<code>https://www.glossylooks.in/api/staff</code>) are automatically mapped and synchronized to Central SMAV Supabase Auth, profiles, and permissions scoped to outlet <code>glossylooks</code>.
-                </p>
-              </div>
-
-              {/* Action Buttons */}
-              <div className="flex items-center gap-3">
-                <button
-                  onClick={handleTriggerGlossySync}
-                  disabled={isSyncingGlossy}
-                  className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-pink-500 via-rose-500 to-orange-500 hover:brightness-110 disabled:opacity-50 text-white text-xs font-semibold flex items-center gap-2 shadow-lg shadow-pink-500/20 transition"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isSyncingGlossy ? 'animate-spin' : ''}`} />
-                  {isSyncingGlossy ? 'Synchronizing Staff...' : 'Sync Glossy Looks Staff Now'}
-                </button>
-              </div>
-            </div>
-
-            {/* Sync Feedback Message */}
-            {syncFeedback && (
-              <div
-                className={`p-3 rounded-xl border text-xs flex items-center gap-2 ${
-                  syncFeedback.type === 'success'
-                    ? 'bg-emerald-950/40 border-emerald-500/40 text-emerald-300'
-                    : 'bg-rose-950/40 border-rose-500/40 text-rose-300'
-                }`}
-              >
-                {syncFeedback.type === 'success' ? (
-                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                ) : (
-                  <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
-                )}
-                <span>{syncFeedback.message}</span>
-              </div>
-            )}
-
-            {/* Error Banner if Last Sync Encountered Error */}
-            {glossySyncStatus?.lastError && !syncFeedback && (
-              <div className="p-3 rounded-xl border bg-amber-950/40 border-amber-500/40 text-amber-300 text-xs flex items-center gap-2">
-                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-                <span>Last Synchronization Warning: {glossySyncStatus.lastError}</span>
-              </div>
-            )}
-
-            {/* Status & Counts Grid (Requirement 7) */}
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1">
-              <div className="p-3 rounded-xl bg-slate-900/60 border border-slate-800">
-                <div className="text-[11px] font-medium text-slate-400">Total Production Staff</div>
-                <div className="text-xl font-bold text-white mt-1">
-                  {glossySyncStatus?.totalProductionStaff ?? 7}
-                </div>
-                <div className="text-[10px] text-pink-400 mt-0.5">glossylooks.in API</div>
-              </div>
-
-              <div className="p-3 rounded-xl bg-slate-900/60 border border-slate-800">
-                <div className="text-[11px] font-medium text-slate-400">Central Synced Users</div>
-                <div className="text-xl font-bold text-emerald-400 mt-1">
-                  {glossySyncStatus?.syncedUsers ?? 7}
-                </div>
-                <div className="text-[10px] text-emerald-500 mt-0.5">Active Central Auth</div>
-              </div>
-
-              <div className="p-3 rounded-xl bg-slate-900/60 border border-slate-800">
-                <div className="text-[11px] font-medium text-slate-400">Superadmins Preserved</div>
-                <div className="text-xl font-bold text-purple-400 mt-1">
-                  {glossySyncStatus?.preservedSuperadmins ?? 1}
-                </div>
-                <div className="text-[10px] text-purple-400 mt-0.5">Never Downgraded</div>
-              </div>
-
-              <div className="p-3 rounded-xl bg-slate-900/60 border border-slate-800">
-                <div className="text-[11px] font-medium text-slate-400">Sync Status</div>
-                <div className="text-sm font-bold text-white mt-2 flex items-center gap-1.5">
-                  <span
-                    className={`w-2 h-2 rounded-full ${
-                      glossySyncStatus?.status === 'syncing'
-                        ? 'bg-amber-400 animate-pulse'
-                        : glossySyncStatus?.status === 'error'
-                        ? 'bg-rose-400'
-                        : 'bg-emerald-400'
-                    }`}
-                  />
-                  <span className="capitalize">{glossySyncStatus?.status || 'Active & Ready'}</span>
-                </div>
-                <div className="text-[10px] text-slate-400 mt-0.5">
-                  {glossySyncStatus?.lastRun
-                    ? `Last: ${new Date(glossySyncStatus.lastRun).toLocaleTimeString()}`
-                    : 'Startup sync complete'}
-                </div>
-              </div>
-            </div>
-
-            {/* Role Mapping Info Footer (Requirement 3 & 4) */}
-            <div className="p-3 rounded-xl bg-slate-900/40 border border-slate-800/80 text-[11px] text-slate-400 flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <span className="font-semibold text-slate-300">Role Scoping:</span>
-                <span>OWNER / DIRECTOR → <strong>ADMIN</strong></span>
-                <span>•</span>
-                <span>MANAGER → <strong>ADMIN</strong></span>
-                <span>•</span>
-                <span>STYLIST / RECEPTIONIST → <strong>STAFF (POS_BILLING)</strong></span>
-              </div>
-              <div className="text-[10px] font-mono text-slate-400">
-                Target: smav-identity-admin (sync-glossylooks)
-              </div>
-            </div>
-          </div>
-
-          <PortalAuthDashboard
-            session={session}
-            onLaunchOutletPos={onLaunchOutletPos}
-          />
-        </div>
+        <PortalAuthDashboard
+          session={session}
+          onLaunchOutletPos={onLaunchOutletPos}
+        />
       )}
 
       {/* ============================================================================== */}
@@ -1131,6 +997,17 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
                 />
               </div>
 
+              <div>
+                <label className="font-semibold text-slate-300 mb-1 block">Bidirectional Sync Webhook URL (Optional)</label>
+                <input
+                  type="text"
+                  value={newOutletForm.syncWebhookUrl}
+                  onChange={e => setNewOutletForm({ ...newOutletForm, syncWebhookUrl: e.target.value })}
+                  placeholder="https://portal.example.com/api/smav-sync-webhook"
+                  className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2.5 font-mono focus:outline-none focus:border-pink-500"
+                />
+              </div>
+
               <div className="pt-3 flex items-center justify-end gap-2 border-t border-slate-800">
                 <button
                   type="button"
@@ -1209,6 +1086,17 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
                 />
               </div>
 
+              <div>
+                <label className="font-semibold text-slate-300 mb-1 block">Bidirectional Sync Webhook URL (Optional)</label>
+                <input
+                  type="text"
+                  value={editOutletForm.syncWebhookUrl}
+                  onChange={e => setEditOutletForm({ ...editOutletForm, syncWebhookUrl: e.target.value })}
+                  placeholder="https://portal.example.com/api/smav-sync-webhook"
+                  className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2.5 font-mono focus:outline-none focus:border-pink-500"
+                />
+              </div>
+
               <div className="pt-3 flex items-center justify-end gap-2 border-t border-slate-800">
                 <button
                   type="button"
@@ -1240,7 +1128,7 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
               <button onClick={() => setIsAddAdminOpen(false)} className="text-slate-400 hover:text-white">✕</button>
             </div>
 
-            <form onSubmit={handleCreateAdmin} className="space-y-3.5 text-xs">
+            <form onSubmit={handleCreateAdmin} className="space-y-3 text-xs">
               <div>
                 <label className="font-semibold text-slate-300 mb-1 block">Full Name</label>
                 <input
@@ -1249,8 +1137,36 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
                   onChange={e => setNewAdminForm({ ...newAdminForm, fullName: e.target.value })}
                   placeholder="e.g. Ramesh V"
                   required
-                  className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2.5 focus:outline-none focus:border-pink-500"
+                  className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2 focus:outline-none focus:border-pink-500"
                 />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="font-semibold text-slate-300 mb-1 block">Username</label>
+                  <input
+                    type="text"
+                    value={newAdminForm.username}
+                    onChange={e => setNewAdminForm({ ...newAdminForm, username: e.target.value })}
+                    placeholder="ramesh"
+                    required
+                    className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2 font-mono focus:outline-none focus:border-pink-500"
+                  />
+                </div>
+                <div>
+                  <label className="font-semibold text-slate-300 mb-1 block">Assign to Outlet</label>
+                  <select
+                    value={newAdminForm.outletId}
+                    onChange={e => setNewAdminForm({ ...newAdminForm, outletId: e.target.value })}
+                    required
+                    className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2 focus:outline-none focus:border-pink-500"
+                  >
+                    <option value="">-- Select Outlet --</option>
+                    {outlets.map(o => (
+                      <option key={o.id} value={o.id}>{o.name} ({o.code})</option>
+                    ))}
+                  </select>
+                </div>
               </div>
 
               <div>
@@ -1261,34 +1177,24 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
                   onChange={e => setNewAdminForm({ ...newAdminForm, email: e.target.value })}
                   placeholder="admin@outlet.com"
                   required
-                  className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2.5 focus:outline-none focus:border-pink-500"
+                  className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2 focus:outline-none focus:border-pink-500"
                 />
               </div>
 
               <div>
-                <label className="font-semibold text-slate-300 mb-1 block">Assign to Outlet</label>
-                <select
-                  value={newAdminForm.outletId}
-                  onChange={e => setNewAdminForm({ ...newAdminForm, outletId: e.target.value })}
-                  required
-                  className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2.5 focus:outline-none focus:border-pink-500"
-                >
-                  <option value="">-- Select Target Outlet --</option>
-                  {outlets.map(o => (
-                    <option key={o.id} value={o.id}>{o.name} ({o.code})</option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label className="font-semibold text-slate-300 mb-1 block">Temporary Password</label>
+                <label className="font-semibold text-slate-300 mb-1 block">Initial Temporary Password (min. 8 characters)</label>
                 <input
                   type="password"
-                  value={newAdminForm.password}
-                  onChange={e => setNewAdminForm({ ...newAdminForm, password: e.target.value })}
-                  placeholder="Leave empty for auto-generated"
-                  className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2.5 focus:outline-none focus:border-pink-500"
+                  value={newAdminForm.initialPassword}
+                  onChange={e => setNewAdminForm({ ...newAdminForm, initialPassword: e.target.value })}
+                  placeholder="Minimum 8 characters"
+                  minLength={8}
+                  required
+                  className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2 focus:outline-none focus:border-pink-500"
                 />
+                <p className="text-[10px] text-slate-400 mt-1">
+                  Administrator will be prompted to set a personal password on first sign-in.
+                </p>
               </div>
 
               <div className="pt-3 flex items-center justify-end gap-2 border-t border-slate-800">
@@ -1303,7 +1209,7 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
                   type="submit"
                   className="px-5 py-2 rounded-xl bg-gradient-to-r from-pink-500 to-orange-500 text-white font-semibold shadow"
                 >
-                  Create Admin
+                  Create &amp; Sync Admin
                 </button>
               </div>
             </form>
@@ -1318,34 +1224,65 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-[#121629] border border-[#1e2540] rounded-2xl p-6 max-w-md w-full shadow-2xl space-y-4">
             <div className="flex items-center justify-between pb-2 border-b border-slate-800">
-              <h3 className="text-base font-bold text-white">Reset Admin Credentials</h3>
+              <h3 className="text-base font-bold text-white">Reset Administrator Password</h3>
               <button onClick={() => setIsResetPasswordOpen(false)} className="text-slate-400 hover:text-white">✕</button>
             </div>
 
-            <p className="text-xs text-slate-300">
-              Generate a secure new temporary password for <span className="font-bold text-white">{selectedAdmin.fullName}</span> ({selectedAdmin.email}).
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Set a temporary password for <span className="font-bold text-white">{selectedAdmin.fullName}</span> ({selectedAdmin.email || selectedAdmin.userId || selectedAdmin.id}). They must change it on their next login.
             </p>
 
             {resetPassFeedback && (
-              <div className="p-3 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-xs font-mono">
+              <div className={`p-3 rounded-xl border text-xs ${
+                resetPassFeedback.startsWith('Error:')
+                  ? 'bg-rose-500/15 border-rose-500/30 text-rose-300'
+                  : 'bg-emerald-500/15 border-emerald-500/30 text-emerald-300'
+              }`}>
                 {resetPassFeedback}
               </div>
             )}
 
-            <div className="pt-3 flex items-center justify-end gap-2 border-t border-slate-800">
-              <button
-                onClick={() => setIsResetPasswordOpen(false)}
-                className="px-4 py-2 rounded-xl text-slate-400 hover:text-white text-xs"
-              >
-                Close
-              </button>
-              <button
-                onClick={handleResetAdminPassword}
-                className="px-4 py-2 rounded-xl bg-pink-600 hover:bg-pink-500 text-white text-xs font-semibold shadow"
-              >
-                Confirm Reset
-              </button>
-            </div>
+            <form onSubmit={handleResetAdminPassword} className="space-y-3 text-xs">
+              <div>
+                <label className="font-semibold text-slate-300 mb-1 block">New Temporary Password (min. 8 characters)</label>
+                <input
+                  type="password"
+                  value={resetTempPassword}
+                  onChange={e => setResetTempPassword(e.target.value)}
+                  minLength={8}
+                  required
+                  className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2 focus:outline-none focus:border-pink-500"
+                />
+              </div>
+
+              <div>
+                <label className="font-semibold text-slate-300 mb-1 block">Confirm Temporary Password</label>
+                <input
+                  type="password"
+                  value={resetConfirmPassword}
+                  onChange={e => setResetConfirmPassword(e.target.value)}
+                  minLength={8}
+                  required
+                  className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2 focus:outline-none focus:border-pink-500"
+                />
+              </div>
+
+              <div className="pt-3 flex items-center justify-end gap-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setIsResetPasswordOpen(false)}
+                  className="px-4 py-2 rounded-xl text-slate-400 hover:text-white text-xs"
+                >
+                  Close
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 rounded-xl bg-pink-600 hover:bg-pink-500 text-white text-xs font-semibold shadow"
+                >
+                  Set Temporary Password
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

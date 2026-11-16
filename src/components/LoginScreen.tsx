@@ -61,6 +61,15 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   const [forgotLoading, setForgotLoading] = useState(false);
   const [forgotSuccess, setForgotSuccess] = useState(false);
 
+  // Forced first-login temporary password change state
+  const [passwordChangeState, setPasswordChangeState] = useState<{
+    token: string;
+    email: string;
+    outletCode?: string;
+  } | null>(null);
+  const [firstLoginNewPassword, setFirstLoginNewPassword] = useState('');
+  const [firstLoginConfirmPassword, setFirstLoginConfirmPassword] = useState('');
+
   const fetchSupabaseStatus = async () => {
     try {
       const res = await fetch('/api/central-supabase/status');
@@ -81,7 +90,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!emailOrId.trim() || !password.trim()) {
-      setErrorMessage('Please enter both email address and password.');
+      setErrorMessage('Please enter both your email address (or username) and password.');
       setErrorDetails(null);
       return;
     }
@@ -105,6 +114,18 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       const data = await res.json();
 
       if (!res.ok || !data.success) {
+        if (data.requiresPasswordChange && data.passwordChangeToken) {
+          setPasswordChangeState({
+            token: data.passwordChangeToken,
+            email: data.email || emailOrId.trim(),
+            outletCode: outletCode.trim() || undefined
+          });
+          setFirstLoginNewPassword('');
+          setFirstLoginConfirmPassword('');
+          setErrorMessage(null);
+          setIsLoading(false);
+          return;
+        }
         if (data.requiresPasswordReset) {
           setErrorMessage('Security notice: Your account requires a password reset to migrate to central auth. Click Forgot Password below.');
         } else {
@@ -120,6 +141,59 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       if (data.multiBusiness && data.availableOutlets) {
         onMultiBusinessFound(data.availableOutlets, data.tempToken || '', data.userId || data.session?.userId || '');
         setIsLoading(false);
+        return;
+      }
+
+      if (data.session) {
+        onLoginSuccess(data.session, data.redirectTo);
+      }
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Network connection error. Please try again.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleCompleteFirstLoginPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!passwordChangeState) return;
+    if (firstLoginNewPassword.length < 8) {
+      setErrorMessage('Your new personal password must be at least 8 characters long.');
+      return;
+    }
+    if (firstLoginNewPassword !== firstLoginConfirmPassword) {
+      setErrorMessage('Passwords do not match. Please confirm your new password.');
+      return;
+    }
+
+    setIsLoading(true);
+    setErrorMessage(null);
+
+    try {
+      const res = await fetch('/api/auth/complete-first-login-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          passwordChangeToken: passwordChangeState.token,
+          newPassword: firstLoginNewPassword,
+          outletCode: passwordChangeState.outletCode,
+          device_id: 'SMAV-POS-' + Math.random().toString(36).substring(2, 8).toUpperCase()
+        })
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setErrorMessage(data.message || 'Unable to set new password. Please sign in again.');
+        setIsLoading(false);
+        return;
+      }
+
+      setPasswordChangeState(null);
+      setFirstLoginNewPassword('');
+      setFirstLoginConfirmPassword('');
+
+      if (data.multiBusiness && data.availableOutlets) {
+        onMultiBusinessFound(data.availableOutlets, data.tempToken || '', data.userId || data.session?.userId || '');
         return;
       }
 
@@ -223,7 +297,11 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           setForgotStep('reset');
           setForgotMessage('Verification reset token generated. Enter your new password below.');
         } else {
-          setForgotMessage(data.message || 'If registered, reset instructions have been recorded.');
+          setForgotSuccess(true);
+          setForgotMessage(
+            data.message ||
+              'If that email is registered in Central SMAV Auth, a password reset email has been sent. You can also ask your outlet ADMIN or SUPERADMIN to set a temporary password.'
+          );
         }
       } else {
         setForgotMessage(data.message || 'Failed to request password reset.');
@@ -312,87 +390,161 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           </div>
         )}
 
-        {/* Login Form */}
-        <form onSubmit={handleSubmit} className="space-y-4">
-          {/* Field 1: Email Address (Email login first) */}
-          <div>
-            <label className="text-xs font-semibold text-slate-300 mb-1.5 block">
-              Email Address
-            </label>
-            <input
-              type="email"
-              value={emailOrId}
-              onChange={(e) => setEmailOrId(e.target.value)}
-              placeholder="name@company.com"
-              autoComplete="email"
-              required
-              autoFocus
-              className="w-full rounded-xl bg-[#161a33]/90 border border-[#2a3055] text-white placeholder-slate-500 px-4 py-3 text-sm focus:outline-none focus:border-[#ff3b80] focus:ring-1 focus:ring-[#ff3b80]/40 transition"
-            />
-          </div>
+        {/* Forced First-Login Password Change OR Standard Login Form */}
+        {passwordChangeState ? (
+          <form onSubmit={handleCompleteFirstLoginPassword} className="space-y-4">
+            <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs space-y-1">
+              <div className="font-bold flex items-center gap-1.5 text-amber-300">
+                <KeyRound className="w-4 h-4" />
+                Password Change Required
+              </div>
+              <p className="leading-relaxed">
+                Signed in with an admin-assigned temporary password for <span className="font-mono text-white">{passwordChangeState.email}</span>. Choose a personal password to continue.
+              </p>
+            </div>
 
-          {/* Field 2: Password / PIN with show/hide control */}
-          <div>
-            <label className="text-xs font-semibold text-slate-300 mb-1.5 block">
-              Password / PIN
-            </label>
-            <div className="relative">
+            <div>
+              <label className="text-xs font-semibold text-slate-300 mb-1.5 block">
+                New Personal Password (min. 8 characters)
+              </label>
               <input
-                type={showPassword ? 'text' : 'password'}
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="Enter password"
+                type="password"
+                value={firstLoginNewPassword}
+                onChange={(e) => setFirstLoginNewPassword(e.target.value)}
+                placeholder="Enter new password"
+                minLength={8}
                 required
-                className="w-full rounded-xl bg-[#161a33]/90 border border-[#2a3055] text-white placeholder-slate-500 px-4 py-3 pr-11 text-sm focus:outline-none focus:border-[#ff3b80] focus:ring-1 focus:ring-[#ff3b80]/40 transition"
+                autoFocus
+                className="w-full rounded-xl bg-[#161a33]/90 border border-[#2a3055] text-white placeholder-slate-500 px-4 py-3 text-sm focus:outline-none focus:border-[#ff3b80] focus:ring-1 focus:ring-[#ff3b80]/40 transition"
               />
+            </div>
+
+            <div>
+              <label className="text-xs font-semibold text-slate-300 mb-1.5 block">
+                Confirm New Password
+              </label>
+              <input
+                type="password"
+                value={firstLoginConfirmPassword}
+                onChange={(e) => setFirstLoginConfirmPassword(e.target.value)}
+                placeholder="Re-enter new password"
+                minLength={8}
+                required
+                className="w-full rounded-xl bg-[#161a33]/90 border border-[#2a3055] text-white placeholder-slate-500 px-4 py-3 text-sm focus:outline-none focus:border-[#ff3b80] focus:ring-1 focus:ring-[#ff3b80]/40 transition"
+              />
+            </div>
+
+            <div className="pt-2 space-y-2">
+              <div className="p-[2px] rounded-xl bg-gradient-to-r from-[#ff1b7a] via-[#ff6a00] to-[#ffa500] shadow-lg shadow-pink-500/10">
+                <button
+                  type="submit"
+                  disabled={isLoading}
+                  className="w-full bg-[#242938] hover:bg-[#2c3245] disabled:opacity-70 text-white font-semibold py-3 px-4 rounded-[10px] text-sm flex items-center justify-center gap-2 transition duration-200"
+                >
+                  {isLoading ? (
+                    <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  ) : (
+                    <>
+                      <KeyRound className="w-4 h-4 text-white" />
+                      <span>Set Password &amp; Sign In</span>
+                    </>
+                  )}
+                </button>
+              </div>
               <button
                 type="button"
-                onClick={() => setShowPassword(!showPassword)}
-                className="absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white transition p-1"
-                aria-label={showPassword ? 'Hide password' : 'Show password'}
+                onClick={() => {
+                  setPasswordChangeState(null);
+                  setErrorMessage(null);
+                }}
+                className="w-full py-2 text-xs text-slate-400 hover:text-white transition"
               >
-                {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                Back to Sign In
               </button>
             </div>
-          </div>
-
-          {/* Field 3: Outlet Code (optional) */}
-          <div>
-            <label className="text-xs font-semibold text-slate-300 mb-1.5 block">
-              Outlet Code (optional)
-            </label>
-            <input
-              type="text"
-              value={outletCode}
-              onChange={(e) => setOutletCode(e.target.value)}
-              placeholder="e.g. mozz, glossylooks"
-              className="w-full rounded-xl bg-[#161a33]/90 border border-[#2a3055] text-white placeholder-slate-500 px-4 py-3 text-sm focus:outline-none focus:border-[#ff3b80] focus:ring-1 focus:ring-[#ff3b80]/40 transition font-mono"
-            />
-            <p className="text-[11px] text-slate-400 mt-1.5">
-              Used to identify an outlet's authentication provider when required.
-            </p>
-          </div>
-
-          {/* Pink-to-Orange Gradient Button */}
-          <div className="pt-2">
-            <div className="p-[2px] rounded-xl bg-gradient-to-r from-[#ff1b7a] via-[#ff6a00] to-[#ffa500] shadow-lg shadow-pink-500/10">
-              <button
-                type="submit"
-                disabled={isLoading}
-                className="w-full bg-[#242938] hover:bg-[#2c3245] disabled:opacity-70 text-white font-semibold py-3 px-4 rounded-[10px] text-sm flex items-center justify-center gap-2 transition duration-200"
-              >
-                {isLoading ? (
-                  <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                ) : (
-                  <>
-                    <LogIn className="w-4 h-4 text-white" />
-                    <span>Sign In</span>
-                  </>
-                )}
-              </button>
+          </form>
+        ) : (
+          <form onSubmit={handleSubmit} className="space-y-4">
+            {/* Field 1: Email Address or Username */}
+            <div>
+              <label className="text-xs font-semibold text-slate-300 mb-1.5 block">
+                Email Address or Username
+              </label>
+              <input
+                type="text"
+                value={emailOrId}
+                onChange={(e) => setEmailOrId(e.target.value)}
+                placeholder="name@company.com or username"
+                autoComplete="username"
+                required
+                autoFocus
+                className="w-full rounded-xl bg-[#161a33]/90 border border-[#2a3055] text-white placeholder-slate-500 px-4 py-3 text-sm focus:outline-none focus:border-[#ff3b80] focus:ring-1 focus:ring-[#ff3b80]/40 transition"
+              />
             </div>
-          </div>
-        </form>
+
+            {/* Field 2: Password / PIN with show/hide control */}
+            <div>
+              <label className="text-xs font-semibold text-slate-300 mb-1.5 block">
+                Password / PIN
+              </label>
+              <div className="relative">
+                <input
+                  type={showPassword ? 'text' : 'password'}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Enter password"
+                  required
+                  className="w-full rounded-xl bg-[#161a33]/90 border border-[#2a3055] text-white placeholder-slate-500 px-4 py-3 pr-11 text-sm focus:outline-none focus:border-[#ff3b80] focus:ring-1 focus:ring-[#ff3b80]/40 transition"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white transition p-1"
+                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                >
+                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+            </div>
+
+            {/* Field 3: Outlet Code (optional) */}
+            <div>
+              <label className="text-xs font-semibold text-slate-300 mb-1.5 block">
+                Outlet Code (optional)
+              </label>
+              <input
+                type="text"
+                value={outletCode}
+                onChange={(e) => setOutletCode(e.target.value)}
+                placeholder="e.g. mozz, glossylooks"
+                className="w-full rounded-xl bg-[#161a33]/90 border border-[#2a3055] text-white placeholder-slate-500 px-4 py-3 text-sm focus:outline-none focus:border-[#ff3b80] focus:ring-1 focus:ring-[#ff3b80]/40 transition font-mono"
+              />
+              <p className="text-[11px] text-slate-400 mt-1.5">
+                Used to identify an outlet's authentication provider when required.
+              </p>
+            </div>
+
+            {/* Pink-to-Orange Gradient Button */}
+            <div className="pt-2">
+              <div className="p-[2px] rounded-xl bg-gradient-to-r from-[#ff1b7a] via-[#ff6a00] to-[#ffa500] shadow-lg shadow-pink-500/10">
+                <button
+                  type="submit"
+                  disabled={isLoading}
+                  className="w-full bg-[#242938] hover:bg-[#2c3245] disabled:opacity-70 text-white font-semibold py-3 px-4 rounded-[10px] text-sm flex items-center justify-center gap-2 transition duration-200"
+                >
+                  {isLoading ? (
+                    <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  ) : (
+                    <>
+                      <LogIn className="w-4 h-4 text-white" />
+                      <span>Sign In</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </form>
+        )}
 
         {/* Footer Links & Forgot Password */}
         <div className="mt-6 text-center space-y-2">
@@ -522,7 +674,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                       type="email"
                       value={verifyEmail}
                       onChange={(e) => setVerifyEmail(e.target.value)}
-                      placeholder="e.g. superadmin@smav.io"
+                      placeholder="name@company.com"
                       required
                       className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2.5 text-xs focus:outline-none focus:border-pink-500"
                     />
@@ -692,7 +844,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                     type="email"
                     value={forgotEmail}
                     onChange={(e) => setForgotEmail(e.target.value)}
-                    placeholder="e.g. ananya@glossylooks.com"
+                    placeholder="name@company.com"
                     required
                     className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2.5 text-xs focus:outline-none focus:border-pink-500"
                   />

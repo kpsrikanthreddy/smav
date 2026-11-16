@@ -1,185 +1,271 @@
 /**
- * Central SMAV Identity Admin Service
+ * Central SMAV Unified Identity & Multi-Outlet Sync Service
  * Location: src/services/identityAdminService.ts
  *
- * Communicates with the Supabase Edge Function:
- * https://qykdwswatopylzvqhgog.supabase.co/functions/v1/smav-identity-admin
- *
- * Uses the caller's authenticated Supabase JWT Bearer token.
- * Never exposes or transmits the service-role key.
+ * Uses the caller's authenticated SMAV session token via backend proxy APIs (`/api/outlet-users`, `/api/sync/outbox`).
+ * Never exposes or transmits service-role keys. Never logs or stores plaintext passwords.
  */
 
-const CENTRAL_SUPABASE_PROJECT_URL =
-  import.meta.env.VITE_SMAV_SUPABASE_URL || 'https://qykdwswatopylzvqhgog.supabase.co';
+import { OutletUserRecord, SyncOutboxItem } from '../types';
 
-const CENTRAL_SUPABASE_ANON_KEY =
-  import.meta.env.VITE_SMAV_SUPABASE_ANON_KEY || '';
-
-export const EDGE_FUNCTION_ENDPOINT = `${CENTRAL_SUPABASE_PROJECT_URL}/functions/v1/smav-identity-admin`;
-
-export interface EdgeFunctionResult<T = any> {
+export interface UnifiedSyncResponse {
   success: boolean;
-  message?: string;
+  httpStatus?: number;
+  message: string;
   error?: string;
   userId?: string;
+  email?: string;
+  username?: string;
+  role?: 'ADMIN' | 'STAFF';
   isNewUser?: boolean;
-  recoveryLink?: string;
-  activationLink?: string;
-  data?: T;
-  staff?: any[];
-  results?: any[];
-  details?: any;
+  mustChangePassword?: boolean;
+  centralConfirmed?: boolean;
+  outletConfirmed?: boolean;
+  syncStatus?: string;
+  outboxItem?: SyncOutboxItem;
+  conflictDetails?: Record<string, any> | null;
 }
 
 export class IdentityAdminService {
-  private endpoint: string;
-
-  constructor(endpoint?: string) {
-    this.endpoint = endpoint || EDGE_FUNCTION_ENDPOINT;
-  }
-
-  private async callEdgeFunction<T = any>(
-    token: string,
-    action: string,
-    payload: Record<string, any> = {}
-  ): Promise<EdgeFunctionResult<T>> {
+  async listOutletUsers(
+    sessionToken: string,
+    outletCode?: string
+  ): Promise<{ success: boolean; users: OutletUserRecord[]; message?: string }> {
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      };
-      if (CENTRAL_SUPABASE_ANON_KEY) {
-        headers['apikey'] = CENTRAL_SUPABASE_ANON_KEY;
-      }
-
-      const response = await fetch(this.endpoint, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ action, ...payload }),
+      const qs = outletCode && outletCode !== 'all' ? `?outletCode=${encodeURIComponent(outletCode)}` : '';
+      const response = await fetch(`/api/outlet-users${qs}`, {
+        headers: { Authorization: `Bearer ${sessionToken}` },
       });
-
-      const data = await response.json();
-      if (!response.ok) {
-        const errorMsg =
-          response.status === 401
-            ? `Supabase 401 Unauthorized: Invalid or expired Supabase user JWT, or Edge Function requires --no-verify-jwt. (${data.error || data.message || 'Unauthorized'})`
-            : data.error || data.message || `HTTP ${response.status}: Action failed`;
-        return {
-          success: false,
-          error: errorMsg,
-          details: data,
-        };
-      }
-      return data;
+      const data = await response.json().catch(() => ({
+        success: false,
+        message: `HTTP ${response.status}: Invalid server response`,
+        users: [],
+      }));
+      return {
+        success: Boolean(response.ok && data.success !== false),
+        users: Array.isArray(data.users) ? data.users : [],
+        message: data.message || data.error,
+      };
     } catch (err: any) {
-      console.error(`[IdentityAdminService] Error calling ${action}:`, err);
       return {
         success: false,
-        error: `Network or edge connection failure: ${err.message}`,
+        users: [],
+        message: `Network error loading outlet users: ${err?.message || 'Unknown error'}`,
       };
     }
   }
 
-  /**
-   * Superadmin creates an outlet administrator for any registered outlet.
-   */
-  async createOutletAdmin(
-    token: string,
-    payload: {
-      email: string;
-      fullName: string;
-      phone?: string;
-      outletCode: string;
-      temporaryPassword?: string;
-      username?: string;
-    }
-  ): Promise<EdgeFunctionResult> {
-    return this.callEdgeFunction(token, 'create-admin', payload);
-  }
-
-  /**
-   * Superadmin or assigned Outlet Admin creates a staff member.
-   */
-  async createOutletStaff(
-    token: string,
-    payload: {
-      email: string;
-      fullName: string;
-      phone?: string;
-      outletCode: string;
-      temporaryPassword?: string;
-      username?: string;
-      externalStaffId?: string;
-      externalRole?: string;
-    }
-  ): Promise<EdgeFunctionResult> {
-    return this.callEdgeFunction(token, 'create-staff', payload);
-  }
-
-  /**
-   * Toggle staff status (activate / deactivate).
-   */
-  async setStaffStatus(
-    token: string,
-    payload: {
-      userId: string;
-      email?: string;
-      outletCode?: string;
-      isActive: boolean;
-    }
-  ): Promise<EdgeFunctionResult> {
-    return this.callEdgeFunction(token, 'set-status', payload);
-  }
-
-  /**
-   * Securely reset password for staff or generate recovery link without exposing passwords.
-   */
-  async resetPassword(
-    token: string,
+  async upsertOutletUser(
+    sessionToken: string,
     payload: {
       userId?: string;
-      email?: string;
-      newPassword?: string;
-      outletCode?: string;
+      externalStaffId?: string;
+      fullName: string;
+      username?: string;
+      email: string;
+      phone?: string;
+      role: 'ADMIN' | 'STAFF';
+      outletCode: string;
+      initialPassword?: string;
+      isActive?: boolean;
+      idempotencyKey?: string;
     }
-  ): Promise<EdgeFunctionResult> {
-    return this.callEdgeFunction(token, 'reset-password', payload);
+  ): Promise<UnifiedSyncResponse> {
+    try {
+      const response = await fetch('/api/outlet-users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify(payload),
+      });
+      const data = await response.json().catch(() => ({
+        success: false,
+        message: `HTTP ${response.status}: Invalid server response`,
+      }));
+      return {
+        ...data,
+        httpStatus: response.status,
+        success: Boolean(response.ok && data.success !== false),
+        message: data.message || data.error || 'User operation completed.',
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        message: `Network error saving user: ${err?.message || 'Unknown error'}`,
+      };
+    }
   }
 
-  /**
-   * List staff belonging to authorized outlets.
-   */
-  async listStaff(token: string, outletCode?: string): Promise<EdgeFunctionResult> {
-    return this.callEdgeFunction(token, 'list-staff', { outletCode });
+  async updateOutletUser(
+    sessionToken: string,
+    userId: string,
+    payload: {
+      externalStaffId?: string;
+      fullName?: string;
+      username?: string;
+      email?: string;
+      phone?: string;
+      role?: 'ADMIN' | 'STAFF';
+      outletCode: string;
+      isActive?: boolean;
+      idempotencyKey?: string;
+    }
+  ): Promise<UnifiedSyncResponse> {
+    try {
+      const response = await fetch(`/api/outlet-users/${encodeURIComponent(userId)}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify(payload),
+      });
+      const data = await response.json().catch(() => ({
+        success: false,
+        message: `HTTP ${response.status}: Invalid server response`,
+      }));
+      return {
+        ...data,
+        httpStatus: response.status,
+        success: Boolean(response.ok && data.success !== false),
+        message: data.message || data.error || 'User updated.',
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        message: `Network error updating user: ${err?.message || 'Unknown error'}`,
+      };
+    }
   }
 
-  /**
-   * Retrieve identity and outlet permissions.
-   */
-  async getIdentityInfo(token: string): Promise<EdgeFunctionResult> {
-    return this.callEdgeFunction(token, 'get-info');
+  async resetOutletUserPassword(
+    sessionToken: string,
+    userId: string,
+    payload: {
+      newPassword: string;
+      email?: string;
+      outletCode: string;
+      idempotencyKey?: string;
+    }
+  ): Promise<UnifiedSyncResponse> {
+    try {
+      const response = await fetch(`/api/outlet-users/${encodeURIComponent(userId)}/reset-password`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify(payload),
+      });
+      const data = await response.json().catch(() => ({
+        success: false,
+        message: `HTTP ${response.status}: Invalid server response`,
+      }));
+      return {
+        ...data,
+        httpStatus: response.status,
+        success: Boolean(response.ok && data.success !== false),
+        message: data.message || data.error || 'Password updated.',
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        message: `Network error resetting password: ${err?.message || 'Unknown error'}`,
+      };
+    }
   }
 
-  /**
-   * Synchronize staff from The Glossy Looks Admin Portal.
-   * Interactive requests use the authenticated Supabase user JWT.
-   */
-  async syncGlossyLooks(
-    userToken: string,
-    staff: any[]
-  ): Promise<EdgeFunctionResult> {
-    return this.callEdgeFunction(userToken, 'sync-glossylooks', { staff });
+  async setOutletUserStatus(
+    sessionToken: string,
+    userId: string,
+    payload: {
+      isActive: boolean;
+      email?: string;
+      outletCode: string;
+      idempotencyKey?: string;
+    }
+  ): Promise<UnifiedSyncResponse> {
+    try {
+      const response = await fetch(`/api/outlet-users/${encodeURIComponent(userId)}/status`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify(payload),
+      });
+      const data = await response.json().catch(() => ({
+        success: false,
+        message: `HTTP ${response.status}: Invalid server response`,
+      }));
+      return {
+        ...data,
+        httpStatus: response.status,
+        success: Boolean(response.ok && data.success !== false),
+        message: data.message || data.error || 'User status updated.',
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        message: `Network error updating user status: ${err?.message || 'Unknown error'}`,
+      };
+    }
   }
 
-  /**
-   * Synchronize staff from MOZZ / Starters4U Admin Portal.
-   * Interactive requests use the authenticated Supabase user JWT.
-   */
-  async syncMozz(
-    userToken: string,
-    staff: any[]
-  ): Promise<EdgeFunctionResult> {
-    return this.callEdgeFunction(userToken, 'sync-mozz', { staff });
+  async listSyncOutbox(
+    sessionToken: string,
+    outletCode?: string
+  ): Promise<{ success: boolean; items: SyncOutboxItem[]; message?: string }> {
+    try {
+      const qs = outletCode && outletCode !== 'all' ? `?outletCode=${encodeURIComponent(outletCode)}` : '';
+      const response = await fetch(`/api/sync/outbox${qs}`, {
+        headers: { Authorization: `Bearer ${sessionToken}` },
+      });
+      const data = await response.json().catch(() => ({
+        success: false,
+        items: [],
+        message: `HTTP ${response.status}: Invalid server response`,
+      }));
+      return {
+        success: Boolean(response.ok && data.success !== false),
+        items: Array.isArray(data.items) ? data.items : [],
+        message: data.message || data.error,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        items: [],
+        message: `Network error loading outbox: ${err?.message || 'Unknown error'}`,
+      };
+    }
+  }
+
+  async retrySyncOutboxItem(
+    sessionToken: string,
+    outboxId: string
+  ): Promise<{ success: boolean; message: string; item?: SyncOutboxItem }> {
+    try {
+      const response = await fetch(`/api/sync/outbox/${encodeURIComponent(outboxId)}/retry`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${sessionToken}` },
+      });
+      const data = await response.json().catch(() => ({
+        success: false,
+        message: `HTTP ${response.status}: Invalid server response`,
+      }));
+      return {
+        success: Boolean(response.ok && data.success !== false),
+        message: data.message || data.error || 'Retry attempted.',
+        item: data.item,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        message: `Network error retrying sync item: ${err?.message || 'Unknown error'}`,
+      };
+    }
   }
 }
 

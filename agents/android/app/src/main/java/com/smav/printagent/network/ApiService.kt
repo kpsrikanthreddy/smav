@@ -20,6 +20,8 @@ import retrofit2.http.GET
 import retrofit2.http.Header
 import retrofit2.http.POST
 import retrofit2.http.Query
+import retrofit2.http.Path
+import com.google.gson.JsonObject
 
 data class StaffLoginRequest(
     @SerializedName("email") val email: String,
@@ -178,6 +180,15 @@ data class SyncResponse(
 )
 
 interface ApiService {
+    // B2: authoritative catalog, paginated and scoped by central outlet UUID.
+    @GET("api/pos/outlets/{outletId}/source-catalog")
+    suspend fun getOutletSourceCatalog(
+        @Header("Authorization") token: String,
+        @Path("outletId") outletId: String,
+        @Query("limit") limit: Int = 200,
+        @Query("offset") offset: Int = 0
+    ): Response<JsonObject>
+
     // 1. Staff & Multi-Outlet Enterprise Authentication (SUPERADMIN, ADMIN, STAFF)
     @POST("api/auth/login")
     suspend fun loginEnterpriseAuth(@Body request: StaffLoginRequest): Response<StaffLoginResponse>

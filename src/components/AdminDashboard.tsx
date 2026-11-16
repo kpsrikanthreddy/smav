@@ -8,14 +8,12 @@ import {
   UserPlus,
   KeyRound,
   ShieldCheck,
-  CheckCircle2,
-  XCircle,
-  Plus,
   Edit2,
-  Trash2,
-  SlidersHorizontal
+  RefreshCw,
+  AlertTriangle,
+  CheckCircle2,
 } from 'lucide-react';
-import { UserSession, getVisibleRole } from '../types';
+import { UserSession, OutletUserRecord, SyncOutboxItem, getVisibleRole } from '../types';
 import { identityAdminService } from '../services/identityAdminService';
 
 interface AdminDashboardProps {
@@ -27,32 +25,48 @@ interface AdminDashboardProps {
 export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   session,
   onOpenPos,
-  onLogout
 }) => {
+  const isSuperadmin =
+    session.role === 'superadmin' ||
+    getVisibleRole(session.displayRole || session.role) === 'SUPERADMIN';
+
   const [activeTab, setActiveTab] = useState<'overview' | 'staff' | 'catalog' | 'orders' | 'printer'>('overview');
-  const [staffList, setStaffList] = useState<any[]>([]);
+  const [staffList, setStaffList] = useState<OutletUserRecord[]>([]);
+  const [outboxItems, setOutboxItems] = useState<SyncOutboxItem[]>([]);
   const [reports, setReports] = useState<any>(null);
   const [catalogItems, setCatalogItems] = useState<any[]>([]);
   const [printerConfig, setPrinterConfig] = useState({
     paperWidth: 80,
     receiptHeader: session.activeOutlet.receiptHeader,
     receiptFooter: session.activeOutlet.receiptFooter,
-    autoCut: true
+    autoCut: true,
   });
+  const [printerSavedMessage, setPrinterSavedMessage] = useState<string | null>(null);
 
-  // Staff creation modal
-  const [isAddStaffOpen, setIsAddStaffOpen] = useState(false);
-  const [newStaffForm, setNewStaffForm] = useState({
+  // Modals: Add User, Edit User, Reset Password
+  const [isAddUserOpen, setIsAddUserOpen] = useState(false);
+  const [addUserForm, setAddUserForm] = useState({
     fullName: '',
+    username: '',
     email: '',
     phone: '',
-    role: 'staff',
-    specificTitle: session.activeOutlet.category === 'salon' ? 'Salon Receptionist' : 'Cashier / Counter Staff',
-    password: ''
+    role: 'STAFF' as 'ADMIN' | 'STAFF',
+    initialPassword: '',
   });
 
-  // Action state and feedback (Edge Function / API)
-  const [resetFeedback, setResetFeedback] = useState<string | null>(null);
+  const [editingUser, setEditingUser] = useState<OutletUserRecord | null>(null);
+  const [editUserForm, setEditUserForm] = useState({
+    fullName: '',
+    username: '',
+    email: '',
+    phone: '',
+    role: 'STAFF' as 'ADMIN' | 'STAFF',
+  });
+
+  const [resetTarget, setResetTarget] = useState<OutletUserRecord | null>(null);
+  const [resetNewPassword, setResetNewPassword] = useState('');
+  const [resetConfirmPassword, setResetConfirmPassword] = useState('');
+
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
   const [isActionLoading, setIsActionLoading] = useState(false);
@@ -60,28 +74,25 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const fetchAdminData = async () => {
     try {
       const headers = { Authorization: `Bearer ${session.token}` };
-      let loadedFromEdge = false;
 
-      // If user has Supabase token, list staff via Edge Function or backend
-      if (session.supabaseToken) {
-        const edgeStaff = await identityAdminService.listStaff(session.supabaseToken, session.activeOutlet.code);
-        if (edgeStaff.success && Array.isArray(edgeStaff.staff)) {
-          setStaffList(edgeStaff.staff);
-          loadedFromEdge = true;
-        }
-      }
-
-      const [staffRes, repRes] = await Promise.all([
-        fetch('/api/admin/staff', { headers }).then(r => r.json()).catch(() => ({ staff: [] })),
-        fetch('/api/admin/reports', { headers }).then(r => r.json()).catch(() => null)
+      const [usersRes, outboxRes, repRes] = await Promise.all([
+        identityAdminService.listOutletUsers(session.token, session.activeOutlet.code),
+        identityAdminService.listSyncOutbox(session.token, session.activeOutlet.code),
+        fetch('/api/admin/reports', { headers }).then((r) => r.json()).catch(() => null),
       ]);
 
-      if (staffRes.staff && !loadedFromEdge) {
-        setStaffList(staffRes.staff);
+      if (usersRes.success) {
+        setStaffList(usersRes.users);
+      } else if (usersRes.message) {
+        setActionError(usersRes.message);
       }
+
+      if (outboxRes.success) {
+        setOutboxItems(outboxRes.items);
+      }
+
       if (repRes && repRes.success !== false) setReports(repRes);
 
-      // Fetch catalog (requires authenticated headers)
       if (session.activeOutlet.category === 'salon') {
         const srvRes = await fetch('/api/salon/services', { headers });
         const srvData = await srvRes.json();
@@ -104,148 +115,170 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     fetchAdminData();
   }, [session.token, session.activeOutlet.id]);
 
-  const handleCreateStaff = async (e: React.FormEvent) => {
+  const handleCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (addUserForm.initialPassword.length < 8) {
+      setActionError('Initial temporary password must be at least 8 characters.');
+      return;
+    }
+
+    setIsActionLoading(true);
+    setActionError(null);
+    setActionSuccess(null);
+
+    try {
+      const res = await identityAdminService.upsertOutletUser(session.token, {
+        fullName: addUserForm.fullName.trim(),
+        username: addUserForm.username.trim().toLowerCase() || undefined,
+        email: addUserForm.email.trim().toLowerCase(),
+        phone: addUserForm.phone.trim(),
+        role: isSuperadmin ? addUserForm.role : 'STAFF',
+        outletCode: session.activeOutlet.code,
+        initialPassword: addUserForm.initialPassword,
+      });
+
+      if (res.success) {
+        setIsAddUserOpen(false);
+        setAddUserForm({
+          fullName: '',
+          username: '',
+          email: '',
+          phone: '',
+          role: 'STAFF',
+          initialPassword: '',
+        });
+        setActionSuccess(res.message);
+        await fetchAdminData();
+      } else {
+        setActionError(res.message || res.error || 'Failed to add user.');
+        await fetchAdminData();
+      }
+    } catch (err: any) {
+      setActionError(err?.message || 'Failed to add user.');
+    } finally {
+      setIsActionLoading(false);
+    }
+  };
+
+  const handleEditUser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingUser) return;
+
+    setIsActionLoading(true);
+    setActionError(null);
+    setActionSuccess(null);
+
+    try {
+      const res = await identityAdminService.updateOutletUser(session.token, editingUser.userId, {
+        fullName: editUserForm.fullName.trim(),
+        username: editUserForm.username.trim().toLowerCase() || undefined,
+        email: editUserForm.email.trim().toLowerCase(),
+        phone: editUserForm.phone.trim(),
+        role: isSuperadmin ? editUserForm.role : 'STAFF',
+        outletCode: session.activeOutlet.code,
+      });
+
+      if (res.success) {
+        setEditingUser(null);
+        setActionSuccess(res.message);
+        await fetchAdminData();
+      } else {
+        setActionError(res.message || res.error || 'Failed to update user.');
+        await fetchAdminData();
+      }
+    } catch (err: any) {
+      setActionError(err?.message || 'Failed to update user.');
+    } finally {
+      setIsActionLoading(false);
+    }
+  };
+
+  const handleResetPasswordSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!resetTarget) return;
+    if (resetNewPassword.length < 8) {
+      setActionError('Temporary password must be at least 8 characters.');
+      return;
+    }
+    if (resetNewPassword !== resetConfirmPassword) {
+      setActionError('Temporary password confirmation does not match.');
+      return;
+    }
+
+    setIsActionLoading(true);
+    setActionError(null);
+    setActionSuccess(null);
+
+    try {
+      const res = await identityAdminService.resetOutletUserPassword(session.token, resetTarget.userId, {
+        newPassword: resetNewPassword,
+        email: resetTarget.email || undefined,
+        outletCode: session.activeOutlet.code,
+      });
+
+      if (res.success) {
+        setResetTarget(null);
+        setResetNewPassword('');
+        setResetConfirmPassword('');
+        setActionSuccess(
+          `${res.message} User will be prompted to set a personal password on first sign-in.`
+        );
+        await fetchAdminData();
+      } else {
+        setActionError(res.message || res.error || 'Failed to reset password.');
+        await fetchAdminData();
+      }
+    } catch (err: any) {
+      setActionError(err?.message || 'Failed to reset password.');
+    } finally {
+      setIsActionLoading(false);
+    }
+  };
+
+  const handleToggleStatus = async (user: OutletUserRecord) => {
+    setIsActionLoading(true);
+    setActionError(null);
+    setActionSuccess(null);
+
+    try {
+      const res = await identityAdminService.setOutletUserStatus(session.token, user.userId, {
+        isActive: !user.isActive,
+        email: user.email || undefined,
+        outletCode: session.activeOutlet.code,
+      });
+
+      if (res.success) {
+        setActionSuccess(res.message);
+        await fetchAdminData();
+      } else {
+        setActionError(res.message || res.error || 'Failed to update user status.');
+        await fetchAdminData();
+      }
+    } catch (err: any) {
+      setActionError(err?.message || 'Failed to update user status.');
+    } finally {
+      setIsActionLoading(false);
+    }
+  };
+
+  const handleRetryOutbox = async (outboxId: string) => {
     setIsActionLoading(true);
     setActionError(null);
     setActionSuccess(null);
     try {
-      if (session.supabaseToken) {
-        const res = await identityAdminService.createOutletStaff(session.supabaseToken, {
-          email: newStaffForm.email.trim(),
-          fullName: newStaffForm.fullName.trim(),
-          phone: newStaffForm.phone.trim(),
-          outletCode: session.activeOutlet.code,
-          temporaryPassword: newStaffForm.password || undefined
-        });
-
-        if (res.success) {
-          setIsAddStaffOpen(false);
-          setActionSuccess(res.message || `Staff member "${newStaffForm.email}" created successfully.`);
-          setNewStaffForm({
-            fullName: '',
-            email: '',
-            phone: '',
-            role: 'staff',
-            specificTitle: session.activeOutlet.category === 'salon' ? 'Salon Receptionist' : 'Cashier',
-            password: ''
-          });
-          fetchAdminData();
-        } else {
-          setActionError(res.error || 'Failed to create staff');
-        }
+      const res = await identityAdminService.retrySyncOutboxItem(session.token, outboxId);
+      if (res.success) {
+        setActionSuccess(res.message);
       } else {
-        const res = await fetch('/api/admin/staff', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${session.token}`
-          },
-          body: JSON.stringify(newStaffForm)
-        });
-        const data = await res.json();
-        if (res.ok && data.success) {
-          setIsAddStaffOpen(false);
-          setActionSuccess('Staff created successfully.');
-          setNewStaffForm({
-            fullName: '',
-            email: '',
-            phone: '',
-            role: 'staff',
-            specificTitle: session.activeOutlet.category === 'salon' ? 'Salon Receptionist' : 'Cashier',
-            password: ''
-          });
-          fetchAdminData();
-        } else {
-          setActionError(data.message || 'Failed to create staff');
-        }
+        setActionError(res.message);
       }
-    } catch (e: any) {
-      setActionError(e.message);
+      await fetchAdminData();
     } finally {
       setIsActionLoading(false);
     }
   };
 
-  const handleResetStaffPassword = async (staffId: string, staffName: string, staffEmail?: string) => {
-    setIsActionLoading(true);
-    setActionError(null);
-    try {
-      if (session.supabaseToken) {
-        const res = await identityAdminService.resetPassword(session.supabaseToken, {
-          userId: staffId,
-          email: staffEmail,
-          outletCode: session.activeOutlet.code
-        });
-
-        if (res.success) {
-          if (res.recoveryLink) {
-            setResetFeedback(`Password recovery link generated for ${staffName}: ${res.recoveryLink}`);
-          } else {
-            setResetFeedback(res.message || `Password reset link sent to ${staffName}.`);
-          }
-        } else {
-          setActionError(res.error || 'Password reset failed');
-        }
-      } else {
-        const res = await fetch(`/api/admin/staff/${staffId}/reset-password`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${session.token}`
-          },
-          body: JSON.stringify({})
-        });
-        const data = await res.json();
-        if (data.success) {
-          setResetFeedback(`Password for ${staffName} reset to: ${data.temporaryPassword}`);
-        } else {
-          setActionError(data.message || 'Reset failed');
-        }
-      }
-    } catch (e: any) {
-      setActionError(e.message);
-    } finally {
-      setIsActionLoading(false);
-    }
-  };
-
-  const handleToggleStaffStatus = async (staffId: string, currentActive: boolean) => {
-    setIsActionLoading(true);
-    setActionError(null);
-    try {
-      if (session.supabaseToken) {
-        const res = await identityAdminService.setStaffStatus(session.supabaseToken, {
-          userId: staffId,
-          outletCode: session.activeOutlet.code,
-          isActive: !currentActive
-        });
-        if (!res.success) {
-          setActionError(res.error || 'Failed to update staff status.');
-          return;
-        }
-      } else {
-        const res = await fetch(`/api/admin/staff/${staffId}/status`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${session.token}`
-          },
-          body: JSON.stringify({ isActive: !currentActive })
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok || data.success === false) {
-          setActionError(data.message || 'Failed to update staff status.');
-          return;
-        }
-      }
-      fetchAdminData();
-    } catch (e: any) {
-      setActionError(e.message || 'Failed to update staff status.');
-    } finally {
-      setIsActionLoading(false);
-    }
-  };
+  const pendingOutbox = outboxItems.filter((i) => i.status !== 'SYNCED');
 
   return (
     <div className="space-y-6">
@@ -278,11 +311,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       <div className="flex items-center gap-2 border-b border-slate-800 pb-2 overflow-x-auto text-xs">
         {[
           { id: 'overview', label: 'Outlet Overview & Reports', icon: TrendingUp },
-          { id: 'staff', label: `Staff Management (${staffList.length})`, icon: Users },
+          { id: 'staff', label: `Outlet Users (${staffList.length})`, icon: Users },
           { id: 'catalog', label: `Catalog & Pricing (${catalogItems.length})`, icon: Sparkles },
           { id: 'orders', label: 'Billing & Transaction Ledger', icon: Receipt },
-          { id: 'printer', label: 'ESC/POS Printer Setup', icon: Printer }
-        ].map(tab => (
+          { id: 'printer', label: 'ESC/POS Printer Setup', icon: Printer },
+        ].map((tab) => (
           <button
             key={tab.id}
             onClick={() => setActiveTab(tab.id as any)}
@@ -298,9 +331,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         ))}
       </div>
 
-      {/* ============================================================================== */}
-      {/* TAB 1: OVERVIEW & REPORTS                                                      */}
-      {/* ============================================================================== */}
+      {/* TAB 1: OVERVIEW & REPORTS */}
       {activeTab === 'overview' && (
         <div className="space-y-6">
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -317,7 +348,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             <div className="bg-[#121629] border border-[#1e2540] p-5 rounded-2xl">
               <span className="text-xs text-slate-400 font-medium">Transactions Recorded</span>
               <div className="text-2xl font-bold text-white mt-1">{reports?.totalTransactions || 0}</div>
-              <span className="text-[11px] text-sky-400">Bills & KOT Orders</span>
+              <span className="text-[11px] text-sky-400">Bills &amp; KOT Orders</span>
             </div>
           </div>
 
@@ -327,116 +358,250 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               Tenant Isolation Verified
             </div>
             <p className="text-xs text-slate-300 leading-relaxed">
-              This administrative dashboard is strictly bound to <span className="font-bold text-white">{session.activeOutlet.name}</span> (ID: <span className="font-mono text-slate-400">{session.activeOutlet.id}</span>). Data, customers, staff members, and price modifications cannot leak across business tenants.
+              This administrative dashboard is strictly bound to <span className="font-bold text-white">{session.activeOutlet.name}</span> (Code:{' '}
+              <span className="font-mono text-slate-400">{session.activeOutlet.code}</span>). Users, bills, and catalog updates are isolated per outlet.
             </p>
           </div>
         </div>
       )}
 
-      {/* ============================================================================== */}
-      {/* TAB 2: STAFF CREATION & MANAGEMENT (Item 5)                                    */}
-      {/* ============================================================================== */}
+      {/* TAB 2: UNIFIED OUTLET USER MANAGEMENT */}
       {activeTab === 'staff' && (
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-bold text-white">POS Billing & Outlet Users for {session.activeOutlet.name}</h3>
-            <button
-              onClick={() => setIsAddStaffOpen(true)}
-              className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-pink-600 hover:bg-pink-500 text-white text-xs font-semibold shadow transition"
-            >
-              <UserPlus className="w-3.5 h-3.5" />
-              + Add POS_BILLING User
-            </button>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-bold text-white">User Management — {session.activeOutlet.name}</h3>
+              <p className="text-[11px] text-slate-400">
+                Changes made here synchronize automatically with {session.activeOutlet.name} and Central SMAV Auth.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={fetchAdminData}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium transition"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                Refresh
+              </button>
+              <button
+                onClick={() => {
+                  setActionError(null);
+                  setIsAddUserOpen(true);
+                }}
+                className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-pink-600 hover:bg-pink-500 text-white text-xs font-semibold shadow transition"
+              >
+                <UserPlus className="w-3.5 h-3.5" />
+                Add User
+              </button>
+            </div>
           </div>
 
           {actionError && (
-            <div className="p-3 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs flex items-center justify-between">
+            <div className="p-3 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs flex items-center justify-between gap-2">
               <span>{actionError}</span>
-              <button onClick={() => setActionError(null)} className="text-xs underline">Dismiss</button>
+              <button onClick={() => setActionError(null)} className="text-xs underline shrink-0">Dismiss</button>
             </div>
           )}
 
           {actionSuccess && (
-            <div className="p-3 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-xs flex items-center justify-between">
+            <div className="p-3 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-xs flex items-center justify-between gap-2">
               <span>{actionSuccess}</span>
-              <button onClick={() => setActionSuccess(null)} className="text-xs underline">Dismiss</button>
-            </div>
-          )}
-
-          {resetFeedback && (
-            <div className="p-3 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-xs font-mono flex items-center justify-between">
-              <span className="break-all">{resetFeedback}</span>
-              <button onClick={() => setResetFeedback(null)} className="text-xs underline ml-2">Dismiss</button>
+              <button onClick={() => setActionSuccess(null)} className="text-xs underline shrink-0">Dismiss</button>
             </div>
           )}
 
           <div className="bg-[#121629] border border-[#1e2540] rounded-2xl overflow-hidden shadow-xl">
-            <table className="w-full text-left text-xs text-slate-300">
-              <thead className="bg-[#161a33] text-slate-400 border-b border-[#2a3055] font-semibold">
-                <tr>
-                  <th className="p-4">Staff Name & Contact</th>
-                  <th className="p-4">Assigned Role</th>
-                  <th className="p-4">Status</th>
-                  <th className="p-4 text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/80">
-                {staffList.map(staff => (
-                  <tr key={staff.id || staff.userId} className="hover:bg-slate-800/30 transition">
-                    <td className="p-4">
-                      <div className="font-bold text-white">{staff.fullName}</div>
-                      <div className="text-slate-400 font-mono text-[11px]">{staff.email}</div>
-                      {staff.phone && <div className="text-slate-500 text-[10px]">{staff.phone}</div>}
-                    </td>
-                    <td className="p-4">
-                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider border ${
-                        getVisibleRole(staff.displayRole || staff.role) === 'ADMIN'
-                          ? 'bg-sky-500/15 text-sky-300 border-sky-500/30'
-                          : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-                      }`}>
-                        {getVisibleRole(staff.displayRole || staff.role)}
-                      </span>
-                    </td>
-                    <td className="p-4">
-                      <button
-                        onClick={() => handleToggleStaffStatus(staff.id || staff.userId, staff.isActive)}
-                        className={`px-2 py-0.5 rounded text-[10px] font-bold transition ${
-                          staff.isActive ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
-                        }`}
-                      >
-                        {staff.isActive ? 'ACTIVE' : 'DEACTIVATED'}
-                      </button>
-                    </td>
-                    <td className="p-4 text-right space-x-2">
-                      <button
-                        onClick={() => handleResetStaffPassword(staff.id || staff.userId, staff.fullName, staff.email)}
-                        className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-400 text-xs font-semibold transition"
-                      >
-                        Reset Password
-                      </button>
-                    </td>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs text-slate-300">
+                <thead className="bg-[#161a33] text-slate-400 border-b border-[#2a3055] font-semibold">
+                  <tr>
+                    <th className="p-4">User &amp; Identity</th>
+                    <th className="p-4">Role</th>
+                    <th className="p-4">Sync Status</th>
+                    <th className="p-4 text-right">Actions</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody className="divide-y divide-slate-800/80">
+                  {staffList.length === 0 ? (
+                    <tr>
+                      <td colSpan={4} className="p-8 text-center text-slate-500">
+                        No users assigned to {session.activeOutlet.name} yet. Click &ldquo;Add User&rdquo; to create one.
+                      </td>
+                    </tr>
+                  ) : (
+                    staffList.map((user) => {
+                      const visibleRole = getVisibleRole(user.outletRole || user.displayRole || user.role);
+                      const isProtected = user.platformRole === 'SUPERADMIN' || visibleRole === 'ADMIN';
+                      const canManageRow = isSuperadmin || !isProtected;
+
+                      return (
+                        <tr key={user.userId} className="hover:bg-slate-800/30 transition">
+                          <td className="p-4">
+                            <div className="font-bold text-white flex items-center gap-2">
+                              <span>{user.fullName}</span>
+                              {user.platformRole === 'SUPERADMIN' && (
+                                <span className="px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/30 text-[9px] font-bold">
+                                  SUPERADMIN
+                                </span>
+                              )}
+                            </div>
+                            <div className="font-mono text-[11px] text-slate-300 mt-0.5">
+                              {user.email || 'No email'}
+                            </div>
+                            {user.username && (
+                              <div className="text-slate-400 font-mono text-[10px]">@{user.username}</div>
+                            )}
+                            <div className="text-slate-500 font-mono text-[10px]">UUID: {user.userId}</div>
+                          </td>
+                          <td className="p-4">
+                            <span
+                              className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider border ${
+                                visibleRole === 'ADMIN'
+                                  ? 'bg-sky-500/15 text-sky-300 border-sky-500/30'
+                                  : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                              }`}
+                            >
+                              {visibleRole}
+                            </span>
+                          </td>
+                          <td className="p-4">
+                            <div className="flex flex-col gap-1 items-start">
+                              <span
+                                className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                  !user.isActive
+                                    ? 'bg-rose-500/20 text-rose-400'
+                                    : user.syncStatus === 'conflict'
+                                      ? 'bg-rose-500/20 text-rose-300'
+                                      : user.syncStatus === 'pending_outlet_sync'
+                                        ? 'bg-amber-500/20 text-amber-300'
+                                        : 'bg-emerald-500/20 text-emerald-400'
+                                }`}
+                              >
+                                {!user.isActive
+                                  ? 'DISABLED'
+                                  : user.syncStatus === 'conflict'
+                                    ? 'CONFLICT'
+                                    : user.syncStatus === 'pending_outlet_sync'
+                                      ? 'OUTBOX PENDING'
+                                      : 'SYNCED'}
+                              </span>
+                              {user.mustChangePassword && user.isActive && (
+                                <span className="text-[10px] text-amber-300 font-medium">
+                                  First-login password change pending
+                                </span>
+                              )}
+                              {user.outboxLastError && (
+                                <span className="text-[10px] text-amber-400 max-w-xs truncate" title={user.outboxLastError}>
+                                  {user.outboxLastError}
+                                </span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="p-4 text-right">
+                            {canManageRow ? (
+                              <div className="flex flex-wrap items-center justify-end gap-1.5">
+                                <button
+                                  disabled={isActionLoading}
+                                  onClick={() => {
+                                    setActionError(null);
+                                    setEditingUser(user);
+                                    setEditUserForm({
+                                      fullName: user.fullName || '',
+                                      username: user.username || '',
+                                      email: user.email || '',
+                                      phone: user.phone || '',
+                                      role: visibleRole === 'ADMIN' ? 'ADMIN' : 'STAFF',
+                                    });
+                                  }}
+                                  className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-semibold transition flex items-center gap-1"
+                                >
+                                  <Edit2 className="w-3 h-3" />
+                                  Edit User
+                                </button>
+                                <button
+                                  disabled={isActionLoading}
+                                  onClick={() => {
+                                    setActionError(null);
+                                    setResetTarget(user);
+                                    setResetNewPassword('');
+                                    setResetConfirmPassword('');
+                                  }}
+                                  className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-400 text-[11px] font-semibold transition flex items-center gap-1"
+                                >
+                                  <KeyRound className="w-3 h-3" />
+                                  Reset Password
+                                </button>
+                                <button
+                                  disabled={isActionLoading}
+                                  onClick={() => handleToggleStatus(user)}
+                                  className={`px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-[11px] font-semibold transition ${
+                                    user.isActive ? 'text-rose-400' : 'text-emerald-400'
+                                  }`}
+                                >
+                                  {user.isActive ? 'Disable User' : 'Enable User'}
+                                </button>
+                              </div>
+                            ) : (
+                              <span className="text-[11px] text-slate-500">SUPERADMIN Managed</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
+
+          {pendingOutbox.length > 0 && (
+            <div className="bg-[#121629] border border-amber-500/30 rounded-2xl p-4 space-y-2.5">
+              <div className="flex items-center gap-2 text-xs font-bold text-amber-300">
+                <AlertTriangle className="w-4 h-4" />
+                Pending Outlet Sync Queue ({pendingOutbox.length})
+              </div>
+              <div className="space-y-2">
+                {pendingOutbox.map((item) => (
+                  <div
+                    key={item.id}
+                    className="flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-xl bg-slate-900/60 border border-slate-800 text-xs"
+                  >
+                    <div>
+                      <span className="font-semibold text-white">{item.payload?.fullName || item.payload?.email || item.targetUserId}</span>
+                      <span className="ml-2 font-mono text-[10px] text-amber-300">{item.status}</span>
+                      {item.lastError && <div className="text-[11px] text-slate-400 mt-0.5">{item.lastError}</div>}
+                    </div>
+                    {item.status !== 'CONFLICT' && (
+                      <button
+                        disabled={isActionLoading}
+                        onClick={() => handleRetryOutbox(item.id)}
+                        className="px-3 py-1 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-[11px] font-semibold"
+                      >
+                        Retry Sync
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
-      {/* ============================================================================== */}
-      {/* TAB 3: CATALOG & PRICING MANAGEMENT                                            */}
-      {/* ============================================================================== */}
+      {/* TAB 3: CATALOG & PRICING MANAGEMENT */}
       {activeTab === 'catalog' && (
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <h3 className="text-sm font-bold text-white">
-                {session.activeOutlet.category === 'salon' ? 'Salon Services Catalog' : session.activeOutlet.category === 'restaurant' ? 'Restaurant Menu Items' : 'Retail Products Catalog'}
-              </h3>
-              <p className="text-xs text-slate-400">
-                Changes bump monotonic revisions and broadcast real-time delta updates to all paired POS terminals.
-              </p>
-            </div>
+          <div>
+            <h3 className="text-sm font-bold text-white">
+              {session.activeOutlet.category === 'salon'
+                ? 'Salon Services Catalog'
+                : session.activeOutlet.category === 'restaurant'
+                  ? 'Restaurant Menu Items'
+                  : 'Retail Products Catalog'}
+            </h3>
+            <p className="text-xs text-slate-400">
+              Changes bump monotonic revisions and broadcast real-time delta updates to all paired POS terminals.
+            </p>
           </div>
 
           <div className="bg-[#121629] border border-[#1e2540] rounded-2xl overflow-hidden shadow-xl">
@@ -472,9 +637,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </div>
       )}
 
-      {/* ============================================================================== */}
-      {/* TAB 4: ORDERS & BILLING HISTORY                                                */}
-      {/* ============================================================================== */}
+      {/* TAB 4: ORDERS & BILLING HISTORY */}
       {activeTab === 'orders' && (
         <div className="space-y-4">
           <h3 className="text-sm font-bold text-white">Outlet Transaction Ledger</h3>
@@ -497,7 +660,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       <td className="p-2.5">{b.customer_name || 'Guest'}</td>
                       <td className="p-2.5 uppercase text-slate-400">{b.payment_mode}</td>
                       <td className="p-2.5 font-bold text-emerald-400 font-mono">₹{b.grand_total}</td>
-                      <td className="p-2.5 text-right text-emerald-400 font-semibold">Paid & Synced</td>
+                      <td className="p-2.5 text-right text-emerald-400 font-semibold">Paid &amp; Synced</td>
                     </tr>
                   ))}
                 </tbody>
@@ -532,9 +695,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </div>
       )}
 
-      {/* ============================================================================== */}
-      {/* TAB 5: PRINTER CONFIGURATION                                                   */}
-      {/* ============================================================================== */}
+      {/* TAB 5: PRINTER CONFIGURATION */}
       {activeTab === 'printer' && (
         <div className="bg-[#121629] border border-[#1e2540] rounded-2xl p-6 shadow-xl max-w-xl space-y-4">
           <h3 className="text-base font-bold text-white flex items-center gap-2">
@@ -544,6 +705,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           <p className="text-xs text-slate-400">
             Configure default paper roll dimensions and receipt headers printed by Bluetooth thermal units.
           </p>
+
+          {printerSavedMessage && (
+            <div className="p-3 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-xs flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 shrink-0" />
+              <span>{printerSavedMessage}</span>
+            </div>
+          )}
 
           <div className="space-y-3 text-xs">
             <div>
@@ -577,7 +745,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <input
                 type="text"
                 value={printerConfig.receiptHeader}
-                onChange={e => setPrinterConfig({ ...printerConfig, receiptHeader: e.target.value })}
+                onChange={(e) => setPrinterConfig({ ...printerConfig, receiptHeader: e.target.value })}
                 className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2.5 focus:outline-none focus:border-pink-500"
               />
             </div>
@@ -587,7 +755,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <input
                 type="text"
                 value={printerConfig.receiptFooter}
-                onChange={e => setPrinterConfig({ ...printerConfig, receiptFooter: e.target.value })}
+                onChange={(e) => setPrinterConfig({ ...printerConfig, receiptFooter: e.target.value })}
                 className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2.5 focus:outline-none focus:border-pink-500"
               />
             </div>
@@ -595,7 +763,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             <div className="pt-2">
               <button
                 type="button"
-                onClick={() => alert('Printer settings saved successfully for this outlet.')}
+                onClick={() => setPrinterSavedMessage('Printer preferences saved for this outlet session.')}
                 className="px-4 py-2 rounded-xl bg-pink-600 hover:bg-pink-500 text-white font-semibold shadow"
               >
                 Save Printer Preferences
@@ -605,58 +773,156 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </div>
       )}
 
-      {/* Modal: Add Staff Member */}
-      {isAddStaffOpen && (
+      {/* Modal: Add User */}
+      {isAddUserOpen && (
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-[#121629] border border-[#1e2540] rounded-2xl p-6 max-w-md w-full shadow-2xl space-y-4">
             <div className="flex items-center justify-between pb-2 border-b border-slate-800">
-              <h3 className="text-base font-bold text-white">Add POS_BILLING User</h3>
-              <button onClick={() => setIsAddStaffOpen(false)} className="text-slate-400 hover:text-white">✕</button>
+              <h3 className="text-base font-bold text-white">Add User ({session.activeOutlet.name})</h3>
+              <button onClick={() => setIsAddUserOpen(false)} className="text-slate-400 hover:text-white">✕</button>
             </div>
 
-            <form onSubmit={handleCreateStaff} className="space-y-3 text-xs">
+            <form onSubmit={handleCreateUser} className="space-y-3 text-xs">
               <div>
                 <label className="font-semibold text-slate-300 mb-1 block">Full Name</label>
                 <input
                   type="text"
-                  value={newStaffForm.fullName}
-                  onChange={e => setNewStaffForm({ ...newStaffForm, fullName: e.target.value })}
+                  value={addUserForm.fullName}
+                  onChange={(e) => setAddUserForm({ ...addUserForm, fullName: e.target.value })}
                   placeholder="e.g. Ananya Rao"
                   required
                   className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2 focus:outline-none focus:border-pink-500"
                 />
               </div>
 
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="font-semibold text-slate-300 mb-1 block">Username</label>
+                  <input
+                    type="text"
+                    value={addUserForm.username}
+                    onChange={(e) => setAddUserForm({ ...addUserForm, username: e.target.value })}
+                    placeholder="ananya"
+                    required
+                    className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2 font-mono focus:outline-none focus:border-pink-500"
+                  />
+                </div>
+                <div>
+                  <label className="font-semibold text-slate-300 mb-1 block">Role</label>
+                  <select
+                    value={isSuperadmin ? addUserForm.role : 'STAFF'}
+                    onChange={(e) => setAddUserForm({ ...addUserForm, role: e.target.value as 'ADMIN' | 'STAFF' })}
+                    disabled={!isSuperadmin}
+                    className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2 focus:outline-none focus:border-pink-500 disabled:opacity-70"
+                  >
+                    <option value="STAFF">STAFF (POS_BILLING)</option>
+                    {isSuperadmin && <option value="ADMIN">ADMIN</option>}
+                  </select>
+                </div>
+              </div>
+
               <div>
-                <label className="font-semibold text-slate-300 mb-1 block">Staff Email</label>
+                <label className="font-semibold text-slate-300 mb-1 block">Email Address</label>
                 <input
                   type="email"
-                  value={newStaffForm.email}
-                  onChange={e => setNewStaffForm({ ...newStaffForm, email: e.target.value })}
-                  placeholder="staff@outlet.com"
+                  value={addUserForm.email}
+                  onChange={(e) => setAddUserForm({ ...addUserForm, email: e.target.value })}
+                  placeholder="staff@company.com"
                   required
                   className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2 focus:outline-none focus:border-pink-500"
                 />
               </div>
 
               <div>
-                <label className="font-semibold text-slate-300 mb-1 block">Specific Title / Position</label>
+                <label className="font-semibold text-slate-300 mb-1 block">Initial Temporary Password (min. 8 characters)</label>
+                <input
+                  type="password"
+                  value={addUserForm.initialPassword}
+                  onChange={(e) => setAddUserForm({ ...addUserForm, initialPassword: e.target.value })}
+                  placeholder="Minimum 8 characters"
+                  minLength={8}
+                  required
+                  className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2 focus:outline-none focus:border-pink-500"
+                />
+                <p className="text-[10px] text-slate-400 mt-1">
+                  User will be required to change this temporary password on first sign-in.
+                </p>
+              </div>
+
+              <div className="pt-3 flex items-center justify-end gap-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setIsAddUserOpen(false)}
+                  className="px-4 py-2 rounded-xl text-slate-400 hover:text-white"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isActionLoading}
+                  className="px-5 py-2 rounded-xl bg-pink-600 hover:bg-pink-500 disabled:opacity-50 text-white font-semibold shadow"
+                >
+                  {isActionLoading ? 'Saving & Syncing...' : 'Save & Sync User'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Modal: Edit User */}
+      {editingUser && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-[#121629] border border-[#1e2540] rounded-2xl p-6 max-w-md w-full shadow-2xl space-y-4">
+            <div className="flex items-center justify-between pb-2 border-b border-slate-800">
+              <h3 className="text-base font-bold text-white">Edit User</h3>
+              <button onClick={() => setEditingUser(null)} className="text-slate-400 hover:text-white">✕</button>
+            </div>
+            <div className="text-[10px] font-mono text-slate-400">Preserves Central Auth UUID: {editingUser.userId}</div>
+
+            <form onSubmit={handleEditUser} className="space-y-3 text-xs">
+              <div>
+                <label className="font-semibold text-slate-300 mb-1 block">Full Name</label>
                 <input
                   type="text"
-                  value={newStaffForm.specificTitle}
-                  onChange={e => setNewStaffForm({ ...newStaffForm, specificTitle: e.target.value })}
-                  placeholder="e.g. Counter Cashier, Receptionist"
+                  value={editUserForm.fullName}
+                  onChange={(e) => setEditUserForm({ ...editUserForm, fullName: e.target.value })}
+                  required
                   className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2 focus:outline-none focus:border-pink-500"
                 />
               </div>
 
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="font-semibold text-slate-300 mb-1 block">Username</label>
+                  <input
+                    type="text"
+                    value={editUserForm.username}
+                    onChange={(e) => setEditUserForm({ ...editUserForm, username: e.target.value })}
+                    className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2 font-mono focus:outline-none focus:border-pink-500"
+                  />
+                </div>
+                <div>
+                  <label className="font-semibold text-slate-300 mb-1 block">Role</label>
+                  <select
+                    value={isSuperadmin ? editUserForm.role : 'STAFF'}
+                    onChange={(e) => setEditUserForm({ ...editUserForm, role: e.target.value as 'ADMIN' | 'STAFF' })}
+                    disabled={!isSuperadmin}
+                    className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2 focus:outline-none focus:border-pink-500 disabled:opacity-70"
+                  >
+                    <option value="STAFF">STAFF (POS_BILLING)</option>
+                    {isSuperadmin && <option value="ADMIN">ADMIN</option>}
+                  </select>
+                </div>
+              </div>
+
               <div>
-                <label className="font-semibold text-slate-300 mb-1 block">Initial Password</label>
+                <label className="font-semibold text-slate-300 mb-1 block">Email Address</label>
                 <input
-                  type="password"
-                  value={newStaffForm.password}
-                  onChange={e => setNewStaffForm({ ...newStaffForm, password: e.target.value })}
-                  placeholder="Leave blank for Staff@123"
+                  type="email"
+                  value={editUserForm.email}
+                  onChange={(e) => setEditUserForm({ ...editUserForm, email: e.target.value })}
+                  required
                   className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2 focus:outline-none focus:border-pink-500"
                 />
               </div>
@@ -664,16 +930,76 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <div className="pt-3 flex items-center justify-end gap-2 border-t border-slate-800">
                 <button
                   type="button"
-                  onClick={() => setIsAddStaffOpen(false)}
+                  onClick={() => setEditingUser(null)}
                   className="px-4 py-2 rounded-xl text-slate-400 hover:text-white"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 rounded-xl bg-pink-600 hover:bg-pink-500 text-white font-semibold shadow"
+                  disabled={isActionLoading}
+                  className="px-5 py-2 rounded-xl bg-pink-600 hover:bg-pink-500 disabled:opacity-50 text-white font-semibold shadow"
                 >
-                  Create Staff
+                  {isActionLoading ? 'Updating...' : 'Save Changes'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Modal: Reset Password */}
+      {resetTarget && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-[#121629] border border-[#1e2540] rounded-2xl p-6 max-w-md w-full shadow-2xl space-y-4">
+            <div className="flex items-center justify-between pb-2 border-b border-slate-800">
+              <h3 className="text-base font-bold text-white flex items-center gap-2">
+                <KeyRound className="w-4 h-4 text-sky-400" />
+                Reset User Password
+              </h3>
+              <button onClick={() => setResetTarget(null)} className="text-slate-400 hover:text-white">✕</button>
+            </div>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Set a temporary password for <span className="font-bold text-white">{resetTarget.fullName}</span> ({resetTarget.email || resetTarget.userId}). They will be required to choose a personal password on first sign-in.
+            </p>
+
+            <form onSubmit={handleResetPasswordSubmit} className="space-y-3 text-xs">
+              <div>
+                <label className="font-semibold text-slate-300 mb-1 block">New Temporary Password (min. 8 characters)</label>
+                <input
+                  type="password"
+                  value={resetNewPassword}
+                  onChange={(e) => setResetNewPassword(e.target.value)}
+                  minLength={8}
+                  required
+                  className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2 focus:outline-none focus:border-pink-500"
+                />
+              </div>
+              <div>
+                <label className="font-semibold text-slate-300 mb-1 block">Confirm Temporary Password</label>
+                <input
+                  type="password"
+                  value={resetConfirmPassword}
+                  onChange={(e) => setResetConfirmPassword(e.target.value)}
+                  minLength={8}
+                  required
+                  className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2 focus:outline-none focus:border-pink-500"
+                />
+              </div>
+              <div className="pt-3 flex items-center justify-end gap-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setResetTarget(null)}
+                  className="px-4 py-2 rounded-xl text-slate-400 hover:text-white"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isActionLoading}
+                  className="px-5 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white font-semibold shadow"
+                >
+                  {isActionLoading ? 'Updating...' : 'Set Temporary Password'}
                 </button>
               </div>
             </form>

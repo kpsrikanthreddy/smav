@@ -21,6 +21,7 @@ import { SuperadminDashboard } from './components/SuperadminDashboard';
 import { AdminDashboard } from './components/AdminDashboard';
 import { StaffPOS } from './components/StaffPOS';
 import { SyncDashboard } from './components/SyncDashboard';
+import { CatalogSyncDiagnostics } from './components/CatalogSyncDiagnostics';
 
 export default function App() {
   // Session is null initially so user lands on the requested login screen
@@ -32,7 +33,7 @@ export default function App() {
   const [outletSwitchError, setOutletSwitchError] = useState<string | null>(null);
 
   // Active top navigation tab
-  const [activeTab, setActiveTab] = useState<'primary' | 'pos' | 'sync' | 'whatsapp'>('primary');
+  const [activeTab, setActiveTab] = useState<'primary' | 'pos' | 'sync' | 'whatsapp' | 'diagnostics'>('primary');
 
   // Terminal hardware simulation states
   const [isOnline, setIsOnline] = useState<boolean>(true);
@@ -344,6 +345,14 @@ export default function App() {
             </button>
           )}
 
+          {session.role === 'superadmin' && (
+            <button onClick={() => setActiveTab('diagnostics')}
+              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg font-medium transition ${activeTab === 'diagnostics' ? 'bg-slate-800 text-white border border-slate-700' : 'text-slate-400 hover:text-slate-200'}`}>
+              <SlidersHorizontal className="w-3.5 h-3.5 text-sky-400" />
+              <span>Catalog Sync Diagnostics</span>
+            </button>
+          )}
+
           {/* POS Terminal Tab */}
           <button
             onClick={() => setActiveTab('pos')}
@@ -389,6 +398,10 @@ export default function App() {
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl mx-auto w-full p-4 lg:p-8">
         
+        {activeTab === 'diagnostics' && session.role === 'superadmin' && (
+          <CatalogSyncDiagnostics session={session} />
+        )}
+
         {/* VIEW 1: SUPERADMIN DASHBOARD */}
         {activeTab === 'primary' && session.role === 'superadmin' && (
           <SuperadminDashboard

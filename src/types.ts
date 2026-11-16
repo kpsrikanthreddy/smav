@@ -21,9 +21,75 @@ export interface Outlet {
   receiptFooter: string;
   providerType: 'supabase_salon' | 'supabase_restaurant' | 'central_smav' | 'custom_outlet';
   supabaseUrl?: string;
+  syncWebhookUrl?: string;
   isActive: boolean;
   createdAt?: string;
   updatedAt?: string;
+}
+
+export interface OutletUserOutletMembership {
+  outletId: string;
+  outletCode: string;
+  outletName: string;
+  category: BusinessCategory;
+  role: 'ADMIN' | 'STAFF' | string;
+  displayRole: 'ADMIN' | 'POS_BILLING';
+  isActive: boolean;
+}
+
+export interface OutletUserRecord {
+  id: string;
+  userId: string;
+  email: string | null;
+  username: string | null;
+  externalStaffId?: string | null;
+  fullName: string;
+  phone?: string;
+  platformRole?: string;
+  role: 'admin' | 'staff';
+  outletRole: 'ADMIN' | 'STAFF' | string;
+  displayRole: 'ADMIN' | 'POS_BILLING';
+  outletId: string;
+  outletCode: string;
+  outletName: string;
+  outletCategory: BusinessCategory;
+  outlets: OutletUserOutletMembership[];
+  isActive: boolean;
+  mustChangePassword?: boolean;
+  lastSignInAt?: string | null;
+  lastSyncedAt?: string | null;
+  syncOrigin?: string | null;
+  syncVersion?: number;
+  syncStatus: 'synced' | 'pending_outlet_sync' | 'conflict' | 'disabled';
+  syncNote?: string;
+  outboxStatus?: string | null;
+  outboxLastError?: string | null;
+  outboxId?: string | null;
+}
+
+export interface SyncOutboxItem {
+  id: string;
+  idempotencyKey: string;
+  operationId: string;
+  syncOrigin: 'smav_portal' | 'outlet_admin' | 'outbox_retry';
+  action: 'upsert_user' | 'update_user' | 'reset_password' | 'set_status';
+  outletId: string | null;
+  outletCode: string;
+  targetUserId: string | null;
+  externalStaffId: string | null;
+  payload: Record<string, any>;
+  centralConfirmed: boolean;
+  outletConfirmed: boolean;
+  status: 'PENDING' | 'PARTIAL_CENTRAL_ONLY' | 'PARTIAL_OUTLET_ONLY' | 'SYNCED' | 'CONFLICT' | 'FAILED';
+  attempts: number;
+  maxAttempts: number;
+  nextRetryAt: string | null;
+  lastError: string | null;
+  conflictDetails: Record<string, any> | null;
+  syncVersion: number;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface UserOutletMembership {

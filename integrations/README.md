@@ -1,135 +1,80 @@
-# SMAV Central Enterprise Authentication Integration Guide
+# SMAV Multi-Outlet Unified User Management Integration Guide
 
-This guide documents how **The Glossy Looks Admin Portal** (`https://www.glossylooks.in`) and the **MOZZ / Starters4U Admin Portal** (`https://www.starters4u.in`) connect to the **Central SMAV Supabase Auth Gateway**.
-
----
-
-## 1. Architecture Overview
-
-```
-                      ┌──────────────────────────────────────────────┐
-                      │        CENTRAL SMAV SUPABASE AUTH            │
-                      │  - auth.users (Single authoritative ID)      │
-                      │  - public.smav_profiles                      │
-                      │  - public.smav_user_outlet_roles             │
-                      │  - public.smav_outlets                       │
-                      └──────────────────────┬───────────────────────┘
-                                             │
-                       Central Auth REST API Gateway
-                                             │
-       ┌─────────────────────────────────────┼─────────────────────────────────────┐
-       │                                     │                                     │
-       ▼                                     ▼                                     ▼
-┌─────────────────────────┐       ┌─────────────────────────┐       ┌─────────────────────────┐
-│   SMAV PRINT AGENT      │       │   THE GLOSSY LOOKS      │       │     MOZZ / STARTERS4U   │
-│   (POS & Gateway)       │       │   Admin Portal          │       │     Admin Portal        │
-│                         │       │                         │       │                         │
-│ • Superadmin Console    │       │ • Staff Creation Hook   │       │ • Staff Creation Hook   │
-│ • Salon POS (/pos)      │       │ • Salon Catalog & Appts │       │ • Restaurant Menu & KOT │
-│ • Restaurant POS (/pos) │       │ • Local DB intact       │       │ • Local DB intact       │
-└─────────────────────────┘       └─────────────────────────┘       └─────────────────────────┘
-```
+This guide covers bidirectional, loop-safe user synchronization between:
+- **Central SMAV Supabase (`qykdwswatopylzvqhgog`)** — Authoritative Auth (`auth.users`), profiles, outlet roles, identity mappings, and `smav_sync_outbox`.
+- **The Glossy Looks (`onswigwiwuvkvoduuhxr`)**
+- **MOZZ / Starters4U (`uyqdnqbadfysnbzbncyj`)**
+- **Future Outlets** (Salons, Restaurants, Retail Stores, or custom outlets)
+- **SMAV Print Agent** (`server.ts` + React Admin/Superadmin UI)
 
 ---
 
-## 2. Key Principles & Security Rules
+## 1. Architecture Rules
 
-1. **Single Authoritative Authentication Provider**:
-   All user credentials (email + password / PIN) are managed exclusively by **Central SMAV Supabase Auth**.
-2. **Zero Plaintext Password Exposure**:
-   Neither portal nor SMAV ever stores or transmits plaintext passwords. Passwords are only accepted during Supabase Auth `signInWithPassword` or through standard Supabase invitation / reset token workflows.
-3. **No Duplicate Identity Creation**:
-   If an email already exists in Central Auth (e.g. an owner with multiple businesses or an employee switching branches), Central SMAV links that existing `user_id` to the new outlet in `smav_user_outlet_roles` instead of failing or creating duplicates.
-4. **Strict Outlet Isolation**:
-   - Glossy Looks staff receive role assignments for `outlet_glossy_gach` (`category: 'salon'`) and can only access the **Salon POS** (services, stylists, appointments, salon billing).
-   - MOZZ staff receive role assignments for `outlet_mozz_gach` (`category: 'restaurant'`) and can only access the **Restaurant POS** (menu, tables, KOT, restaurant billing).
-   - Superadmin accounts access all outlets.
-5. **Zero-Downtime Migration**:
-   Existing operations in Glossy Looks and Starters4U continue uninterrupted. Each portal continues using its existing database for appointments, services, orders, and tables. Only staff authentication and POS linkage federate with SMAV.
-
----
-
-## 3. Database Migrations
-
-### A. Central SMAV Supabase
-Run `database/migrations/009_shared_portal_authentication_and_linking.sql` in the Central Supabase project.
-
-### B. The Glossy Looks Supabase (`onswigwiwuvkvoduuhxr.supabase.co`)
-Run `database/migrations/glossylooks_central_auth_link.sql` in the SQL Editor.
-- Adds `central_auth_id` to `public.staff` and `public.users`.
-- Keeps all existing tables (`appointments`, `services`, `categories`, `staff`, `branches`) completely intact.
-
-### C. MOZZ / Starters4U Supabase (`uyqdnqbadfysnbzbncyj.supabase.co`)
-Run `database/migrations/mozz_central_auth_link.sql` in the SQL Editor.
-- Adds `central_auth_id` to restaurant `staff` / `users`.
-- Keeps all existing tables (`menu_items`, `orders`, `tables`, `branches`) completely intact.
+1. **Single-Source Admin Onboarding**:
+   An authorized admin adds a user with **Full Name, Username, Email, Role (`ADMIN` or `STAFF`), and Initial Password** directly via the server-side API. Activation-link / email-invite workflows are removed from standard onboarding.
+2. **Mandatory Password Change on First Sign-In**:
+   Admin-assigned initial or reset passwords set `user_metadata.must_change_password = true` in Central Supabase Auth. When the user signs in for the first time, SMAV prompts them to set a personal password before issuing a POS/Admin session.
+3. **Zero Plaintext Password Persistence**:
+   Passwords exist only transiently inside the HTTPS request body forwarded to Supabase Auth Admin APIs and are **never** written to `smav_sync_outbox`, `smav_audit_logs`, `smav_profiles`, or outlet tables.
+4. **Deterministic Identity Matching (No Duplicates)**:
+   Edits update the existing Central Auth UUID resolved in order:
+   1. `userId` (Central Auth UUID)
+   2. `smav_external_identities (source, external_id)`
+   3. Exact email match in `auth.users` (fails closed with HTTP `409 Conflict` if ambiguous)
+5. **Bidirectional Sync Without Loops**:
+   - **Outlet Admin → SMAV**: Sends `X-SMAV-Sync-Origin: outlet_admin` and `X-Idempotency-Key` to `POST /api/integrations/outlets/:outletCode/users/sync`. SMAV updates Central Supabase, confirms both sides (`outletConfirmed = true`), and skips echoing back to that outlet.
+   - **SMAV UI → Outlet**: Sends `X-SMAV-Sync-Origin: smav_portal` and pushes metadata/status to the outlet's configured webhook URL or direct outlet Supabase service-role client. If the outlet does not confirm, `smav_sync_outbox` records `PARTIAL_CENTRAL_ONLY` and schedules automatic retries.
+6. **Strict Outlet Isolation & RBAC**:
+   - `SUPERADMIN`: manages all outlets, can grant `ADMIN` or `STAFF`, never auto-promotes outlet owners to `SUPERADMIN`.
+   - Outlet `ADMIN`: manages only users within assigned active outlets (`STAFF` only).
+   - `STAFF` (`POS_BILLING`): billing & receipt printing only; no user-management permissions.
 
 ---
 
-## 4. Portal Code Integration
+## 2. Reusable Outlet Portal Code (`integrations/shared/smav_outlet_user_adapter.ts`)
 
-### The Glossy Looks Admin Portal
-Copy `integrations/glossylooks/glossylooks_smav_auth_adapter.ts` to your portal's server or API directory.
-When creating staff in `POST /api/admin/staff`:
-```typescript
-import { GlossyLooksSmavAuthAdapter } from './glossylooks_smav_auth_adapter';
+Use `GlossyLooksSmavAuthAdapter`, `MozzSmavAuthAdapter`, or `new SmavOutletUserAdapter({ outletCode: 'your_outlet', integrationKey, gatewayUrl })`:
 
-const smavAdapter = new GlossyLooksSmavAuthAdapter({
-  centralGatewayUrl: process.env.SMAV_GATEWAY_URL,
-  gatewaySecret: process.env.SMAV_GATEWAY_SECRET
+```ts
+import { SmavOutletUserAdapter } from './integrations/shared/smav_outlet_user_adapter';
+
+const adapter = new SmavOutletUserAdapter({
+  outletCode: 'my_retail_store',
+  integrationKey: process.env.MY_RETAIL_INTEGRATION_KEY,
+  gatewayUrl: process.env.SMAV_GATEWAY_URL, // e.g. SMAV Print Agent backend URL
 });
 
-// Inside your create staff route:
-const linkResult = await smavAdapter.provisionOrLinkStaff({
-  externalStaffId: localStaffRecord.id,
-  email: localStaffRecord.email,
-  fullName: localStaffRecord.name,
-  phone: localStaffRecord.phone,
-  role: 'staff' // or 'admin'
+// Create user cleanly from Outlet Admin page
+const res = await adapter.upsertUser({
+  externalStaffId: localUser.id,
+  fullName: localUser.name,
+  username: localUser.username,
+  email: localUser.email,
+  role: 'STAFF',
+  initialPassword: formPassword,
 });
-
-// Update local record with central_auth_id
-if (linkResult.success && linkResult.centralUserId) {
-  await supabase
-    .from('staff')
-    .update({ 
-      central_auth_id: linkResult.centralUserId,
-      central_auth_status: 'ACTIVE',
-      central_auth_linked_at: new Date().toISOString()
-    })
-    .eq('id', localStaffRecord.id);
-}
 ```
 
-### MOZZ / Starters4U Admin Portal
-Copy `integrations/mozz/mozz_smav_auth_adapter.ts` to your restaurant portal's server or API directory.
-```typescript
-import { MozzSmavAuthAdapter } from './mozz_smav_auth_adapter';
+### Handling Updates Pushed FROM SMAV Portal (`verifyIncomingSmavWebhook`)
 
-const smavAdapter = new MozzSmavAuthAdapter({
-  centralGatewayUrl: process.env.SMAV_GATEWAY_URL,
-  gatewaySecret: process.env.SMAV_GATEWAY_SECRET
-});
+```ts
+app.post('/api/smav-sync-webhook', async (req, res) => {
+  const check = adapter.verifyIncomingSmavWebhook(req.headers, req.body);
+  if (!check.authorized) return res.status(401).json({ success: false, message: check.skipReason });
+  if (!check.shouldApply) return res.json({ success: true, skipped: true, reason: check.skipReason });
 
-// Inside restaurant staff creation route:
-const linkResult = await smavAdapter.provisionOrLinkStaff({
-  externalStaffId: restaurantStaffRecord.id,
-  email: restaurantStaffRecord.email,
-  fullName: restaurantStaffRecord.name,
-  phone: restaurantStaffRecord.phone,
-  role: 'staff'
+  // Update local outlet DB row using central_auth_id = req.body.userId
+  return res.json({ success: true, externalStaffId: updatedRow.id });
 });
 ```
 
 ---
 
-## 5. Verification Checklist
+## 3. Separate Deployment Order
 
-1. **Staff Provisioning Test**:
-   Create a new staff member in Glossy Looks portal -> Verify central user exists in `smav_profiles` and has an active entry in `smav_user_outlet_roles` for `outlet_glossy_gach`.
-2. **Duplicate Prevention Test**:
-   Provision the same email for MOZZ portal -> Central gateway links the existing central user ID without creating duplicate `auth.users` records.
-3. **Login & POS Enforcement Test**:
-   Log into SMAV Print Agent with Glossy Looks staff credentials -> Verify redirected to `/pos` with Salon services and stylists. Verify restaurant menu is inaccessible.
-4. **Restaurant POS Test**:
-   Log into SMAV with MOZZ staff credentials -> Verify redirected to `/pos` with Restaurant menu and tables. Verify salon services are inaccessible.
+1. **Central SMAV Supabase (`qykdwswatopylzvqhgog`)**: Apply `database/migrations/012_unified_user_sync_and_outbox.sql` and deploy updated `supabase/functions/smav-identity-admin/index.ts`.
+2. **The Glossy Looks (`onswigwiwuvkvoduuhxr`)**: Apply `database/migrations/glossylooks_central_auth_link.sql` and wire `GlossyLooksSmavAuthAdapter` + env `GLOSSYLOOKS_INTEGRATION_KEY`.
+3. **MOZZ / Starters4U (`uyqdnqbadfysnbzbncyj`)**: Apply `database/migrations/mozz_central_auth_link.sql` and wire `MozzSmavAuthAdapter` + env `MOZZ_INTEGRATION_KEY`.
+4. **Future Outlets**: Apply `database/migrations/template_outlet_central_auth_link.sql`, register outlet in SMAV Superadmin UI (`outlet_code` + optional `syncWebhookUrl`), and configure `OUTLET_<CODE>_INTEGRATION_KEY`.
+5. **SMAV Print Agent**: Configure `.env` keys (`SMAV_SUPABASE_URL`, `SMAV_SUPABASE_ANON_KEY`, `SMAV_SERVICE_ROLE_KEY`, outlet integration keys/webhooks or Supabase service keys) and restart server.
