@@ -8,6 +8,7 @@ import com.smav.printagent.data.local.OutletCatalogMetadata
 import com.smav.printagent.network.ApiService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.collect
 import okhttp3.OkHttpClient
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
@@ -17,9 +18,12 @@ import java.util.concurrent.TimeUnit
  * No business images, customers, or other outlets are downloaded.
  */
 class OutletCatalogRepository(private val context: Context, private val sessions: SessionManager) {
-    fun observe(outletId: String) = OutletCatalogDatabase.open(context, outletId).let { db ->
-        db.catalogDao().observeItems()
-    }
+    fun observe(outletId: String): kotlinx.coroutines.flow.Flow<List<OutletCatalogItem>> =
+        kotlinx.coroutines.flow.flow {
+            val db = OutletCatalogDatabase.open(context, outletId)
+            try { db.catalogDao().observeItems().collect { emit(it) } }
+            finally { db.close() }
+        }
 
     /** Caller must pass the central outlet UUID selected in the authenticated session.
      * The backend independently enforces authorization. Never use a business slug as outletId.

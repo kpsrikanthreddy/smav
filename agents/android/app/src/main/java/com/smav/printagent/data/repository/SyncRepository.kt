@@ -11,7 +11,6 @@ import com.smav.printagent.network.SyncPrintStatusRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
-import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import java.util.concurrent.TimeUnit
@@ -23,11 +22,7 @@ class SyncRepository(
 ) {
 
     private fun getApiService(): ApiService {
-        val logging = HttpLoggingInterceptor().apply {
-            level = HttpLoggingInterceptor.Level.BODY
-        }
         val okHttpClient = OkHttpClient.Builder()
-            .addInterceptor(logging)
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
             .writeTimeout(20, TimeUnit.SECONDS)
@@ -49,6 +44,32 @@ class SyncRepository(
     suspend fun syncAllPending(): Result<Int> = withContext(Dispatchers.IO) {
         val session = sessionManager.getStaffSession()
             ?: return@withContext Result.failure(IllegalStateException("No active staff session"))
+
+        // B5 safety: fail closed. The legacy Room billing store is shared across
+        // outlets and still uses legacy business IDs. Do not upload another outlet's
+        // offline transactions under the current user's bearer token.
+        val pendingSalon = database.salonBillDao().getUnsyncedBills()
+        val pendingRestaurant = database.restaurantOrderDao().getUnsyncedOrders()
+        val legacyBusinessId = when (session.businessType) {
+            com.smav.printagent.model.BusinessType.SALON -> "the_glossy_looks"
+            com.smav.printagent.model.BusinessType.RESTAURANT -> "mozz_starters4u"
+            else -> null
+        }
+        if (legacyBusinessId == null ||
+            (pendingSalon.isNotEmpty() && (legacyBusinessId != "the_glossy_looks" || pendingSalon.any { it.businessId != legacyBusinessId })) ||
+            (pendingRestaurant.isNotEmpty() && (legacyBusinessId != "mozz_starters4u" || pendingRestaurant.any { it.businessId != legacyBusinessId }))
+        ) {
+            return@withContext Result.failure(
+                IllegalStateException("Offline sync blocked: outlet ownership must be verified before uploading transactions")
+            )
+        }
+        // New UUID-based sessions cannot safely sync legacy business IDs until
+        // backend transaction ownership and idempotency are integrated.
+        if (session.businessId != legacyBusinessId) {
+            return@withContext Result.failure(
+                IllegalStateException("Offline sync blocked: legacy billing store is not bound to selected outlet UUID")
+            )
+        }
 
         var totalSynced = 0
         val token = "Bearer ${session.token}"
