@@ -94,7 +94,7 @@ class BillingRepository(
         val roundedGrandTotal = Math.round(rawGrandTotal).toDouble()
         val roundOff = roundedGrandTotal - rawGrandTotal
 
-        val currentCatalogRev = database.cachedCatalogDao().getSyncState("the_glossy_looks")?.lastSyncedRevision ?: 101L
+        val currentCatalogRev = database.cachedCatalogDao().getSyncState("the_glossy_looks")?.currentRevision ?: 101L
 
         val billEntity = SalonBillEntity(
             id = billId,
@@ -225,7 +225,7 @@ class BillingRepository(
         val totalTax = cgstAmount + sgstAmount
         val grandTotal = Math.round(subtotal + totalTax).toDouble()
 
-        val currentCatalogRev = database.cachedCatalogDao().getSyncState("mozz_starters4u")?.lastSyncedRevision ?: 201L
+        val currentCatalogRev = database.cachedCatalogDao().getSyncState("mozz_starters4u")?.currentRevision ?: 201L
 
         val orderEntity = RestaurantOrderEntity(
             id = orderId,
