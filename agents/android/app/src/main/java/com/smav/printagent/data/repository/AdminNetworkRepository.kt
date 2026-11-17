@@ -425,7 +425,7 @@ class AdminNetworkRepository(
             val resp = api.getOutletCatalogChanges(currentBearer(), outletId, sinceRevision = 0, limit = 50, offset = 0)
             val body = SmavApiClient.unwrapOrThrow(resp) { it }
             val catalog = body.get("catalog").asJsonObjectOrNull()
-            val changesCount = catalog?.getAsJsonArray("items")?.size() ?: catalog?.optInt("total", 0) ?: 0
+            val changesCount = catalog?.getAsJsonArray("items")?.size() ?: catalog?.optInt("total", default = 0) ?: 0
             val rev = catalog?.optInt("currentRevision", default = 0) ?: 0
             CatalogDiagnosticItem(
                 checkType = "Incremental Delta Changes",
@@ -442,7 +442,7 @@ class AdminNetworkRepository(
             val sourceWarning = runCatching {
                 val srcResp = api.getOutletSourceCatalog(currentBearer(), outletId, limit = 200, offset = 0)
                 val srcBody = SmavApiClient.unwrapOrThrow(srcResp) { it }
-                if (srcBody.optInt("total", 0) == 0) "Source cache is empty; no import performed." else null
+                if (srcBody.optInt("total", default = 0) == 0) "Source cache is empty; no import performed." else null
             }.getOrNull()
 
             val resp = api.getCatalogImportPreflight(currentBearer(), outletId)

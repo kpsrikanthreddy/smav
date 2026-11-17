@@ -95,13 +95,26 @@ object SmavApiClient {
         }
     }
 
-    private fun sanitizeMessage(msg: String): String {
+    @PublishedApi
+    internal fun sanitizeMessage(msg: String): String {
         val trimmed = msg.trim()
         if (trimmed.isBlank()) return "Something went wrong. Please try again."
         if (trimmed.startsWith("<!doctype", ignoreCase = true) || trimmed.startsWith("<html", ignoreCase = true)) {
             return "The SMAV server returned a web page instead of JSON data."
         }
-        return trimmed
+        val sensitivePatterns = listOf(
+            Regex("eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]+"),
+            Regex("Bearer\\s+[A-Za-z0-9._~+/=-]{8,}", RegexOption.IGNORE_CASE),
+            Regex("(service_?role|supabase_?key|anon_?key|access_?token|refresh_?token|api_?key|authorization)\\s*[:=]", RegexOption.IGNORE_CASE),
+            Regex("(\"password\"|password\\s*=)\\s*[:=]?", RegexOption.IGNORE_CASE)
+        )
+        if (sensitivePatterns.any { it.containsMatchIn(trimmed) }) {
+            return "Request failed due to an authentication or server error. Please try again."
+        }
+        if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+            return "The server returned an unexpected error payload. Please try again."
+        }
+        return if (trimmed.length > 240) trimmed.take(240).trimEnd() + "..." else trimmed
     }
 
     inline fun <T> unwrapOrThrow(
