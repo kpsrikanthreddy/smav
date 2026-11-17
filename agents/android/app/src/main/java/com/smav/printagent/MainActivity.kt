@@ -8,8 +8,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Login
@@ -98,25 +96,26 @@ class MainActivity : ComponentActivity() {
                         contentAlignment = Alignment.TopCenter
                     ) {
                         Column(
-                            Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
-                                .background(cardBackground, RoundedCornerShape(28.dp)).padding(horizontal = 28.dp, vertical = 36.dp),
+                            Modifier.fillMaxWidth()
+                                .background(cardBackground, RoundedCornerShape(24.dp)).padding(horizontal = 22.dp, vertical = 20.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
                             Surface(
-                                modifier = Modifier.size(76.dp),
-                                shape = RoundedCornerShape(22.dp),
+                                modifier = Modifier.size(52.dp),
+                                shape = RoundedCornerShape(16.dp),
                                 color = Color(0xFF171E38),
                                 border = BorderStroke(1.dp, outline)
                             ) {
                                 Box(contentAlignment = Alignment.Center) {
-                                    Icon(Icons.Default.Print, "Printer", tint = Color(0xFFFF2D82), modifier = Modifier.size(38.dp))
+                                    Icon(Icons.Default.Print, "Printer", tint = Color(0xFFFF2D82), modifier = Modifier.size(28.dp))
                                 }
                             }
-                            Spacer(Modifier.height(24.dp))
-                            Text("SMAV Print Agent", color = Color.White, fontSize = 30.sp, fontWeight = FontWeight.Bold)
-                            Spacer(Modifier.height(8.dp))
-                            Text("Secure Enterprise Authentication Gateway", color = Color(0xFF78A7E8), fontSize = 15.sp)
-                            Spacer(Modifier.height(40.dp))
+                            Spacer(Modifier.height(12.dp))
+                            Text("SMAV Print Agent", color = Color.White, fontSize = 25.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(3.dp))
+                            Text("Secure Enterprise Authentication Gateway", color = Color(0xFF78A7E8), fontSize = 12.sp,
+                                maxLines = 1)
+                            Spacer(Modifier.height(20.dp))
 
                             LoginLabel("Email Address or Username")
                             OutlinedTextField(
@@ -126,9 +125,9 @@ class MainActivity : ComponentActivity() {
                                 singleLine = true,
                                 colors = loginFieldColors(fieldBackground, outline),
                                 shape = RoundedCornerShape(16.dp),
-                                modifier = Modifier.fillMaxWidth()
+                                modifier = Modifier.fillMaxWidth().height(56.dp)
                             )
-                            Spacer(Modifier.height(22.dp))
+                            Spacer(Modifier.height(12.dp))
 
                             LoginLabel("Password / PIN")
                             OutlinedTextField(
@@ -145,9 +144,9 @@ class MainActivity : ComponentActivity() {
                                 },
                                 colors = loginFieldColors(fieldBackground, outline),
                                 shape = RoundedCornerShape(16.dp),
-                                modifier = Modifier.fillMaxWidth()
+                                modifier = Modifier.fillMaxWidth().height(56.dp)
                             )
-                            Spacer(Modifier.height(22.dp))
+                            Spacer(Modifier.height(12.dp))
 
                             LoginLabel("Outlet Code (optional)")
                             OutlinedTextField(
@@ -157,12 +156,13 @@ class MainActivity : ComponentActivity() {
                                 singleLine = true,
                                 colors = loginFieldColors(fieldBackground, outline),
                                 shape = RoundedCornerShape(16.dp),
-                                modifier = Modifier.fillMaxWidth()
+                                modifier = Modifier.fillMaxWidth().height(56.dp)
                             )
-                            Spacer(Modifier.height(8.dp))
+                            Spacer(Modifier.height(4.dp))
                             Text("Used to identify an outlet's authentication provider when required.",
-                                color = Color(0xFF78A7E8), fontSize = 13.sp, modifier = Modifier.fillMaxWidth())
-                            Spacer(Modifier.height(32.dp))
+                                color = Color(0xFF78A7E8), fontSize = 11.sp, maxLines = 1,
+                                modifier = Modifier.fillMaxWidth())
+                            Spacer(Modifier.height(18.dp))
 
                         Button(onClick = {
                             busy = true; message = ""
@@ -201,7 +201,7 @@ class MainActivity : ComponentActivity() {
                             }
                         },
                             enabled = !busy && username.isNotBlank() && password.isNotBlank(),
-                            modifier = Modifier.fillMaxWidth().height(64.dp),
+                            modifier = Modifier.fillMaxWidth().height(56.dp),
                             shape = RoundedCornerShape(16.dp),
                             border = BorderStroke(3.dp, Brush.horizontalGradient(listOf(Color(0xFFFF1F81), Color(0xFFFFA000)))),
                             colors = ButtonDefaults.buttonColors(
@@ -213,7 +213,7 @@ class MainActivity : ComponentActivity() {
                             Spacer(Modifier.width(12.dp))
                             Text("Sign In", fontSize = 18.sp, fontWeight = FontWeight.Bold)
                         }
-                        Spacer(Modifier.height(22.dp))
+                        Spacer(Modifier.height(6.dp))
                         TextButton(onClick = { message = "Please contact your outlet administrator to reset your credentials." }) {
                             Text("Forgot Password? ", color = secondaryText)
                             Text("Reset your credentials", color = Color(0xFFFF2D82), fontWeight = FontWeight.Bold)
@@ -291,8 +291,8 @@ private fun JsonObject.bool(key: String): Boolean =
 
 @Composable
 private fun LoginLabel(text: String) {
-    Text(text, color = Color(0xFFDCE7FF), fontWeight = FontWeight.SemiBold,
-        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp))
+    Text(text, color = Color(0xFFDCE7FF), fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp))
 }
 
 @Composable
