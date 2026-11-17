@@ -38,6 +38,7 @@ class MainActivity : ComponentActivity() {
                 var message by remember { mutableStateOf("") }
                 var busy by remember { mutableStateOf(false) }
                 var pendingToken by remember { mutableStateOf("") }
+                var pendingUserId by remember { mutableStateOf("") }
                 var outlets by remember { mutableStateOf<List<Pair<String,String>>>(emptyList()) }
                 var active by remember { mutableStateOf(sessions.getStaffSession()) }
                 var catalogRows by remember { mutableStateOf<List<com.smav.printagent.data.local.OutletCatalogItem>>(emptyList()) }
@@ -63,6 +64,7 @@ class MainActivity : ComponentActivity() {
                     active = session
                     outlets = emptyList()
                     pendingToken = ""
+                    pendingUserId = ""
                     password = ""
                 }
                 Column(Modifier.fillMaxSize().padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -78,18 +80,28 @@ class MainActivity : ComponentActivity() {
                                     require(server.startsWith("https://")) { "HTTPS server URL required" }
                                     sessions.setServerUrl(server)
                                     val body = JsonObject().apply {
-                                        addProperty("email", username); addProperty("password", password)
+                                        addProperty("emailOrId", username); addProperty("email", username)
+                                        addProperty("password", password)
                                         addProperty("device_id", sessions.deviceId)
                                     }
-                                    val reply = withContext(Dispatchers.IO) { postJson(server, "api/mobile-auth/login", body) }
-                                    if (reply.get("multi_business")?.asBoolean == true) {
-                                        pendingToken = reply.str("temp_token")
-                                        outlets = reply.getAsJsonArray("available_businesses")?.mapNotNull { element ->
+                                    val reply = withContext(Dispatchers.IO) { postJson(server, "api/auth/login", body) }
+                                    val isMultiBusiness = reply.bool("multiBusiness") || reply.bool("multi_business")
+                                    if (isMultiBusiness) {
+                                        pendingToken = reply.str("tempToken").ifBlank { reply.str("temp_token") }
+                                        pendingUserId = reply.str("userId").ifBlank {
+                                            reply.getAsJsonObject("session")?.str("userId") ?: ""
+                                        }
+                                        val options = reply.getAsJsonArray("availableOutlets")
+                                            ?: reply.getAsJsonArray("available_businesses")
+                                        outlets = options?.mapNotNull { element ->
                                             val o = element.asJsonObject
-                                            val id = o.str("business_id")
-                                            if (id.isBlank()) null else id to o.str("business_name")
+                                            val id = o.str("outletId").ifBlank { o.str("business_id") }
+                                            val name = o.str("outletName").ifBlank { o.str("business_name") }
+                                            if (id.isBlank()) null else id to name.ifBlank { "Outlet" }
                                         } ?: emptyList()
-                                        require(pendingToken.isNotBlank() && outlets.isNotEmpty()) { "Server did not provide selectable outlets" }
+                                        require((pendingToken.isNotBlank() || pendingUserId.isNotBlank()) && outlets.isNotEmpty()) {
+                                            "Server did not provide selectable outlets"
+                                        }
                                         password = ""
                                     } else installSession(reply)
                                 } catch(e: Exception) { message = e.message ?: "Login failed" }
@@ -102,11 +114,16 @@ class MainActivity : ComponentActivity() {
                                 scope.launch {
                                     try {
                                         val body = JsonObject().apply {
+                                            addProperty("tempToken", pendingToken)
                                             addProperty("temp_token", pendingToken)
+                                            addProperty("userId", pendingUserId)
+                                            addProperty("user_id", pendingUserId)
+                                            addProperty("outletId", id)
                                             addProperty("business_id", id)
+                                            addProperty("deviceId", sessions.deviceId)
                                             addProperty("device_id", sessions.deviceId)
                                         }
-                                        installSession(withContext(Dispatchers.IO) { postJson(server, "api/mobile-auth/select-business", body) })
+                                        installSession(withContext(Dispatchers.IO) { postJson(server, "api/auth/select-outlet", body) })
                                     } catch(e: Exception) { message = e.message ?: "Outlet selection failed" }
                                     finally { busy = false }
                                 }
@@ -146,6 +163,9 @@ class MainActivity : ComponentActivity() {
 private fun JsonObject.str(key: String): String =
     get(key)?.takeUnless { it.isJsonNull }?.asString ?: ""
 
+private fun JsonObject.bool(key: String): Boolean =
+    get(key)?.takeUnless { it.isJsonNull }?.runCatching { asBoolean }?.getOrDefault(false) ?: false
+
 private fun postJson(server: String, endpoint: String, body: JsonObject): JsonObject {
     val client = OkHttpClient()
     val request = Request.Builder().url(server.trimEnd('/') + "/" + endpoint)
@@ -154,6 +174,11 @@ private fun postJson(server: String, endpoint: String, body: JsonObject): JsonOb
     client.newCall(request).execute().use { response ->
         val text = response.body?.string() ?: ""
         val json = runCatching { JsonParser.parseString(text).asJsonObject }.getOrNull()
+        if (json == null) {
+            error(if (response.isSuccessful) {
+                "The SMAV server returned a web page instead of login data. Please deploy the latest server package."
+            } else "Server error: HTTP ${response.code}")
+        }
         if (!response.isSuccessful || json?.get("success")?.asBoolean != true)
             error(json?.str("message")?.ifBlank { "HTTP ${response.code}" } ?: "HTTP ${response.code}")
         return json
