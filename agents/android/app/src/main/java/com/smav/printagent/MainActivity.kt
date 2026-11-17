@@ -6,10 +6,28 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Login
+import androidx.compose.material.icons.filled.Print
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.shape.RoundedCornerShape
 import com.google.gson.JsonObject
 import com.smav.printagent.data.repository.OutletCatalogRepository
 import com.smav.printagent.data.repository.SessionManager
@@ -35,6 +53,8 @@ class MainActivity : ComponentActivity() {
                 var server by remember { mutableStateOf(sessions.getServerUrl()) }
                 var username by remember { mutableStateOf("") }
                 var password by remember { mutableStateOf("") }
+                var outletCode by remember { mutableStateOf("") }
+                var passwordVisible by remember { mutableStateOf(false) }
                 var message by remember { mutableStateOf("") }
                 var busy by remember { mutableStateOf(false) }
                 var pendingToken by remember { mutableStateOf("") }
@@ -67,12 +87,83 @@ class MainActivity : ComponentActivity() {
                     pendingUserId = ""
                     password = ""
                 }
-                Column(Modifier.fillMaxSize().padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("SMAV Print Agent", style = MaterialTheme.typography.headlineSmall)
-                    if (active == null) {
-                        OutlinedTextField(server, { server = it }, label = { Text("SMAV server HTTPS URL") }, modifier = Modifier.fillMaxWidth())
-                        OutlinedTextField(username, { username = it }, label = { Text("Email / User ID") }, modifier = Modifier.fillMaxWidth())
-                        OutlinedTextField(password, { password = it }, label = { Text("Password") }, modifier = Modifier.fillMaxWidth(), visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation())
+                if (active == null) {
+                    val pageBackground = Color(0xFF080D21)
+                    val cardBackground = Color(0xFF0E142A)
+                    val fieldBackground = Color(0xFF121832)
+                    val outline = Color(0xFF30385B)
+                    val secondaryText = Color(0xFF8FA6D7)
+                    Box(
+                        Modifier.fillMaxSize().background(pageBackground).padding(8.dp),
+                        contentAlignment = Alignment.TopCenter
+                    ) {
+                        Column(
+                            Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
+                                .background(cardBackground, RoundedCornerShape(28.dp)).padding(horizontal = 28.dp, vertical = 36.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Surface(
+                                modifier = Modifier.size(76.dp),
+                                shape = RoundedCornerShape(22.dp),
+                                color = Color(0xFF171E38),
+                                border = BorderStroke(1.dp, outline)
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(Icons.Default.Print, "Printer", tint = Color(0xFFFF2D82), modifier = Modifier.size(38.dp))
+                                }
+                            }
+                            Spacer(Modifier.height(24.dp))
+                            Text("SMAV Print Agent", color = Color.White, fontSize = 30.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(8.dp))
+                            Text("Secure Enterprise Authentication Gateway", color = Color(0xFF78A7E8), fontSize = 15.sp)
+                            Spacer(Modifier.height(40.dp))
+
+                            LoginLabel("Email Address or Username")
+                            OutlinedTextField(
+                                value = username,
+                                onValueChange = { username = it },
+                                placeholder = { Text("name@company.com or username", color = Color(0xFF64749F)) },
+                                singleLine = true,
+                                colors = loginFieldColors(fieldBackground, outline),
+                                shape = RoundedCornerShape(16.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Spacer(Modifier.height(22.dp))
+
+                            LoginLabel("Password / PIN")
+                            OutlinedTextField(
+                                value = password,
+                                onValueChange = { password = it },
+                                placeholder = { Text("Enter password", color = Color(0xFF64749F)) },
+                                singleLine = true,
+                                visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                                trailingIcon = {
+                                    IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                                        Icon(if (passwordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                            "Show or hide password", tint = secondaryText)
+                                    }
+                                },
+                                colors = loginFieldColors(fieldBackground, outline),
+                                shape = RoundedCornerShape(16.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Spacer(Modifier.height(22.dp))
+
+                            LoginLabel("Outlet Code (optional)")
+                            OutlinedTextField(
+                                value = outletCode,
+                                onValueChange = { outletCode = it },
+                                placeholder = { Text("e.g. mozz, glossylooks", color = Color(0xFF64749F)) },
+                                singleLine = true,
+                                colors = loginFieldColors(fieldBackground, outline),
+                                shape = RoundedCornerShape(16.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            Text("Used to identify an outlet's authentication provider when required.",
+                                color = Color(0xFF78A7E8), fontSize = 13.sp, modifier = Modifier.fillMaxWidth())
+                            Spacer(Modifier.height(32.dp))
+
                         Button(onClick = {
                             busy = true; message = ""
                             scope.launch {
@@ -82,6 +173,7 @@ class MainActivity : ComponentActivity() {
                                     val body = JsonObject().apply {
                                         addProperty("emailOrId", username); addProperty("email", username)
                                         addProperty("password", password)
+                                        if (outletCode.isNotBlank()) addProperty("outletCode", outletCode.trim())
                                         addProperty("device_id", sessions.deviceId)
                                     }
                                     val reply = withContext(Dispatchers.IO) { postJson(server, "api/auth/login", body) }
@@ -107,7 +199,25 @@ class MainActivity : ComponentActivity() {
                                 } catch(e: Exception) { message = e.message ?: "Login failed" }
                                 finally { busy = false }
                             }
-                        }, enabled = !busy && username.isNotBlank() && password.isNotBlank()) { Text("Sign in") }
+                        },
+                            enabled = !busy && username.isNotBlank() && password.isNotBlank(),
+                            modifier = Modifier.fillMaxWidth().height(64.dp),
+                            shape = RoundedCornerShape(16.dp),
+                            border = BorderStroke(3.dp, Brush.horizontalGradient(listOf(Color(0xFFFF1F81), Color(0xFFFFA000)))),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFF24293A), contentColor = Color.White,
+                                disabledContainerColor = Color(0xFF24293A), disabledContentColor = Color(0xFF71788D)
+                            )
+                        ) {
+                            Icon(Icons.Default.Login, null)
+                            Spacer(Modifier.width(12.dp))
+                            Text("Sign In", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                        }
+                        Spacer(Modifier.height(22.dp))
+                        TextButton(onClick = { message = "Please contact your outlet administrator to reset your credentials." }) {
+                            Text("Forgot Password? ", color = secondaryText)
+                            Text("Reset your credentials", color = Color(0xFFFF2D82), fontWeight = FontWeight.Bold)
+                        }
                         outlets.forEach { (id, name) ->
                             Button(enabled = !busy, onClick = {
                                 busy = true
@@ -127,10 +237,23 @@ class MainActivity : ComponentActivity() {
                                     } catch(e: Exception) { message = e.message ?: "Outlet selection failed" }
                                     finally { busy = false }
                                 }
-                            }) { Text("Open $name") }
+                            }, modifier = Modifier.fillMaxWidth()) { Text("Open $name") }
                         }
-                    } else {
+                        if (busy) {
+                            Spacer(Modifier.height(16.dp))
+                            LinearProgressIndicator(Modifier.fillMaxWidth(), color = Color(0xFFFF2D82))
+                        }
+                        if (message.isNotBlank()) {
+                            Spacer(Modifier.height(16.dp))
+                            Text(message, color = Color(0xFFFFA5B8), textAlign = TextAlign.Center,
+                                modifier = Modifier.fillMaxWidth())
+                        }
+                    }
+                }
+                } else {
+                    Column(Modifier.fillMaxSize().padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         val current = active!!
+                        Text("SMAV Print Agent", style = MaterialTheme.typography.headlineSmall)
                         Text("${current.businessName} — ${current.businessType.displayName}")
                         Text("Catalog is read-only. Billing is not yet connected.")
                         Button(enabled = !busy, onClick = {
@@ -151,9 +274,9 @@ class MainActivity : ComponentActivity() {
                                 supportingContent = { Text(row.category) },
                                 trailingContent = { Text("₹${row.price}") })
                         } }
+                        if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                        if (message.isNotBlank()) Text(message)
                     }
-                    if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-                    if (message.isNotBlank()) Text(message)
                 }
             }
         }
@@ -165,6 +288,23 @@ private fun JsonObject.str(key: String): String =
 
 private fun JsonObject.bool(key: String): Boolean =
     get(key)?.takeUnless { it.isJsonNull }?.runCatching { asBoolean }?.getOrDefault(false) ?: false
+
+@Composable
+private fun LoginLabel(text: String) {
+    Text(text, color = Color(0xFFDCE7FF), fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp))
+}
+
+@Composable
+private fun loginFieldColors(background: Color, outline: Color) = OutlinedTextFieldDefaults.colors(
+    focusedTextColor = Color.White,
+    unfocusedTextColor = Color.White,
+    focusedContainerColor = background,
+    unfocusedContainerColor = background,
+    focusedBorderColor = Color(0xFF50618F),
+    unfocusedBorderColor = outline,
+    cursorColor = Color(0xFFFF2D82)
+)
 
 private fun postJson(server: String, endpoint: String, body: JsonObject): JsonObject {
     val client = OkHttpClient()
@@ -179,8 +319,12 @@ private fun postJson(server: String, endpoint: String, body: JsonObject): JsonOb
                 "The SMAV server returned a web page instead of login data. Please deploy the latest server package."
             } else "Server error: HTTP ${response.code}")
         }
-        if (!response.isSuccessful || json?.get("success")?.asBoolean != true)
-            error(json?.str("message")?.ifBlank { "HTTP ${response.code}" } ?: "HTTP ${response.code}")
+        if (!response.isSuccessful || json.get("success")?.asBoolean != true) {
+            val serverMessage = json.str("message").ifBlank { json.str("error") }
+            error(serverMessage.ifBlank {
+                if (response.isSuccessful) "Login was not accepted by the SMAV server." else "Server error: HTTP ${response.code}"
+            })
+        }
         return json
     }
 }
