@@ -872,13 +872,17 @@ fun SuperadminDiagnosticsScreen(
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
                             onClick = {
-                                if (selectedOutletId.isBlank()) return@Button
-                                busy = true; errorMsg = null
-                                scope.launch {
-                                    adminRepo.runSourceCatalogCheck(selectedOutletId)
-                                        .onSuccess { results = listOf(it) + results }
-                                        .onFailure { errorMsg = SmavApiClient.friendlyThrowable(it) }
-                                    busy = false
+                                if (selectedOutletId.isBlank()) {
+                                    errorMsg = "Please select an outlet."
+                                } else {
+                                    busy = true
+                                    errorMsg = null
+                                    scope.launch {
+                                        adminRepo.runSourceCatalogCheck(selectedOutletId)
+                                            .onSuccess { results = listOf(it) + results }
+                                            .onFailure { errorMsg = SmavApiClient.friendlyThrowable(it) }
+                                        busy = false
+                                    }
                                 }
                             },
                             enabled = !busy && selectedOutletId.isNotBlank(),
@@ -887,13 +891,17 @@ fun SuperadminDiagnosticsScreen(
 
                         OutlinedButton(
                             onClick = {
-                                if (selectedOutletId.isBlank()) return@Button
-                                busy = true; errorMsg = null
-                                scope.launch {
-                                    adminRepo.runCatalogPreviewCheck(selectedOutletId)
-                                        .onSuccess { results = listOf(it) + results }
-                                        .onFailure { errorMsg = SmavApiClient.friendlyThrowable(it) }
-                                    busy = false
+                                if (selectedOutletId.isBlank()) {
+                                    errorMsg = "Please select an outlet."
+                                } else {
+                                    busy = true
+                                    errorMsg = null
+                                    scope.launch {
+                                        adminRepo.runCatalogPreviewCheck(selectedOutletId)
+                                            .onSuccess { results = listOf(it) + results }
+                                            .onFailure { errorMsg = SmavApiClient.friendlyThrowable(it) }
+                                        busy = false
+                                    }
                                 }
                             },
                             enabled = !busy && selectedOutletId.isNotBlank(),
@@ -902,13 +910,17 @@ fun SuperadminDiagnosticsScreen(
 
                         OutlinedButton(
                             onClick = {
-                                if (selectedOutletId.isBlank()) return@Button
-                                busy = true; errorMsg = null
-                                scope.launch {
-                                    adminRepo.runCatalogChangesCheck(selectedOutletId)
-                                        .onSuccess { results = listOf(it) + results }
-                                        .onFailure { errorMsg = SmavApiClient.friendlyThrowable(it) }
-                                    busy = false
+                                if (selectedOutletId.isBlank()) {
+                                    errorMsg = "Please select an outlet."
+                                } else {
+                                    busy = true
+                                    errorMsg = null
+                                    scope.launch {
+                                        adminRepo.runCatalogChangesCheck(selectedOutletId)
+                                            .onSuccess { results = listOf(it) + results }
+                                            .onFailure { errorMsg = SmavApiClient.friendlyThrowable(it) }
+                                        busy = false
+                                    }
                                 }
                             },
                             enabled = !busy && selectedOutletId.isNotBlank(),
@@ -917,13 +929,17 @@ fun SuperadminDiagnosticsScreen(
 
                         Button(
                             onClick = {
-                                if (selectedOutletId.isBlank()) return@Button
-                                busy = true; errorMsg = null
-                                scope.launch {
-                                    adminRepo.runCatalogImportPreflight(selectedOutletId)
-                                        .onSuccess { results = listOf(it) + results }
-                                        .onFailure { errorMsg = SmavApiClient.friendlyThrowable(it) }
-                                    busy = false
+                                if (selectedOutletId.isBlank()) {
+                                    errorMsg = "Please select an outlet."
+                                } else {
+                                    busy = true
+                                    errorMsg = null
+                                    scope.launch {
+                                        adminRepo.runCatalogImportPreflight(selectedOutletId)
+                                            .onSuccess { results = listOf(it) + results }
+                                            .onFailure { errorMsg = SmavApiClient.friendlyThrowable(it) }
+                                        busy = false
+                                    }
                                 }
                             },
                             enabled = !busy && selectedOutletId.isNotBlank(),
