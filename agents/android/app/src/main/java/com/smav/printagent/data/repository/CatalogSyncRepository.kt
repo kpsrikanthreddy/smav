@@ -137,9 +137,31 @@ class CatalogSyncRepository(
                         )
                     }
 
-                    val stylists = parseStylists(body.getAsJsonArray("stylists"))
+                    var stylists = parseStylists(body.getAsJsonArray("stylists"))
                     val appointments = parseAppointments(body.getAsJsonArray("appointments"))
-                    val stylistWarning = body.optString("stylistError").takeIf { it.isNotBlank() }
+                    var stylistWarning = body.optString("stylistError").takeIf { it.isNotBlank() }
+
+                    if (stylists.isEmpty()) {
+                        val liveStaffRes = runCatching { api.getSalonStylistsRaw(bearer, outletId) }.getOrNull()
+                        if (liveStaffRes != null) {
+                            val staffBody = liveStaffRes.body()
+                            if (liveStaffRes.isSuccessful && staffBody != null && staffBody.optBool("success", true)) {
+                                stylists = parseStylists(staffBody.getAsJsonArray("stylists"))
+                                stylistWarning = if (stylists.isEmpty()) {
+                                    staffBody.optString("message").ifBlank {
+                                        "No active stylists returned for this outlet from the Glossy Looks staff API."
+                                    }
+                                } else {
+                                    null
+                                }
+                            } else {
+                                stylistWarning = SmavApiClient.parseErrorMessage(
+                                    liveStaffRes,
+                                    stylistWarning ?: "Could not load active stylists."
+                                )
+                            }
+                        }
+                    }
 
                     Result.success(
                         PosInitBundle(
@@ -474,15 +496,21 @@ class CatalogSyncRepository(
         if (array == null) return emptyList()
         return array.mapNotNull { el ->
             val obj = el.asJsonObjectOrNull() ?: return@mapNotNull null
-            val id = obj.optString("id", "userId")
-            val name = obj.optString("name", "fullName")
+            val id = obj.optString("id", "staffId", "staff_id", "userId", "user_id")
+            val name = obj.optString("name", "fullName", "full_name", "displayName")
             if (id.isBlank() || name.isBlank()) return@mapNotNull null
+            val available = if (obj.has("available")) {
+                obj.optBool("available", true)
+            } else {
+                obj.optBool("isAvailable", true)
+            }
+            if (!available) return@mapNotNull null
             Stylist(
                 id = id,
                 name = name,
-                specialty = obj.optString("specialty"),
-                branchId = obj.optString("branchId"),
-                isAvailable = obj.optBool("isAvailable", true)
+                specialty = obj.optString("role", "specialty", "designation", "jobTitle", "job_title"),
+                branchId = obj.optString("outletId", "branchId", "branch_id", "outlet_id", "outletCode", "outlet_code"),
+                isAvailable = true
             )
         }
     }

@@ -1,34 +1,47 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
+  AlertTriangle,
+  Calendar,
+  CheckCircle2,
+  ChefHat,
+  Package,
+  Printer,
+  Receipt,
+  RefreshCw,
   Scissors,
-  Utensils,
+  Search,
   ShoppingBag,
+  Trash2,
+  Utensils,
   Wifi,
   WifiOff,
-  Printer,
-  Plus,
-  Trash2,
-  Calendar,
-  AlertTriangle,
-  Receipt,
-  FileCode2,
-  CheckCircle2,
-  Search,
-  Sparkles,
-  ChefHat
 } from 'lucide-react';
 import {
-  UserSession,
-  SalonService,
-  Stylist,
   Appointment,
+  RestaurantCartItem,
   RestaurantMenuItem,
   RestaurantTable,
+  RetailCartItem,
   RetailProduct,
   SalonCartItem,
-  RestaurantCartItem,
-  RetailCartItem
+  SalonService,
+  Stylist,
+  UserSession,
 } from '../types';
+import {
+  BASE_INPUT_CLASS,
+  Button,
+  Card,
+  CartSummary,
+  EmptyState,
+  ErrorState,
+  FormField,
+  ItemCard,
+  LoadingState,
+  StatusBadge,
+  StylistSelector,
+} from './ui';
 
 interface StaffPOSProps {
   session: UserSession;
@@ -43,6 +56,8 @@ interface StaffPOSProps {
   onPerformDeltaSync: () => void;
 }
 
+const normalizeGroup = (value?: string | null) => (value || '').trim() || 'General';
+
 export const StaffPOS: React.FC<StaffPOSProps> = ({
   session,
   isOnline,
@@ -51,24 +66,37 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
   onTogglePrinter,
   paperWidthMm,
   onChangePaperWidth,
-  serverRevision,
   localRevision,
-  onPerformDeltaSync
 }) => {
   const category = session.activeOutlet.category;
   const [activePosView, setActivePosView] = useState<'billing' | 'catalog' | 'secondary'>('billing');
   const [catalogError, setCatalogError] = useState<string | null>(null);
+  const [isCatalogLoading, setIsCatalogLoading] = useState<boolean>(true);
 
   // Salon Data
   const [salonServices, setSalonServices] = useState<SalonService[]>([]);
   const [stylists, setStylists] = useState<Stylist[]>([]);
+  const [isLoadingStylists, setIsLoadingStylists] = useState(false);
   const [stylistError, setStylistError] = useState<string | null>(null);
+  const [stylistUpstreamStatus, setStylistUpstreamStatus] = useState<number | null>(null);
   const [billSaveError, setBillSaveError] = useState<string | null>(null);
+  const [billSuccessMessage, setBillSuccessMessage] = useState<string | null>(null);
+  const [missingStylistIdx, setMissingStylistIdx] = useState<number | null>(null);
+  const [isProcessingBill, setIsProcessingBill] = useState(false);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [salonCart, setSalonCart] = useState<SalonCartItem[]>([]);
   const [customerName, setCustomerName] = useState('');
   const [customerPhone, setCustomerPhone] = useState('');
   const [paymentMode, setPaymentMode] = useState('upi');
+
+  const stylistSelectRefs = useRef<Record<number, HTMLSelectElement | null>>({});
+  const isSubmittingBillRef = useRef(false);
+  const prevOutletIdRef = useRef(session.activeOutlet.id);
+  const pendingCheckoutRef = useRef<{
+    fingerprint: string;
+    billNumber: string;
+    idempotencyKey: string;
+  } | null>(null);
 
   // Restaurant Data
   const [restaurantMenu, setRestaurantMenu] = useState<RestaurantMenuItem[]>([]);
@@ -86,159 +114,540 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
   const [selectedCategoryFilter, setSelectedCategoryFilter] = useState('All');
   const [selectedSubcategoryFilter, setSelectedSubcategoryFilter] = useState('All');
 
-  // Derive navigation from the current outlet's live catalog, never from sample labels.
-  const catalogItems = category === 'salon' ? salonServices : category === 'restaurant' ? restaurantMenu : retailProducts;
-  const normalized = (value?: string | null) => (value || '').trim() || 'General';
-  const catalogCategories = Array.from(new Set(catalogItems.map(item => normalized(item.category)))).sort((a, b) => a.localeCompare(b));
-  const categoryItems = catalogItems.filter(item => selectedCategoryFilter === 'All' || normalized(item.category) === selectedCategoryFilter);
-  const catalogSubcategories = Array.from(new Set(categoryItems.map(item => normalized(item.subcategory)))).sort((a, b) => a.localeCompare(b));
-  const visibleCatalogItems = categoryItems.filter(item =>
-    (selectedSubcategoryFilter === 'All' || normalized(item.subcategory) === selectedSubcategoryFilter) &&
-    (item.name.toLowerCase().includes(searchQuery.trim().toLowerCase()) ||
-      normalized(item.category).toLowerCase().includes(searchQuery.trim().toLowerCase()) ||
-      normalized(item.subcategory).toLowerCase().includes(searchQuery.trim().toLowerCase()))
-  );
-
-  useEffect(() => {
-    setSelectedCategoryFilter('All');
-    setSelectedSubcategoryFilter('All');
-    setSearchQuery('');
-  }, [session.activeOutlet.id]);
-
-  useEffect(() => {
-    if (selectedCategoryFilter !== 'All' && !catalogCategories.includes(selectedCategoryFilter)) {
-      setSelectedCategoryFilter('All');
-    }
-  }, [selectedCategoryFilter, catalogCategories.join('|')]);
-
-  useEffect(() => {
-    if (selectedSubcategoryFilter !== 'All' && !catalogSubcategories.includes(selectedSubcategoryFilter)) {
-      setSelectedSubcategoryFilter('All');
-    }
-  }, [selectedSubcategoryFilter, catalogSubcategories.join('|')]);
-
   // Printing & Previews
   const [activeReceiptPreview, setActiveReceiptPreview] = useState<any | null>(null);
   const [activeKotPreview, setActiveKotPreview] = useState<any | null>(null);
   const [isPrinterBusy, setIsPrinterBusy] = useState(false);
   const [offlineQueue, setOfflineQueue] = useState<any[]>([]);
 
-  // Initialize POS Data for assigned outlet
-  useEffect(() => {
-    const loadPosData = async () => {
-      try {
-        const res = await fetch('/api/pos/init', {
-          headers: { Authorization: `Bearer ${session.token}` }
-        });
-        const data = await res.json();
-        if (!res.ok || !data.success) {
-          setCatalogError(data.message || 'Catalog unavailable. Check outlet registration and upstream API.');
-          return;
-        }
-        setCatalogError(null);
-        if (data.success) {
-          if (data.category === 'salon') {
-            setSalonServices(data.services || []);
-            setStylists((data.stylists || []).filter((st: Stylist) => st.isAvailable !== false));
-            setStylistError(data.stylistError || ((data.stylists || []).length ? null : 'No active stylists returned from the Glossy Looks staff API.'));
-            setAppointments(data.appointments || []);
-            // Never prepopulate a bill or silently assign the first stylist.
-          } else if (data.category === 'restaurant') {
-            setRestaurantMenu(data.menu || []);
-            setRestaurantTables(data.tables || []);
-          } else {
-            setRetailProducts(data.products || []);
-          }
-        }
-      } catch (e) {
-        console.error(e);
-        setCatalogError('Could not load POS catalog from SMAV backend.');
-      }
-    };
+  // Catalog derived filters (memoized)
+  const catalogItems = useMemo(
+    () =>
+      category === 'salon'
+        ? salonServices
+        : category === 'restaurant'
+          ? restaurantMenu
+          : retailProducts,
+    [category, salonServices, restaurantMenu, retailProducts]
+  );
 
-    loadPosData();
+  const catalogCategories = useMemo(
+    () =>
+      Array.from(new Set(catalogItems.map((item) => normalizeGroup(item.category)))).sort((a, b) =>
+        a.localeCompare(b)
+      ),
+    [catalogItems]
+  );
+
+  const categoryItems = useMemo(
+    () =>
+      catalogItems.filter(
+        (item) =>
+          selectedCategoryFilter === 'All' || normalizeGroup(item.category) === selectedCategoryFilter
+      ),
+    [catalogItems, selectedCategoryFilter]
+  );
+
+  const catalogSubcategories = useMemo(
+    () =>
+      Array.from(new Set(categoryItems.map((item) => normalizeGroup(item.subcategory)))).sort(
+        (a, b) => a.localeCompare(b)
+      ),
+    [categoryItems]
+  );
+
+  const visibleCatalogItems = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    return categoryItems.filter(
+      (item) =>
+        (selectedSubcategoryFilter === 'All' ||
+          normalizeGroup(item.subcategory) === selectedSubcategoryFilter) &&
+        (!q ||
+          item.name.toLowerCase().includes(q) ||
+          normalizeGroup(item.category).toLowerCase().includes(q) ||
+          normalizeGroup(item.subcategory).toLowerCase().includes(q))
+    );
+  }, [categoryItems, selectedSubcategoryFilter, searchQuery]);
+
+  useEffect(() => {
+    setSelectedCategoryFilter('All');
+    setSelectedSubcategoryFilter('All');
+    setSearchQuery('');
+    if (prevOutletIdRef.current !== session.activeOutlet.id) {
+      prevOutletIdRef.current = session.activeOutlet.id;
+      setSalonCart([]);
+      setRestaurantCart([]);
+      setRetailCart([]);
+      setActiveReceiptPreview(null);
+      setActiveKotPreview(null);
+      setBillSaveError(null);
+      setBillSuccessMessage(null);
+      setMissingStylistIdx(null);
+      pendingCheckoutRef.current = null;
+    }
   }, [session.activeOutlet.id]);
 
-  // Salon Financial Calculations
+  useEffect(() => {
+    if (selectedCategoryFilter !== 'All' && !catalogCategories.includes(selectedCategoryFilter)) {
+      setSelectedCategoryFilter('All');
+    }
+  }, [selectedCategoryFilter, catalogCategories]);
+
+  useEffect(() => {
+    if (
+      selectedSubcategoryFilter !== 'All' &&
+      !catalogSubcategories.includes(selectedSubcategoryFilter)
+    ) {
+      setSelectedSubcategoryFilter('All');
+    }
+  }, [selectedSubcategoryFilter, catalogSubcategories]);
+
+  const loadStylists = useCallback(async () => {
+    if (category !== 'salon') {
+      setStylists([]);
+      setStylistError(null);
+      setStylistUpstreamStatus(null);
+      setIsLoadingStylists(false);
+      return;
+    }
+
+    setIsLoadingStylists(true);
+    setStylistError(null);
+    setStylistUpstreamStatus(null);
+    try {
+      const res = await fetch(
+        `/api/salon/stylists?outletId=${encodeURIComponent(session.activeOutlet.id)}`,
+        { headers: { Authorization: `Bearer ${session.token}` } }
+      );
+      let data: any = null;
+      try {
+        data = await res.json();
+      } catch {
+        data = null;
+      }
+
+      if (!res.ok || !data?.success) {
+        const upstreamStatus =
+          typeof data?.upstreamStatus === 'number' ? data.upstreamStatus : res.status;
+        setStylistUpstreamStatus(upstreamStatus);
+        setStylists([]);
+        setStylistError(
+          data?.message ||
+            `Could not load active stylists from the Glossy Looks staff API (HTTP ${upstreamStatus}).`
+        );
+        return;
+      }
+
+      const activeList: Stylist[] = (Array.isArray(data.stylists) ? data.stylists : []).filter(
+        (st: Stylist) =>
+          st && st.id && st.name && st.available !== false && st.isAvailable !== false
+      );
+      setStylists(activeList);
+      if (activeList.length === 0) {
+        setStylistError(
+          data?.message || 'No active stylists returned for this outlet from the Glossy Looks staff API.'
+        );
+      } else {
+        setStylistError(null);
+      }
+    } catch {
+      setStylists([]);
+      setStylistUpstreamStatus(null);
+      setStylistError('Could not reach SMAV server to load active stylists. Please retry.');
+    } finally {
+      setIsLoadingStylists(false);
+    }
+  }, [category, session.activeOutlet.id, session.token]);
+
+  useEffect(() => {
+    if (category !== 'salon' || isLoadingStylists || stylistError) return;
+    setSalonCart((prev) => {
+      let changed = false;
+      const next = prev.map((line) => {
+        if (!line.stylist?.id) return line;
+        const matched = stylists.find((st) => st.id === line.stylist?.id);
+        if (!matched) {
+          changed = true;
+          return { ...line, stylist: null };
+        }
+        if (matched.name !== line.stylist.name || matched.role !== line.stylist.role) {
+          changed = true;
+          return { ...line, stylist: matched };
+        }
+        return line;
+      });
+      return changed ? next : prev;
+    });
+  }, [category, isLoadingStylists, stylistError, stylists]);
+
+  const loadPosData = useCallback(async () => {
+    setIsCatalogLoading(true);
+    try {
+      const res = await fetch('/api/pos/init', {
+        headers: { Authorization: `Bearer ${session.token}` },
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setCatalogError(
+          data.message || 'Catalog unavailable. Check outlet registration and upstream API.'
+        );
+        return;
+      }
+      setCatalogError(null);
+      if (data.category === 'salon') {
+        setSalonServices(data.services || []);
+        setAppointments(data.appointments || []);
+      } else if (data.category === 'restaurant') {
+        setRestaurantMenu(data.menu || []);
+        setRestaurantTables(data.tables || []);
+      } else {
+        setRetailProducts(data.products || []);
+      }
+    } catch (e) {
+      console.error(e);
+      setCatalogError('Could not load POS catalog from SMAV backend.');
+    } finally {
+      setIsCatalogLoading(false);
+    }
+  }, [session.token]);
+
+  useEffect(() => {
+    void loadPosData();
+    void loadStylists();
+  }, [session.activeOutlet.id, loadPosData, loadStylists]);
+
+  // Cart Quantity Helpers
+  const salonQtyById = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const item of salonCart) {
+      map[item.service.id] = (map[item.service.id] || 0) + item.quantity;
+    }
+    return map;
+  }, [salonCart]);
+
+  const restaurantQtyById = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const item of restaurantCart) {
+      map[item.item.id] = (map[item.item.id] || 0) + item.quantity;
+    }
+    return map;
+  }, [restaurantCart]);
+
+  const retailQtyById = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const item of retailCart) {
+      map[item.product.id] = (map[item.product.id] || 0) + item.quantity;
+    }
+    return map;
+  }, [retailCart]);
+
+  const handleCatalogSalonIncrement = useCallback((srv: SalonService) => {
+    setSalonCart((prev) => {
+      const existingIdx = prev.findIndex((line) => line.service.id === srv.id);
+      if (existingIdx >= 0) {
+        return prev.map((line, i) =>
+          i === existingIdx ? { ...line, quantity: line.quantity + 1 } : line
+        );
+      }
+      return [
+        ...prev,
+        {
+          service: srv,
+          stylist: null,
+          quantity: 1,
+          discountPercent: 0,
+          addedPrice: srv.price,
+          addedRevision: srv.revision,
+        },
+      ];
+    });
+    setBillSuccessMessage(null);
+    setBillSaveError(null);
+  }, []);
+
+  const handleCatalogSalonDecrement = useCallback((srvId: string) => {
+    setSalonCart((prev) => {
+      let idx = -1;
+      for (let i = prev.length - 1; i >= 0; i -= 1) {
+        if (prev[i].service.id === srvId) {
+          idx = i;
+          break;
+        }
+      }
+      if (idx < 0) return prev;
+      if (prev[idx].quantity <= 1) {
+        return prev.filter((_, i) => i !== idx);
+      }
+      return prev.map((line, i) => (i === idx ? { ...line, quantity: line.quantity - 1 } : line));
+    });
+    setMissingStylistIdx(null);
+  }, []);
+
+  const handleCatalogRestaurantIncrement = useCallback((menuItem: RestaurantMenuItem) => {
+    setRestaurantCart((prev) => {
+      const existingIdx = prev.findIndex(
+        (line) => line.item.id === menuItem.id && line.variantName === 'Regular'
+      );
+      if (existingIdx >= 0) {
+        return prev.map((line, i) =>
+          i === existingIdx ? { ...line, quantity: line.quantity + 1 } : line
+        );
+      }
+      return [
+        ...prev,
+        {
+          item: menuItem,
+          variantName: 'Regular',
+          unitPrice: menuItem.basePrice,
+          quantity: 1,
+          notes: '',
+          addedPrice: menuItem.basePrice,
+          addedRevision: menuItem.revision,
+        },
+      ];
+    });
+  }, []);
+
+  const handleCatalogRestaurantDecrement = useCallback((itemId: string) => {
+    setRestaurantCart((prev) => {
+      let idx = -1;
+      for (let i = prev.length - 1; i >= 0; i -= 1) {
+        if (prev[i].item.id === itemId) {
+          idx = i;
+          break;
+        }
+      }
+      if (idx < 0) return prev;
+      if (prev[idx].quantity <= 1) {
+        return prev.filter((_, i) => i !== idx);
+      }
+      return prev.map((line, i) => (i === idx ? { ...line, quantity: line.quantity - 1 } : line));
+    });
+  }, []);
+
+  const handleCatalogRetailIncrement = useCallback((product: RetailProduct) => {
+    setRetailCart((prev) => {
+      const existingIdx = prev.findIndex((line) => line.product.id === product.id);
+      if (existingIdx >= 0) {
+        return prev.map((line, i) =>
+          i === existingIdx ? { ...line, quantity: line.quantity + 1 } : line
+        );
+      }
+      return [
+        ...prev,
+        {
+          product,
+          quantity: 1,
+          discountPercent: 0,
+          addedPrice: product.price,
+          addedRevision: product.revision,
+        },
+      ];
+    });
+  }, []);
+
+  const handleCatalogRetailDecrement = useCallback((productId: string) => {
+    setRetailCart((prev) => {
+      let idx = -1;
+      for (let i = prev.length - 1; i >= 0; i -= 1) {
+        if (prev[i].product.id === productId) {
+          idx = i;
+          break;
+        }
+      }
+      if (idx < 0) return prev;
+      if (prev[idx].quantity <= 1) {
+        return prev.filter((_, i) => i !== idx);
+      }
+      return prev.map((line, i) => (i === idx ? { ...line, quantity: line.quantity - 1 } : line));
+    });
+  }, []);
+
+  // Financial Calculations (preserved identically)
   const salonSubtotal = salonCart.reduce((sum, i) => sum + i.addedPrice * i.quantity, 0);
-  const salonDiscount = salonCart.reduce((sum, i) => sum + (i.addedPrice * i.quantity * (i.discountPercent / 100)), 0);
+  const salonDiscount = salonCart.reduce(
+    (sum, i) => sum + i.addedPrice * i.quantity * (i.discountPercent / 100),
+    0
+  );
   const salonTaxable = salonSubtotal - salonDiscount;
   const salonTax = Math.round(salonTaxable * 0.18);
   const salonGrandTotal = salonTaxable + salonTax;
 
-  // Restaurant Financial Calculations
   const restSubtotal = restaurantCart.reduce((sum, i) => sum + i.unitPrice * i.quantity, 0);
-  const restTax = Math.round(restSubtotal * 0.05); // 5% GST on Restaurant
+  const restTax = Math.round(restSubtotal * 0.05);
   const restGrandTotal = restSubtotal + restTax;
 
-  // Retail Financial Calculations
   const retailSubtotal = retailCart.reduce((sum, i) => sum + i.addedPrice * i.quantity, 0);
-  const retailDiscount = retailCart.reduce((sum, i) => sum + (i.addedPrice * i.quantity * (i.discountPercent / 100)), 0);
+  const retailDiscount = retailCart.reduce(
+    (sum, i) => sum + i.addedPrice * i.quantity * (i.discountPercent / 100),
+    0
+  );
   const retailTaxable = retailSubtotal - retailDiscount;
-  const retailTax = Math.round(retailTaxable * 0.12); // 12% GST average
+  const retailTax = Math.round(retailTaxable * 0.12);
   const retailGrandTotal = retailTaxable + retailTax;
 
-  // Print Salon Bill
-  const handlePrintSalonBill = async () => {
-    if (salonCart.length === 0) return;
-    if (salonCart.some(item => !item.stylist?.id)) {
-      setBillSaveError('Select a stylist for every service before printing.');
-      return;
-    }
-    setBillSaveError(null);
-    const billNumber = `TGL-${session.activeOutlet.code.toUpperCase()}-${Date.now().toString().slice(-6)}`;
-    const bill = {
-      billNumber,
-      outletName: session.activeOutlet.name,
-      receiptHeader: session.activeOutlet.receiptHeader,
-      receiptFooter: session.activeOutlet.receiptFooter,
-      customerName,
-      customerPhone,
-      paymentMode,
-      items: salonCart.map(c => ({
-        name: c.service.name,
-        price: c.addedPrice,
-        quantity: c.quantity,
-        serviceId: c.service.id,
-        stylistId: c.stylist!.id,
-        stylist: c.stylist!.name
-      })),
-      subtotal: salonSubtotal,
-      discount: salonDiscount,
-      tax: salonTax,
-      grandTotal: salonGrandTotal,
-      paperWidth: paperWidthMm,
-      timestamp: new Date().toLocaleString()
-    };
-
-    if (isPrinterConnected) {
-      setIsPrinterBusy(true);
-      setTimeout(() => setIsPrinterBusy(false), 1200);
-    }
-
-    setActiveReceiptPreview(bill);
-
-    // Persist selected stylist IDs with bill line items before claiming sync success.
-    const payload = { bills: [{ bill: { ...bill, id: billNumber, outletId: session.activeOutlet.id }, items: bill.items, idempotency_key: `IDEM_${billNumber}` }] };
-    if (isOnline) {
-      try {
-        const response = await fetch('/api/mobile/sync/bills', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` },
-          body: JSON.stringify(payload)
-        });
-        const result = await response.json();
-        if (!response.ok || !result.success) throw new Error(result.message || 'Bill could not be saved');
-      } catch (error) {
-        setBillSaveError(`Bill not saved to database: ${error instanceof Error ? error.message : 'Unknown error'}. Do not reprint as a new sale.`);
+  const openBrowserPrintDialog = () => {
+    try {
+      if (typeof window !== 'undefined' && typeof window.print === 'function') {
+        setIsPrinterBusy(true);
+        window.setTimeout(() => {
+          try {
+            window.print();
+          } catch (printErr) {
+            setBillSaveError(
+              `Bill saved, but browser print dialog could not be opened: ${
+                printErr instanceof Error ? printErr.message : 'Print unavailable'
+              }. Use "Print Copy" in the receipt panel without recreating the bill.`
+            );
+          } finally {
+            setIsPrinterBusy(false);
+          }
+        }, 60);
       }
-    } else {
-      setOfflineQueue(prev => [...prev, payload]);
-      setBillSaveError('Offline: bill is queued in this session only. Durable offline storage is not yet implemented.');
+    } catch {
+      setIsPrinterBusy(false);
     }
   };
 
-  // Print Restaurant Order
+  // Print Salon Bill (validation, idempotency, persistence preserved identically)
+  const handlePrintSalonBill = async () => {
+    if (isSubmittingBillRef.current || isProcessingBill) return;
+    if (salonCart.length === 0) return;
+
+    if (isLoadingStylists) {
+      setBillSaveError('Stylist data is still loading. Please wait.');
+      return;
+    }
+    if (stylistError || stylists.length === 0) {
+      setBillSaveError(
+        stylistError || 'Stylists are unavailable. Retry loading stylists before printing.'
+      );
+      return;
+    }
+
+    const firstMissingIdx = salonCart.findIndex((item) => !item.stylist?.id);
+    if (firstMissingIdx >= 0) {
+      setMissingStylistIdx(firstMissingIdx);
+      setBillSuccessMessage(null);
+      setBillSaveError('Select a stylist for every salon service before printing.');
+      const selectEl = stylistSelectRefs.current[firstMissingIdx];
+      if (selectEl) {
+        selectEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        selectEl.focus();
+      }
+      return;
+    }
+
+    isSubmittingBillRef.current = true;
+    setIsProcessingBill(true);
+    setMissingStylistIdx(null);
+    setBillSaveError(null);
+    setBillSuccessMessage(null);
+
+    try {
+      const fingerprint = JSON.stringify({
+        outletId: session.activeOutlet.id,
+        customerName: customerName.trim(),
+        customerPhone: customerPhone.trim(),
+        paymentMode,
+        items: salonCart.map((c) => ({
+          id: c.service.id,
+          q: c.quantity,
+          p: c.addedPrice,
+          d: c.discountPercent,
+          s: c.stylist!.id,
+        })),
+      });
+
+      if (!pendingCheckoutRef.current || pendingCheckoutRef.current.fingerprint !== fingerprint) {
+        const billNumber = `TGL-${session.activeOutlet.code.toUpperCase()}-${Date.now().toString().slice(-6)}`;
+        pendingCheckoutRef.current = {
+          fingerprint,
+          billNumber,
+          idempotencyKey: `IDEM_${billNumber}`,
+        };
+      }
+
+      const { billNumber, idempotencyKey } = pendingCheckoutRef.current;
+      const bill = {
+        billNumber,
+        outletName: session.activeOutlet.name,
+        outletAddress: session.activeOutlet.address,
+        outletPhone: session.activeOutlet.phone,
+        outletGstin: session.activeOutlet.gstin,
+        receiptHeader: session.activeOutlet.receiptHeader,
+        receiptFooter: session.activeOutlet.receiptFooter,
+        customerName: customerName.trim() || 'Walk-in Customer',
+        customerPhone: customerPhone.trim(),
+        paymentMode,
+        items: salonCart.map((c) => ({
+          name: c.service.name,
+          price: c.addedPrice,
+          quantity: c.quantity,
+          discountPercent: c.discountPercent,
+          serviceId: c.service.id,
+          stylistId: c.stylist!.id,
+          stylist: c.stylist!.name,
+        })),
+        subtotal: salonSubtotal,
+        discount: salonDiscount,
+        tax: salonTax,
+        grandTotal: salonGrandTotal,
+        paperWidth: paperWidthMm,
+        timestamp: new Date().toLocaleString(),
+      };
+
+      const payload = {
+        bills: [
+          {
+            bill: { ...bill, id: billNumber, outletId: session.activeOutlet.id },
+            items: bill.items,
+            idempotency_key: idempotencyKey,
+          },
+        ],
+      };
+
+      if (isOnline) {
+        const response = await fetch('/api/mobile/sync/bills', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${session.token}`,
+          },
+          body: JSON.stringify(payload),
+        });
+        const result = await response.json().catch(() => null);
+        if (!response.ok || !result?.success) {
+          throw new Error(result?.message || `Bill could not be saved (HTTP ${response.status})`);
+        }
+      } else {
+        setOfflineQueue((prev) => [...prev, payload]);
+      }
+
+      pendingCheckoutRef.current = null;
+      setActiveReceiptPreview(bill);
+      setSalonCart([]);
+      setCustomerName('');
+      setCustomerPhone('');
+      setBillSuccessMessage(
+        isOnline
+          ? `Bill ${bill.billNumber} saved. Opening ${paperWidthMm}mm browser print dialog.`
+          : `Bill ${bill.billNumber} queued locally offline. Opening ${paperWidthMm}mm browser print dialog.`
+      );
+      openBrowserPrintDialog();
+    } catch (error) {
+      setBillSaveError(
+        `Bill not saved to database: ${
+          error instanceof Error ? error.message : 'Unknown error'
+        }. Retry without changing cart to avoid duplicates.`
+      );
+    } finally {
+      isSubmittingBillRef.current = false;
+      setIsProcessingBill(false);
+    }
+  };
+
+  // Print Restaurant Order (preserved)
   const handlePrintRestaurantOrder = () => {
     if (restaurantCart.length === 0) return;
     const orderNumber = `MOZZ-${session.activeOutlet.code.toUpperCase()}-${Date.now().toString().slice(-6)}`;
@@ -252,18 +661,18 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       receiptFooter: session.activeOutlet.receiptFooter,
       tableOrCounter: selectedTable,
       orderType,
-      items: restaurantCart.map(c => ({
+      items: restaurantCart.map((c) => ({
         name: c.item.name,
         variant: c.variantName,
         price: c.unitPrice,
         quantity: c.quantity,
-        notes: c.notes
+        notes: c.notes,
       })),
       subtotal: restSubtotal,
       tax: restTax,
       grandTotal: restGrandTotal,
       paperWidth: paperWidthMm,
-      timestamp: new Date().toLocaleString()
+      timestamp: new Date().toLocaleString(),
     };
 
     if (isPrinterConnected) {
@@ -272,25 +681,31 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
     }
 
     setActiveReceiptPreview(order);
-    setActiveKotPreview(order); // Generates KOT without prices!
+    setActiveKotPreview(order);
 
     if (isOnline) {
       fetch('/api/mobile/sync/orders', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session.token}`
+          Authorization: `Bearer ${session.token}`,
         },
         body: JSON.stringify({
-          orders: [{ order: { ...order, orderNumber, tokenNumber, outletId: session.activeOutlet.id }, items: order.items, idempotency_key: `IDEM_${orderNumber}` }]
-        })
+          orders: [
+            {
+              order: { ...order, orderNumber, tokenNumber, outletId: session.activeOutlet.id },
+              items: order.items,
+              idempotency_key: `IDEM_${orderNumber}`,
+            },
+          ],
+        }),
       });
     } else {
-      setOfflineQueue(prev => [...prev, order]);
+      setOfflineQueue((prev) => [...prev, order]);
     }
   };
 
-  // Print Retail Bill
+  // Print Retail Bill (preserved)
   const handlePrintRetailBill = () => {
     if (retailCart.length === 0) return;
     const billNumber = `RET-${session.activeOutlet.code.toUpperCase()}-${Date.now().toString().slice(-6)}`;
@@ -302,18 +717,18 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       customerName,
       customerPhone,
       paymentMode,
-      items: retailCart.map(c => ({
+      items: retailCart.map((c) => ({
         name: c.product.name,
         sku: c.product.sku,
         price: c.addedPrice,
-        quantity: c.quantity
+        quantity: c.quantity,
       })),
       subtotal: retailSubtotal,
       discount: retailDiscount,
       tax: retailTax,
       grandTotal: retailGrandTotal,
       paperWidth: paperWidthMm,
-      timestamp: new Date().toLocaleString()
+      timestamp: new Date().toLocaleString(),
     };
 
     if (isPrinterConnected) {
@@ -324,98 +739,126 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
     setActiveReceiptPreview(bill);
   };
 
-  return (
-    <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-      {catalogError && <div role="alert" className="lg:col-span-12 rounded-lg border border-red-500/50 bg-red-950/40 p-3 text-red-200">{catalogError}</div>}
+  const activeCartCount =
+    category === 'salon'
+      ? salonCart.reduce((s, i) => s + i.quantity, 0)
+      : category === 'restaurant'
+        ? restaurantCart.reduce((s, i) => s + i.quantity, 0)
+        : retailCart.reduce((s, i) => s + i.quantity, 0);
 
-      {/* Left 7 Cols: Counter Terminal Frame */}
-      <div className="lg:col-span-7 bg-[#121629] border border-[#1e2540] rounded-2xl shadow-2xl overflow-hidden flex flex-col">
-        
-        {/* Terminal Simulation Bar */}
-        <div className="bg-[#0e1222] px-4 py-2.5 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs">
-          <div className="flex items-center gap-2">
-            <span className="text-slate-400 font-medium">Device:</span>
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+      {catalogError && (
+        <div className="lg:col-span-12">
+          <ErrorState
+            title="Catalog unavailable"
+            message={catalogError}
+            onRetry={() => void loadPosData()}
+          />
+        </div>
+      )}
+
+      {/* Left 7 Cols: Counter POS Terminal */}
+      <Card padding="none" className="lg:col-span-7 overflow-hidden flex flex-col">
+        {/* Hardware & Connectivity Toolbar */}
+        <div className="bg-[#F9FAFC] px-4 py-2.5 border-b border-[#E5E7EC] flex flex-wrap items-center justify-between gap-2.5 text-xs">
+          <div className="flex flex-wrap items-center gap-2">
             <button
+              type="button"
               onClick={onToggleOnline}
-              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md font-semibold transition ${
+              className={`min-h-[36px] inline-flex items-center gap-1.5 px-3 py-1 rounded-xl font-semibold border transition cursor-pointer ${
                 isOnline
-                  ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
-                  : 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+                  ? 'bg-[#ECFDF5] text-[#15803D] border-[#BBF7D0]'
+                  : 'bg-[#FEF2F2] text-[#B91C1C] border-[#FECACA]'
               }`}
             >
               {isOnline ? <Wifi className="w-3.5 h-3.5" /> : <WifiOff className="w-3.5 h-3.5" />}
-              {isOnline ? 'Online Sync' : 'Offline Mode'}
+              <span>{isOnline ? 'Online Sync' : 'Offline Mode'}</span>
             </button>
 
             <button
+              type="button"
               onClick={onTogglePrinter}
-              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md font-semibold transition ${
+              className={`min-h-[36px] inline-flex items-center gap-1.5 px-3 py-1 rounded-xl font-semibold border transition cursor-pointer ${
                 isPrinterConnected
-                  ? 'bg-sky-500/20 text-sky-400 border border-sky-500/30'
-                  : 'bg-slate-800 text-slate-400 border border-slate-700'
+                  ? 'bg-[#EFF6FF] text-[#1D4ED8] border-[#BFDBFE]'
+                  : 'bg-white text-[#6F737D] border-[#E5E7EC]'
               }`}
             >
               <Printer className="w-3.5 h-3.5" />
-              {isPrinterConnected ? `BT ESC/POS (${paperWidthMm}mm)` : 'Printer Disconnected'}
+              <span>{isPrinterConnected ? `Print Ready (${paperWidthMm}mm)` : 'Print Standby'}</span>
             </button>
           </div>
 
-          <div className="flex items-center gap-1.5 bg-slate-800/90 rounded-md p-0.5 border border-slate-700 text-[11px]">
-            <span className="text-slate-400 px-1.5">Roll:</span>
-            <button
-              onClick={() => onChangePaperWidth(80)}
-              className={`px-2 py-0.5 rounded font-bold transition ${paperWidthMm === 80 ? 'bg-pink-600 text-white' : 'text-slate-400'}`}
-            >
-              80mm
-            </button>
-            <button
-              onClick={() => onChangePaperWidth(58)}
-              className={`px-2 py-0.5 rounded font-bold transition ${paperWidthMm === 58 ? 'bg-pink-600 text-white' : 'text-slate-400'}`}
-            >
-              58mm
-            </button>
+          <div className="flex items-center gap-1 bg-white rounded-xl p-1 border border-[#E5E7EC]">
+            <span className="text-[11px] font-medium text-[#6F737D] px-1.5">Roll</span>
+            {([80, 58] as const).map((width) => (
+              <button
+                key={width}
+                type="button"
+                onClick={() => onChangePaperWidth(width)}
+                className={`min-h-[28px] px-2.5 rounded-lg text-[11px] font-bold transition cursor-pointer ${
+                  paperWidthMm === width
+                    ? 'bg-[#2F3033] text-white'
+                    : 'text-[#6F737D] hover:text-[#2F3033]'
+                }`}
+              >
+                {width}mm
+              </button>
+            ))}
           </div>
         </div>
 
-        {/* Offline Warning Notice */}
+        {/* Offline Queue Notice */}
         {!isOnline && (
-          <div className="bg-amber-500/15 border-b border-amber-500/30 px-4 py-2 flex items-center justify-between">
-            <div className="flex items-center gap-2 text-amber-300 text-xs">
-              <WifiOff className="w-4 h-4 text-amber-400" />
-              <span>Offline: Transactions safely cached locally in SQLite/Room. Will auto-sync when online.</span>
+          <div className="bg-[#FFFBEB] border-b border-[#FDE68A] px-4 py-2 flex items-center justify-between gap-2 text-xs text-[#92400E]">
+            <div className="flex items-center gap-2">
+              <WifiOff className="w-4 h-4 text-[#D97706] shrink-0" />
+              <span>Offline mode: bills are queued locally and sync once connected.</span>
             </div>
             {offlineQueue.length > 0 && (
-              <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-amber-500/20 text-amber-300">
-                {offlineQueue.length} Queued
-              </span>
+              <StatusBadge label={`${offlineQueue.length} Queued`} tone="warning" />
             )}
           </div>
         )}
 
-        {/* Sub-View Navigation Tabs */}
-        <div className="bg-slate-900 border-b border-slate-800 px-4 py-2 flex items-center justify-between text-xs">
-          <div className="flex items-center gap-2">
+        {/* POS View Navigation */}
+        <div className="bg-white border-b border-[#E5E7EC] px-4 py-2.5 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar">
             <button
+              type="button"
               onClick={() => setActivePosView('billing')}
-              className={`px-3 py-1.5 rounded-lg font-semibold transition ${
-                activePosView === 'billing' ? 'bg-pink-600 text-white shadow' : 'text-slate-400 hover:bg-slate-800'
+              className={`min-h-[38px] shrink-0 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition cursor-pointer ${
+                activePosView === 'billing'
+                  ? 'bg-[#2F3033] text-white shadow-xs'
+                  : 'bg-[#F5F6FA] text-[#6F737D] hover:text-[#2F3033]'
               }`}
             >
-              Active Cart ({category === 'salon' ? salonCart.length : category === 'restaurant' ? restaurantCart.length : retailCart.length})
+              Active Cart ({activeCartCount})
             </button>
             <button
+              type="button"
               onClick={() => setActivePosView('catalog')}
-              className={`px-3 py-1.5 rounded-lg font-semibold transition ${
-                activePosView === 'catalog' ? 'bg-pink-600 text-white shadow' : 'text-slate-400 hover:bg-slate-800'
+              className={`min-h-[38px] shrink-0 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition cursor-pointer ${
+                activePosView === 'catalog'
+                  ? 'bg-[#2F3033] text-white shadow-xs'
+                  : 'bg-[#F5F6FA] text-[#6F737D] hover:text-[#2F3033]'
               }`}
             >
-              {category === 'salon' ? 'Catalog Services' : category === 'restaurant' ? 'Menu Items' : 'Products'}
+              {category === 'salon'
+                ? 'Catalog Services'
+                : category === 'restaurant'
+                  ? 'Menu Items'
+                  : 'Products'}
             </button>
             {category === 'salon' && (
               <button
+                type="button"
                 onClick={() => setActivePosView('secondary')}
-                className={`px-3 py-1.5 rounded-lg font-semibold transition ${
-                  activePosView === 'secondary' ? 'bg-pink-600 text-white shadow' : 'text-slate-400 hover:bg-slate-800'
+                className={`min-h-[38px] shrink-0 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition cursor-pointer ${
+                  activePosView === 'secondary'
+                    ? 'bg-[#2F3033] text-white shadow-xs'
+                    : 'bg-[#F5F6FA] text-[#6F737D] hover:text-[#2F3033]'
                 }`}
               >
                 Appointments ({appointments.length})
@@ -423,494 +866,842 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
             )}
             {category === 'restaurant' && (
               <button
+                type="button"
                 onClick={() => setActivePosView('secondary')}
-                className={`px-3 py-1.5 rounded-lg font-semibold transition ${
-                  activePosView === 'secondary' ? 'bg-pink-600 text-white shadow' : 'text-slate-400 hover:bg-slate-800'
+                className={`min-h-[38px] shrink-0 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition cursor-pointer ${
+                  activePosView === 'secondary'
+                    ? 'bg-[#2F3033] text-white shadow-xs'
+                    : 'bg-[#F5F6FA] text-[#6F737D] hover:text-[#2F3033]'
                 }`}
               >
-                Tables & Seating
+                Tables &amp; Seating
               </button>
             )}
           </div>
 
-          <span className="text-[11px] font-mono text-sky-400">
+          <span className="hidden sm:inline-block text-[11px] font-medium text-[#6F737D] tabular-nums shrink-0">
             Rev #{localRevision}
           </span>
         </div>
 
-        {/* POS Body Content */}
-        <div className="p-5 space-y-4 flex-1">
-          
-          {/* ============================================================================== */}
-          {/* VIEW 1: BILLING CART                                                           */}
-          {/* ============================================================================== */}
+        {/* Body Content */}
+        <div className="p-4 sm:p-5 space-y-4 flex-1 bg-white">
+          {/* VIEW 1: ACTIVE CART */}
           {activePosView === 'billing' && (
             <div className="space-y-4">
-              
               {/* SALON CART */}
               {category === 'salon' && (
-                <div className="space-y-3">
-                  <div className="space-y-2">
-                    {salonCart.map((item, idx) => (
-                      <div key={idx} className="bg-[#161a33] border border-[#2a3055] rounded-xl p-3 flex items-center justify-between gap-3 text-xs">
-                        <div className="flex-1">
-                          <p className="font-bold text-white">{item.service.name}</p>
-                          <label className="mt-2 block text-[11px] text-slate-300" htmlFor={`stylist-${idx}`}>Assigned stylist for this service</label>
-                          <select
-                            id={`stylist-${idx}`}
-                            aria-label={`Stylist for ${item.service.name}`}
-                            value={item.stylist?.id || ''}
-                            onChange={e => {
-                              const chosen = stylists.find(st => st.id === e.target.value) || null;
-                              setSalonCart(prev => prev.map((line, i) => i === idx ? { ...line, stylist: chosen } : line));
-                              setBillSaveError(null);
-                            }}
-                            className="mt-1 w-full max-w-sm rounded-lg border border-[#3a4267] bg-[#10162a] px-2 py-2 text-white"
-                          >
-                            <option value="">Select stylist (required)</option>
-                            {stylists.map(st => <option key={st.id} value={st.id}>{st.name}</option>)}
-                          </select>
-                          <p className="text-[11px] text-slate-400">Price: ₹{item.addedPrice}</p>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <span className="font-bold text-white font-mono">₹{item.addedPrice * item.quantity}</span>
-                          <button
-                            onClick={() => setSalonCart(prev => prev.filter((_, i) => i !== idx))}
-                            className="text-slate-400 hover:text-rose-400 p-1"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
+                <div className="space-y-4">
+                  {isLoadingStylists && (
+                    <div className="rounded-xl border border-[#BFDBFE] bg-[#EFF6FF] px-3.5 py-2.5 text-xs text-[#1D4ED8] flex items-center gap-2">
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
+                      <span>Loading active stylists from Glossy Looks staff API...</span>
+                    </div>
+                  )}
 
-                  {stylistError && <p role="alert" className="text-xs text-amber-400">{stylistError}</p>}
-                  {billSaveError && <p role="alert" className="text-xs text-rose-400">{billSaveError}</p>}
-                  {/* Customer Information */}
-                  <div className="grid grid-cols-2 gap-3 text-xs pt-2">
-                    <div>
-                      <label className="text-slate-400 block mb-1">Customer Name</label>
+                  {!isLoadingStylists && stylistError && (
+                    <ErrorState
+                      title="Stylists unavailable"
+                      message={`${stylistError}${stylistUpstreamStatus ? ` (HTTP ${stylistUpstreamStatus})` : ''}`}
+                      onRetry={() => void loadStylists()}
+                    />
+                  )}
+
+                  {salonCart.length === 0 ? (
+                    <EmptyState
+                      icon={<Scissors className="w-5 h-5" />}
+                      title="Your salon cart is empty"
+                      description="Browse salon services from the catalog and assign a stylist to each service before printing."
+                      action={
+                        <Button size="sm" onClick={() => setActivePosView('catalog')}>
+                          Browse Services
+                        </Button>
+                      }
+                    />
+                  ) : (
+                    <div className="space-y-2.5">
+                      {salonCart.map((item, idx) => (
+                        <ItemCard
+                          key={`${item.service.id}-${idx}`}
+                          title={item.service.name}
+                          subtitle={`${normalizeGroup(item.service.category)} · ${normalizeGroup(item.service.subcategory)}`}
+                          meta={
+                            item.service.durationMinutes
+                              ? `${item.service.durationMinutes} min`
+                              : undefined
+                          }
+                          price={item.addedPrice}
+                          lineTotal={item.addedPrice * item.quantity}
+                          quantity={item.quantity}
+                          onIncrement={() =>
+                            setSalonCart((prev) =>
+                              prev.map((line, i) =>
+                                i === idx ? { ...line, quantity: line.quantity + 1 } : line
+                              )
+                            )
+                          }
+                          onDecrement={() => {
+                            if (item.quantity <= 1) {
+                              setSalonCart((prev) => prev.filter((_, i) => i !== idx));
+                              setMissingStylistIdx(null);
+                            } else {
+                              setSalonCart((prev) =>
+                                prev.map((line, i) =>
+                                  i === idx ? { ...line, quantity: line.quantity - 1 } : line
+                                )
+                              );
+                            }
+                          }}
+                          fallbackIcon={<Scissors className="w-4 h-4 text-[#FF1B7A]" />}
+                          footer={
+                            <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-2.5">
+                              <div className="flex-1 min-w-0">
+                                <StylistSelector
+                                  index={idx}
+                                  serviceName={item.service.name}
+                                  stylists={stylists}
+                                  selectedStylistId={item.stylist?.id || ''}
+                                  isLoadingStylists={isLoadingStylists}
+                                  isMissingHighlight={missingStylistIdx === idx}
+                                  selectRef={(el) => {
+                                    stylistSelectRefs.current[idx] = el;
+                                  }}
+                                  onChange={(chosen) => {
+                                    setSalonCart((prev) =>
+                                      prev.map((line, i) =>
+                                        i === idx ? { ...line, stylist: chosen } : line
+                                      )
+                                    );
+                                    if (chosen && missingStylistIdx === idx) {
+                                      setMissingStylistIdx(null);
+                                    }
+                                    setBillSaveError(null);
+                                  }}
+                                />
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSalonCart((prev) => prev.filter((_, i) => i !== idx));
+                                  setMissingStylistIdx(null);
+                                }}
+                                aria-label={`Remove ${item.service.name}`}
+                                className="min-h-[40px] px-2.5 rounded-xl text-xs font-semibold text-[#6F737D] hover:text-[#B91C1C] hover:bg-[#FEF2F2] inline-flex items-center gap-1 self-end transition cursor-pointer"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                                <span className="sm:hidden">Remove</span>
+                              </button>
+                            </div>
+                          }
+                        />
+                      ))}
+                    </div>
+                  )}
+
+                  {billSaveError && (
+                    <div
+                      role="alert"
+                      className="rounded-xl border border-[#FECACA] bg-[#FEF2F2] px-3.5 py-2.5 text-xs text-[#B91C1C] font-medium"
+                    >
+                      {billSaveError}
+                    </div>
+                  )}
+                  {billSuccessMessage && (
+                    <div
+                      role="status"
+                      className="rounded-xl border border-[#BBF7D0] bg-[#ECFDF5] px-3.5 py-2.5 text-xs text-[#15803D] font-medium flex items-center gap-2"
+                    >
+                      <CheckCircle2 className="w-4 h-4 shrink-0" />
+                      <span>{billSuccessMessage}</span>
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <FormField label="Customer Name" htmlFor="pos-customer-name">
                       <input
+                        id="pos-customer-name"
                         type="text"
                         value={customerName}
-                        onChange={e => setCustomerName(e.target.value)}
+                        onChange={(e) => setCustomerName(e.target.value)}
                         placeholder="Walk-in Customer"
-                        className="w-full bg-[#161a33] border border-[#2a3055] rounded-xl px-3 py-2 text-white"
+                        className={BASE_INPUT_CLASS}
                       />
-                    </div>
-                    <div>
-                      <label className="text-slate-400 block mb-1">Phone (WhatsApp Receipt)</label>
+                    </FormField>
+                    <FormField label="Phone (WhatsApp)" htmlFor="pos-customer-phone">
                       <input
-                        type="text"
+                        id="pos-customer-phone"
+                        type="tel"
                         value={customerPhone}
-                        onChange={e => setCustomerPhone(e.target.value)}
-                        placeholder="Optional mobile number"
-                        className="w-full bg-[#161a33] border border-[#2a3055] rounded-xl px-3 py-2 text-white"
+                        onChange={(e) => setCustomerPhone(e.target.value)}
+                        placeholder="Optional mobile"
+                        className={BASE_INPUT_CLASS}
                       />
-                    </div>
+                    </FormField>
+                    <FormField label="Payment Mode" htmlFor="pos-payment-mode">
+                      <select
+                        id="pos-payment-mode"
+                        value={paymentMode}
+                        onChange={(e) => setPaymentMode(e.target.value)}
+                        className={BASE_INPUT_CLASS}
+                      >
+                        <option value="upi">UPI</option>
+                        <option value="cash">Cash</option>
+                        <option value="card">Card</option>
+                      </select>
+                    </FormField>
                   </div>
 
-                  {/* Payment Summary */}
-                  <div className="bg-[#0e1222] p-4 rounded-xl border border-slate-800 space-y-1.5 text-xs">
-                    <div className="flex justify-between text-slate-400"><span>Subtotal:</span><span>₹{salonSubtotal}</span></div>
-                    <div className="flex justify-between text-slate-400"><span>Discount:</span><span className="text-amber-400">-₹{salonDiscount}</span></div>
-                    <div className="flex justify-between text-slate-400"><span>GST Tax (18%):</span><span>₹{salonTax}</span></div>
-                    <div className="flex justify-between text-sm font-bold text-white pt-2 border-t border-slate-800">
-                      <span>Grand Total:</span>
-                      <span className="text-emerald-400 font-mono">₹{salonGrandTotal}</span>
-                    </div>
-                  </div>
-
-                  <button
-                    onClick={handlePrintSalonBill}
-                    disabled={salonCart.length === 0 || salonCart.some(line => !line.stylist?.id)}
-                    className="w-full py-3.5 rounded-xl bg-gradient-to-r from-pink-500 to-orange-500 hover:brightness-110 text-white font-bold text-sm flex items-center justify-center gap-2 shadow-lg transition"
-                  >
-                    <Printer className="w-4 h-4" />
-                    Print Salon Receipt (ESC/POS)
-                  </button>
+                  <CartSummary
+                    lines={[
+                      { label: 'Subtotal', value: `₹${salonSubtotal}` },
+                      { label: 'Discount', value: `-₹${salonDiscount}`, tone: 'discount' },
+                      { label: 'GST (18%)', value: `₹${salonTax}` },
+                    ]}
+                    grandTotalValue={`₹${salonGrandTotal}`}
+                    itemCountLabel={`${activeCartCount} service${activeCartCount === 1 ? '' : 's'}`}
+                    action={
+                      <div className="space-y-2">
+                        {salonCart.length > 0 &&
+                          (isLoadingStylists || Boolean(stylistError) || stylists.length === 0) && (
+                            <p className="text-[11px] text-[#B45309] font-medium">
+                              {isLoadingStylists
+                                ? 'Printing disabled until active stylists finish loading.'
+                                : 'Printing disabled while active stylists are unavailable. Click Retry above to reload stylists.'}
+                            </p>
+                          )}
+                        <Button
+                          fullWidth
+                          size="lg"
+                          onClick={() => void handlePrintSalonBill()}
+                          disabled={
+                            salonCart.length === 0 ||
+                            isLoadingStylists ||
+                            Boolean(stylistError) ||
+                            stylists.length === 0 ||
+                            isProcessingBill
+                          }
+                          loading={isProcessingBill}
+                          leftIcon={<Printer className="w-4 h-4" />}
+                        >
+                          {isProcessingBill
+                            ? 'Saving Bill & Opening Print Dialog...'
+                            : 'Print Salon Receipt (Browser Print)'}
+                        </Button>
+                      </div>
+                    }
+                  />
                 </div>
               )}
 
               {/* RESTAURANT CART */}
               {category === 'restaurant' && (
-                <div className="space-y-3">
-                  <div className="grid grid-cols-2 gap-3 text-xs pb-1">
-                    <div>
-                      <label className="text-slate-400 block mb-1">Table / Counter</label>
+                <div className="space-y-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <FormField label="Table / Counter" htmlFor="pos-table-select">
                       <select
+                        id="pos-table-select"
                         value={selectedTable}
-                        onChange={e => setSelectedTable(e.target.value)}
-                        className="w-full bg-[#161a33] border border-[#2a3055] rounded-xl px-3 py-2 text-white"
+                        onChange={(e) => setSelectedTable(e.target.value)}
+                        className={BASE_INPUT_CLASS}
                       >
                         <option value="Table 1">Table 1 (2 Pax)</option>
                         <option value="Table 2">Table 2 (4 Pax)</option>
                         <option value="Table 3">Table 3 (4 Pax)</option>
                         <option value="Counter 1">Counter 1 (Fast Bite)</option>
                       </select>
-                    </div>
-                    <div>
-                      <label className="text-slate-400 block mb-1">Order Mode</label>
+                    </FormField>
+                    <FormField label="Order Mode" htmlFor="pos-order-mode">
                       <select
+                        id="pos-order-mode"
                         value={orderType}
-                        onChange={e => setOrderType(e.target.value as any)}
-                        className="w-full bg-[#161a33] border border-[#2a3055] rounded-xl px-3 py-2 text-white"
+                        onChange={(e) => setOrderType(e.target.value as any)}
+                        className={BASE_INPUT_CLASS}
                       >
                         <option value="dine_in">Dine In</option>
                         <option value="takeaway">Takeaway</option>
                         <option value="counter">Express Counter</option>
                       </select>
-                    </div>
+                    </FormField>
                   </div>
 
-                  <div className="space-y-2">
-                    {restaurantCart.map((item, idx) => (
-                      <div key={idx} className="bg-[#161a33] border border-[#2a3055] rounded-xl p-3 flex items-center justify-between gap-3 text-xs">
-                        <div className="flex-1">
-                          <p className="font-bold text-white flex items-center gap-1.5">
-                            <span className={`w-2 h-2 rounded-full ${item.item.isVeg ? 'bg-emerald-400' : 'bg-rose-500'}`} />
-                            {item.item.name}
-                          </p>
-                          <p className="text-[11px] text-slate-400">{item.variantName} • Qty: {item.quantity}</p>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <span className="font-bold text-white font-mono">₹{item.unitPrice * item.quantity}</span>
-                          <button
-                            onClick={() => setRestaurantCart(prev => prev.filter((_, i) => i !== idx))}
-                            className="text-slate-400 hover:text-rose-400 p-1"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </div>
+                  {restaurantCart.length === 0 ? (
+                    <EmptyState
+                      icon={<Utensils className="w-5 h-5" />}
+                      title="No dishes in order"
+                      description="Add items from the restaurant menu to print a KOT or dine-in bill."
+                      action={
+                        <Button size="sm" onClick={() => setActivePosView('catalog')}>
+                          Open Menu
+                        </Button>
+                      }
+                    />
+                  ) : (
+                    <div className="space-y-2.5">
+                      {restaurantCart.map((item, idx) => (
+                        <ItemCard
+                          key={`${item.item.id}-${idx}`}
+                          title={item.item.name}
+                          subtitle={`${item.variantName || 'Regular'} · ${normalizeGroup(item.item.category)}`}
+                          leadingIndicator={
+                            <span
+                              title={item.item.isVeg ? 'Vegetarian' : 'Non-Vegetarian'}
+                              className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                                item.item.isVeg ? 'bg-[#15803D]' : 'bg-[#DC2626]'
+                              }`}
+                            />
+                          }
+                          price={item.unitPrice}
+                          lineTotal={item.unitPrice * item.quantity}
+                          quantity={item.quantity}
+                          onIncrement={() =>
+                            setRestaurantCart((prev) =>
+                              prev.map((line, i) =>
+                                i === idx ? { ...line, quantity: line.quantity + 1 } : line
+                              )
+                            )
+                          }
+                          onDecrement={() => {
+                            if (item.quantity <= 1) {
+                              setRestaurantCart((prev) => prev.filter((_, i) => i !== idx));
+                            } else {
+                              setRestaurantCart((prev) =>
+                                prev.map((line, i) =>
+                                  i === idx ? { ...line, quantity: line.quantity - 1 } : line
+                                )
+                              );
+                            }
+                          }}
+                          fallbackIcon={<Utensils className="w-4 h-4 text-[#FF6A00]" />}
+                        />
+                      ))}
+                    </div>
+                  )}
+
+                  <CartSummary
+                    lines={[
+                      { label: 'Food Subtotal', value: `₹${restSubtotal}` },
+                      { label: 'Restaurant GST (5%)', value: `₹${restTax}` },
+                    ]}
+                    grandTotalLabel="Order Total"
+                    grandTotalValue={`₹${restGrandTotal}`}
+                    itemCountLabel={`${activeCartCount} item${activeCartCount === 1 ? '' : 's'} · ${selectedTable}`}
+                    action={
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        <Button
+                          variant="outline"
+                          onClick={handlePrintRestaurantOrder}
+                          disabled={restaurantCart.length === 0}
+                          leftIcon={<ChefHat className="w-4 h-4 text-[#D97706]" />}
+                        >
+                          Print KOT (No Price)
+                        </Button>
+                        <Button
+                          onClick={handlePrintRestaurantOrder}
+                          disabled={restaurantCart.length === 0}
+                          leftIcon={<Printer className="w-4 h-4" />}
+                        >
+                          Print Dine Bill
+                        </Button>
                       </div>
-                    ))}
-                  </div>
-
-                  <div className="bg-[#0e1222] p-4 rounded-xl border border-slate-800 space-y-1.5 text-xs">
-                    <div className="flex justify-between text-slate-400"><span>Food Subtotal:</span><span>₹{restSubtotal}</span></div>
-                    <div className="flex justify-between text-slate-400"><span>Restaurant GST (5%):</span><span>₹{restTax}</span></div>
-                    <div className="flex justify-between text-sm font-bold text-white pt-2 border-t border-slate-800">
-                      <span>Order Total:</span>
-                      <span className="text-emerald-400 font-mono">₹{restGrandTotal}</span>
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-3">
-                    <button
-                      onClick={handlePrintRestaurantOrder}
-                      disabled={restaurantCart.length === 0}
-                      className="py-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-semibold text-xs flex items-center justify-center gap-1.5 border border-slate-700 transition"
-                    >
-                      <ChefHat className="w-4 h-4 text-amber-400" />
-                      Print KOT (No Price)
-                    </button>
-                    <button
-                      onClick={handlePrintRestaurantOrder}
-                      disabled={restaurantCart.length === 0}
-                      className="py-3 rounded-xl bg-gradient-to-r from-pink-500 to-orange-500 hover:brightness-110 text-white font-semibold text-xs flex items-center justify-center gap-1.5 shadow transition"
-                    >
-                      <Printer className="w-4 h-4" />
-                      Print Dine Bill
-                    </button>
-                  </div>
+                    }
+                  />
                 </div>
               )}
 
-              {/* RETAIL CART */}
-              {category === 'retail' && (
-                <div className="space-y-3">
-                  <div className="space-y-2">
-                    {retailCart.map((item, idx) => (
-                      <div key={idx} className="bg-[#161a33] border border-[#2a3055] rounded-xl p-3 flex items-center justify-between gap-3 text-xs">
-                        <div className="flex-1">
-                          <p className="font-bold text-white">{item.product.name}</p>
-                          <p className="text-[11px] text-slate-400">SKU: {item.product.sku} • Price: ₹{item.addedPrice}</p>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <span className="font-bold text-white font-mono">₹{item.addedPrice * item.quantity}</span>
-                          <button
-                            onClick={() => setRetailCart(prev => prev.filter((_, i) => i !== idx))}
-                            className="text-slate-400 hover:text-rose-400 p-1"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-
-                  <div className="bg-[#0e1222] p-4 rounded-xl border border-slate-800 space-y-1.5 text-xs">
-                    <div className="flex justify-between text-slate-400"><span>Subtotal:</span><span>₹{retailSubtotal}</span></div>
-                    <div className="flex justify-between text-slate-400"><span>Retail GST (12%):</span><span>₹{retailTax}</span></div>
-                    <div className="flex justify-between text-sm font-bold text-white pt-2 border-t border-slate-800">
-                      <span>Grand Total:</span>
-                      <span className="text-emerald-400 font-mono">₹{retailGrandTotal}</span>
+              {/* RETAIL / OTHER CART */}
+              {category !== 'salon' && category !== 'restaurant' && (
+                <div className="space-y-4">
+                  {retailCart.length === 0 ? (
+                    <EmptyState
+                      icon={<ShoppingBag className="w-5 h-5" />}
+                      title="No products in cart"
+                      description="Select products from the catalog to build a retail bill."
+                      action={
+                        <Button size="sm" onClick={() => setActivePosView('catalog')}>
+                          Browse Products
+                        </Button>
+                      }
+                    />
+                  ) : (
+                    <div className="space-y-2.5">
+                      {retailCart.map((item, idx) => (
+                        <ItemCard
+                          key={`${item.product.id}-${idx}`}
+                          title={item.product.name}
+                          subtitle={`SKU: ${item.product.sku}`}
+                          price={item.addedPrice}
+                          lineTotal={item.addedPrice * item.quantity}
+                          quantity={item.quantity}
+                          onIncrement={() =>
+                            setRetailCart((prev) =>
+                              prev.map((line, i) =>
+                                i === idx ? { ...line, quantity: line.quantity + 1 } : line
+                              )
+                            )
+                          }
+                          onDecrement={() => {
+                            if (item.quantity <= 1) {
+                              setRetailCart((prev) => prev.filter((_, i) => i !== idx));
+                            } else {
+                              setRetailCart((prev) =>
+                                prev.map((line, i) =>
+                                  i === idx ? { ...line, quantity: line.quantity - 1 } : line
+                                )
+                              );
+                            }
+                          }}
+                          fallbackIcon={<Package className="w-4 h-4 text-[#15803D]" />}
+                        />
+                      ))}
                     </div>
-                  </div>
+                  )}
 
-                  <button
-                    onClick={handlePrintRetailBill}
-                    disabled={retailCart.length === 0}
-                    className="w-full py-3.5 rounded-xl bg-gradient-to-r from-pink-500 to-orange-500 hover:brightness-110 text-white font-bold text-sm flex items-center justify-center gap-2 shadow"
-                  >
-                    <Printer className="w-4 h-4" />
-                    Print Retail Bill (ESC/POS)
-                  </button>
+                  <CartSummary
+                    lines={[
+                      { label: 'Subtotal', value: `₹${retailSubtotal}` },
+                      { label: 'Retail GST (12%)', value: `₹${retailTax}` },
+                    ]}
+                    grandTotalValue={`₹${retailGrandTotal}`}
+                    itemCountLabel={`${activeCartCount} item${activeCartCount === 1 ? '' : 's'}`}
+                    action={
+                      <Button
+                        fullWidth
+                        size="lg"
+                        onClick={handlePrintRetailBill}
+                        disabled={retailCart.length === 0}
+                        leftIcon={<Printer className="w-4 h-4" />}
+                      >
+                        Print Retail Bill (ESC/POS)
+                      </Button>
+                    }
+                  />
                 </div>
               )}
             </div>
           )}
 
-          {/* ============================================================================== */}
-          {/* VIEW 2: CATALOG ITEM SELECTION                                                 */}
-          {/* ============================================================================== */}
+          {/* VIEW 2: CATALOG ITEM SELECTION */}
           {activePosView === 'catalog' && (
-            <div className="space-y-3">
+            <div className="space-y-4">
               <div className="relative">
-                <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                <Search className="w-4 h-4 text-[#6F737D] absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
                 <input
                   type="text"
                   value={searchQuery}
-                  onChange={e => setSearchQuery(e.target.value)}
-                  placeholder="Search catalog items..."
-                  className="w-full bg-[#161a33] border border-[#2a3055] rounded-xl pl-10 pr-4 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-pink-500"
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search services, dishes, or categories..."
+                  className={`${BASE_INPUT_CLASS} pl-10`}
                 />
               </div>
 
-              <div className="space-y-2" aria-label="Catalog category navigation">
-                <div className="text-[11px] font-semibold text-slate-300">Categories</div>
-                <div className="flex flex-wrap gap-2">
-                  {['All', ...catalogCategories].map(cat => (
-                    <button key={cat} type="button"
+              <div className="space-y-2.5" aria-label="Catalog category navigation">
+                <div className="flex items-center justify-between text-[11px] font-semibold text-[#6F737D]">
+                  <span>Categories</span>
+                  <span className="tabular-nums">
+                    Showing {visibleCatalogItems.length} of {catalogItems.length}
+                  </span>
+                </div>
+                <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-0.5">
+                  {['All', ...catalogCategories].map((cat) => (
+                    <button
+                      key={cat}
+                      type="button"
                       aria-pressed={selectedCategoryFilter === cat}
-                      onClick={() => { setSelectedCategoryFilter(cat); setSelectedSubcategoryFilter('All'); }}
-                      className={`rounded-lg border px-3 py-1.5 text-xs ${selectedCategoryFilter === cat ? 'border-pink-500 bg-pink-500/20 text-white' : 'border-[#2a3055] text-slate-300 hover:border-pink-500/50'}`}>
+                      onClick={() => {
+                        setSelectedCategoryFilter(cat);
+                        setSelectedSubcategoryFilter('All');
+                      }}
+                      className={`min-h-[36px] shrink-0 rounded-xl border px-3 py-1 text-xs font-semibold transition cursor-pointer ${
+                        selectedCategoryFilter === cat
+                          ? 'border-[#2F3033] bg-[#2F3033] text-white'
+                          : 'border-[#E5E7EC] bg-white text-[#6F737D] hover:text-[#2F3033] hover:border-[#D3D7E0]'
+                      }`}
+                    >
                       {cat === 'All' ? 'All Categories' : cat}
                     </button>
                   ))}
                 </div>
-                <div className="text-[11px] font-semibold text-slate-300">Subcategories</div>
-                <div className="flex flex-wrap gap-2">
-                  {['All', ...catalogSubcategories].map(sub => (
-                    <button key={sub} type="button"
-                      aria-pressed={selectedSubcategoryFilter === sub}
-                      onClick={() => setSelectedSubcategoryFilter(sub)}
-                      className={`rounded-lg border px-3 py-1.5 text-xs ${selectedSubcategoryFilter === sub ? 'border-amber-500 bg-amber-500/20 text-white' : 'border-[#2a3055] text-slate-300 hover:border-amber-500/50'}`}>
-                      {sub === 'All' ? 'All Subcategories' : sub}
-                    </button>
-                  ))}
-                </div>
-                <p className="text-[11px] text-slate-400">Showing {visibleCatalogItems.length} of {catalogItems.length} items</p>
-              </div>
-              {catalogError && <p role="alert" className="text-xs text-rose-400">{catalogError}</p>}
-              {visibleCatalogItems.length === 0 && <p className="text-xs text-slate-400 py-4">No items found for these filters. Check the outlet catalog sync if the list is empty.</p>}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-[460px] overflow-y-auto pr-1">
-                {category === 'salon' && (visibleCatalogItems as SalonService[]).map(srv => (
-                  <div
-                    key={srv.id}
-                    onClick={() => {
-                      setSalonCart(prev => [...prev, { service: srv, stylist: null, quantity: 1, discountPercent: 0, addedPrice: srv.price, addedRevision: srv.revision }]);
-                      setActivePosView('billing');
-                    }}
-                    className="p-3 bg-[#161a33] border border-[#2a3055] hover:border-pink-500/60 rounded-xl cursor-pointer transition flex flex-col justify-between"
-                  >
-                    <div>
-                      <div className="flex items-center justify-between">
-                        <span className="text-[10px] text-slate-400 font-mono">{srv.category} / {normalized(srv.subcategory)}</span>
-                        <span className="text-xs font-bold text-emerald-400 font-mono">₹{srv.price}</span>
-                      </div>
-                      <p className="text-xs font-bold text-white mt-1">{srv.name}</p>
-                    </div>
-                    <button className="mt-2 text-[11px] font-semibold text-pink-400 flex items-center gap-1">
-                      <Plus className="w-3.5 h-3.5" /> Add to Bill
-                    </button>
-                  </div>
-                ))}
 
-                {category === 'restaurant' && (visibleCatalogItems as RestaurantMenuItem[]).map(menuItem => (
-                  <div
-                    key={menuItem.id}
-                    onClick={() => {
-                      setRestaurantCart(prev => [...prev, { item: menuItem, variantName: 'Regular', unitPrice: menuItem.basePrice, quantity: 1, notes: '', addedPrice: menuItem.basePrice, addedRevision: menuItem.revision }]);
-                      setActivePosView('billing');
-                    }}
-                    className="p-3 bg-[#161a33] border border-[#2a3055] hover:border-amber-500/60 rounded-xl cursor-pointer transition flex flex-col justify-between"
-                  >
-                    <div>
-                      <div className="flex items-center justify-between">
-                        <span className="text-[10px] text-slate-400 font-mono">{menuItem.category} / {normalized(menuItem.subcategory)}</span>
-                        <span className="text-xs font-bold text-emerald-400 font-mono">₹{menuItem.basePrice}</span>
-                      </div>
-                      <p className="text-xs font-bold text-white mt-1 flex items-center gap-1.5">
-                        <span className={`w-2 h-2 rounded-full ${menuItem.isVeg ? 'bg-emerald-400' : 'bg-rose-500'}`} />
-                        {menuItem.name}
-                      </p>
-                    </div>
-                    <button className="mt-2 text-[11px] font-semibold text-amber-400 flex items-center gap-1">
-                      <Plus className="w-3.5 h-3.5" /> Add to Order
-                    </button>
+                {catalogSubcategories.length > 1 && (
+                  <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-0.5">
+                    {['All', ...catalogSubcategories].map((sub) => (
+                      <button
+                        key={sub}
+                        type="button"
+                        aria-pressed={selectedSubcategoryFilter === sub}
+                        onClick={() => setSelectedSubcategoryFilter(sub)}
+                        className={`min-h-[34px] shrink-0 rounded-xl border px-3 py-1 text-[11px] font-semibold transition cursor-pointer ${
+                          selectedSubcategoryFilter === sub
+                            ? 'border-[#FF1B7A] bg-[#FFF1F5] text-[#D81B60]'
+                            : 'border-[#E5E7EC] bg-[#F9FAFC] text-[#6F737D] hover:text-[#2F3033]'
+                        }`}
+                      >
+                        {sub === 'All' ? 'All Subcategories' : sub}
+                      </button>
+                    ))}
                   </div>
-                ))}
-                {(category === 'retail' || category === 'other') && (visibleCatalogItems as RetailProduct[]).map(product => (
-                  <div key={product.id} onClick={() => {
-                    setRetailCart(prev => [...prev, { product, quantity: 1, discountPercent: 0, addedPrice: product.price, addedRevision: product.revision }]);
-                    setActivePosView('billing');
-                  }} className="p-3 bg-[#161a33] border border-[#2a3055] hover:border-pink-500/60 rounded-xl cursor-pointer">
-                    <div className="flex justify-between gap-2"><span className="text-[10px] text-slate-400">{product.category} / {normalized(product.subcategory)}</span><span className="text-xs font-bold text-emerald-400">₹{product.price}</span></div>
-                    <p className="text-xs font-bold text-white mt-1">{product.name}</p>
-                    <span className="mt-2 text-[11px] font-semibold text-pink-400 flex items-center gap-1"><Plus className="w-3.5 h-3.5" /> Add to Bill</span>
-                  </div>
-                ))}
+                )}
               </div>
+
+              {isCatalogLoading ? (
+                <LoadingState compact title="Loading outlet catalog…" />
+              ) : visibleCatalogItems.length === 0 ? (
+                <EmptyState
+                  title="No matching catalog items"
+                  description="Try clearing your search or category filter, or verify outlet catalog sync."
+                  action={
+                    searchQuery || selectedCategoryFilter !== 'All' ? (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => {
+                          setSearchQuery('');
+                          setSelectedCategoryFilter('All');
+                          setSelectedSubcategoryFilter('All');
+                        }}
+                      >
+                        Reset Filters
+                      </Button>
+                    ) : undefined
+                  }
+                />
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-[520px] overflow-y-auto pr-0.5">
+                  {category === 'salon' &&
+                    (visibleCatalogItems as SalonService[]).map((srv) => (
+                      <ItemCard
+                        key={srv.id}
+                        title={srv.name}
+                        subtitle={`${normalizeGroup(srv.category)} · ${normalizeGroup(srv.subcategory)}`}
+                        meta={srv.durationMinutes ? `${srv.durationMinutes} min` : undefined}
+                        price={srv.price}
+                        quantity={salonQtyById[srv.id] || 0}
+                        disabled={srv.isActive === false}
+                        disabledReason={srv.isActive === false ? 'Service disabled' : undefined}
+                        onIncrement={() => handleCatalogSalonIncrement(srv)}
+                        onDecrement={() => handleCatalogSalonDecrement(srv.id)}
+                        fallbackIcon={<Scissors className="w-4 h-4 text-[#FF1B7A]" />}
+                      />
+                    ))}
+
+                  {category === 'restaurant' &&
+                    (visibleCatalogItems as RestaurantMenuItem[]).map((menuItem) => (
+                      <ItemCard
+                        key={menuItem.id}
+                        title={menuItem.name}
+                        subtitle={`${normalizeGroup(menuItem.category)} · ${normalizeGroup(menuItem.subcategory)}`}
+                        leadingIndicator={
+                          <span
+                            className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                              menuItem.isVeg ? 'bg-[#15803D]' : 'bg-[#DC2626]'
+                            }`}
+                          />
+                        }
+                        price={menuItem.basePrice}
+                        quantity={restaurantQtyById[menuItem.id] || 0}
+                        onIncrement={() => handleCatalogRestaurantIncrement(menuItem)}
+                        onDecrement={() => handleCatalogRestaurantDecrement(menuItem.id)}
+                        fallbackIcon={<Utensils className="w-4 h-4 text-[#FF6A00]" />}
+                      />
+                    ))}
+
+                  {category !== 'salon' &&
+                    category !== 'restaurant' &&
+                    (visibleCatalogItems as RetailProduct[]).map((product) => (
+                      <ItemCard
+                        key={product.id}
+                        title={product.name}
+                        subtitle={`${normalizeGroup(product.category)} · SKU ${product.sku}`}
+                        price={product.price}
+                        quantity={retailQtyById[product.id] || 0}
+                        disabled={product.isActive === false || product.stockQty <= 0}
+                        disabledReason={
+                          product.stockQty <= 0 ? 'Out of stock' : 'Product inactive'
+                        }
+                        onIncrement={() => handleCatalogRetailIncrement(product)}
+                        onDecrement={() => handleCatalogRetailDecrement(product.id)}
+                        fallbackIcon={<Package className="w-4 h-4 text-[#15803D]" />}
+                      />
+                    ))}
+                </div>
+              )}
+
+              {activeCartCount > 0 && (
+                <div className="pt-2 border-t border-[#E5E7EC] flex items-center justify-between gap-3">
+                  <span className="text-xs font-semibold text-[#2F3033] tabular-nums">
+                    {activeCartCount} item{activeCartCount === 1 ? '' : 's'} in cart
+                  </span>
+                  <Button size="sm" onClick={() => setActivePosView('billing')}>
+                    Go to Cart &amp; Print
+                  </Button>
+                </div>
+              )}
             </div>
           )}
 
-          {/* ============================================================================== */}
-          {/* VIEW 3: SECONDARY VIEW (APPOINTMENTS OR TABLES)                                */}
-          {/* ============================================================================== */}
+          {/* VIEW 3: SECONDARY (APPOINTMENTS / TABLES) */}
           {activePosView === 'secondary' && category === 'salon' && (
             <div className="space-y-3">
-              <h3 className="text-xs font-bold text-white">Today's Scheduled Appointments</h3>
-              <div className="space-y-2">
-                {appointments.map(apt => (
-                  <div key={apt.id} className="p-3 bg-[#161a33] border border-[#2a3055] rounded-xl flex items-center justify-between text-xs">
-                    <div>
-                      <p className="font-bold text-white">{apt.customerName} ({apt.customerPhone})</p>
-                      <p className="text-slate-400 text-[11px]">{apt.serviceName} • Stylist: {apt.stylistName}</p>
-                    </div>
-                    <div className="text-right">
-                      <span className="font-mono text-pink-400 font-semibold">{apt.appointmentTime}</span>
-                      <span className="block text-[10px] uppercase text-emerald-400 font-bold">{apt.status}</span>
-                    </div>
-                  </div>
-                ))}
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-bold text-[#2F3033] flex items-center gap-2">
+                  <Calendar className="w-4 h-4 text-[#FF1B7A]" />
+                  <span>Scheduled Appointments</span>
+                </h3>
+                <span className="text-xs text-[#6F737D] tabular-nums">
+                  {appointments.length} total
+                </span>
               </div>
+              {appointments.length === 0 ? (
+                <EmptyState
+                  icon={<Calendar className="w-5 h-5" />}
+                  title="No scheduled appointments"
+                  description="New salon appointments will appear here once synced."
+                />
+              ) : (
+                <div className="space-y-2.5">
+                  {appointments.map((apt) => (
+                    <div
+                      key={apt.id}
+                      className="p-3.5 bg-[#F9FAFC] border border-[#E5E7EC] rounded-2xl flex items-center justify-between gap-3 text-xs"
+                    >
+                      <div className="min-w-0">
+                        <p className="font-semibold text-[#2F3033] truncate">
+                          {apt.customerName} ({apt.customerPhone})
+                        </p>
+                        <p className="text-[#6F737D] mt-0.5 truncate">
+                          {apt.serviceName} · Stylist: {apt.stylistName}
+                        </p>
+                      </div>
+                      <div className="text-right shrink-0 space-y-1">
+                        <span className="font-mono text-[#FF1B7A] font-semibold block">
+                          {apt.appointmentTime}
+                        </span>
+                        <StatusBadge label={apt.status.toUpperCase()} tone="success" />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
           {activePosView === 'secondary' && category === 'restaurant' && (
             <div className="space-y-3">
-              <h3 className="text-xs font-bold text-white">Restaurant Seating & Tables</h3>
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-                {restaurantTables.map(tbl => (
-                  <div
-                    key={tbl.tableNumber}
-                    onClick={() => {
-                      setSelectedTable(tbl.tableNumber);
-                      setActivePosView('billing');
-                    }}
-                    className={`p-4 rounded-xl border cursor-pointer transition text-center ${
-                      selectedTable === tbl.tableNumber
-                        ? 'border-amber-500 bg-amber-500/10'
-                        : 'border-slate-800 bg-[#161a33] hover:border-slate-700'
-                    }`}
-                  >
-                    <p className="font-bold text-white text-sm">{tbl.tableNumber}</p>
-                    <p className="text-[11px] text-slate-400 mt-1">{tbl.capacity} Seats</p>
-                    <span className={`inline-block mt-2 px-2 py-0.5 rounded text-[10px] font-bold ${
-                      tbl.status === 'occupied' ? 'bg-rose-500/20 text-rose-300' : 'bg-emerald-500/20 text-emerald-300'
-                    }`}>
-                      {tbl.status.toUpperCase()}
-                    </span>
-                  </div>
-                ))}
-              </div>
+              <h3 className="text-sm font-bold text-[#2F3033]">Restaurant Seating &amp; Tables</h3>
+              {restaurantTables.length === 0 ? (
+                <EmptyState title="No table layout configured" />
+              ) : (
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                  {restaurantTables.map((tbl) => (
+                    <button
+                      key={tbl.tableNumber}
+                      type="button"
+                      onClick={() => {
+                        setSelectedTable(tbl.tableNumber);
+                        setActivePosView('billing');
+                      }}
+                      className={`p-4 rounded-2xl border text-center transition cursor-pointer ${
+                        selectedTable === tbl.tableNumber
+                          ? 'border-[#FF6A00] bg-[#FFF7ED]'
+                          : 'border-[#E5E7EC] bg-white hover:border-[#D3D7E0]'
+                      }`}
+                    >
+                      <p className="font-bold text-[#2F3033] text-sm">{tbl.tableNumber}</p>
+                      <p className="text-[11px] text-[#6F737D] mt-0.5">{tbl.capacity} Seats</p>
+                      <div className="mt-2">
+                        <StatusBadge
+                          label={tbl.status.toUpperCase()}
+                          tone={tbl.status === 'occupied' ? 'danger' : 'success'}
+                        />
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>
-      </div>
+      </Card>
 
-      {/* Right 5 Cols: Live ESC/POS Thermal Receipt Paper Simulation */}
+      {/* Right 5 Cols: Thermal Receipt & KOT Preview */}
       <div className="lg:col-span-5 space-y-4">
         {activeReceiptPreview ? (
-          <div className="bg-[#121629] border border-[#1e2540] rounded-2xl p-4 shadow-2xl">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
-              <span className="text-xs font-bold text-white flex items-center gap-1.5">
-                <Receipt className="w-4 h-4 text-emerald-400" />
-                ESC/POS Thermal Paper ({paperWidthMm}mm Roll)
+          <Card padding="md">
+            <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-[#E5E7EC]">
+              <span className="text-xs font-bold text-[#2F3033] flex items-center gap-1.5">
+                <Receipt className="w-4 h-4 text-[#15803D]" />
+                <span>Thermal Receipt Preview ({paperWidthMm}mm)</span>
               </span>
-              <button
-                onClick={() => setActiveReceiptPreview(null)}
-                className="text-xs text-slate-400 hover:text-white"
-              >
-                Clear
-              </button>
-            </div>
-
-            {/* Thermal Print Slip Mockup */}
-            <div className={`mx-auto my-4 bg-white text-slate-900 font-mono text-[11px] p-5 rounded shadow-xl ${
-              paperWidthMm === 58 ? 'max-w-[280px]' : 'max-w-[340px]'
-            }`}>
-              <div className="text-center pb-2 border-b border-dashed border-slate-400">
-                <p className="font-bold text-xs uppercase leading-tight">{activeReceiptPreview.outletName}</p>
-                <p className="text-[10px] text-slate-600 mt-0.5">{activeReceiptPreview.receiptHeader}</p>
-                <p className="text-[10px] text-slate-500 mt-1">Date: {activeReceiptPreview.timestamp}</p>
-                <p className="font-bold text-[10px]">No: {activeReceiptPreview.billNumber || activeReceiptPreview.orderNumber}</p>
-              </div>
-
-              <div className="py-2.5 border-b border-dashed border-slate-400 space-y-1">
-                {activeReceiptPreview.items?.map((it: any, i: number) => (
-                  <div key={i} className="flex justify-between">
-                    <span className="truncate pr-2">{it.quantity}x {it.name}</span>
-                    <span className="font-bold">₹{it.price * it.quantity}</span>
-                  </div>
-                ))}
-              </div>
-
-              <div className="py-2 space-y-0.5">
-                <div className="flex justify-between"><span>Subtotal:</span><span>₹{activeReceiptPreview.subtotal}</span></div>
-                {activeReceiptPreview.discount > 0 && (
-                  <div className="flex justify-between text-slate-600"><span>Discount:</span><span>-₹{activeReceiptPreview.discount}</span></div>
-                )}
-                <div className="flex justify-between"><span>GST:</span><span>₹{activeReceiptPreview.tax}</span></div>
-                <div className="flex justify-between font-bold text-xs pt-1.5 border-t border-slate-400">
-                  <span>TOTAL:</span>
-                  <span>₹{activeReceiptPreview.grandTotal}</span>
-                </div>
-              </div>
-
-              <div className="text-center pt-2 border-t border-dashed border-slate-400 text-[9px] text-slate-500">
-                <p>{activeReceiptPreview.receiptFooter}</p>
-                <p className="mt-1 font-bold text-[8px] uppercase">=== SMAV THERMAL AGENT ===</p>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="success"
+                  size="sm"
+                  onClick={openBrowserPrintDialog}
+                  disabled={isPrinterBusy}
+                  leftIcon={<Printer className="w-3.5 h-3.5" />}
+                >
+                  Print Copy
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setActiveReceiptPreview(null)}
+                >
+                  Clear
+                </Button>
               </div>
             </div>
-          </div>
+
+            <ThermalReceiptSlip receipt={activeReceiptPreview} paperWidthMm={paperWidthMm} />
+          </Card>
         ) : (
-          <div className="bg-[#121629] border border-[#1e2540] rounded-2xl p-8 text-center text-slate-400 shadow-xl space-y-3">
-            <Printer className="w-8 h-8 text-slate-500 mx-auto" />
-            <p className="text-xs font-semibold text-white">ESC/POS Thermal Receipt Simulation</p>
-            <p className="text-[11px] text-slate-500 leading-relaxed">
-              When an order or bill is placed, a simulated 80mm/58mm thermal print receipt will render here matching the native Android Bluetooth thermal output.
+          <Card padding="lg" className="text-center space-y-2.5">
+            <div className="w-11 h-11 rounded-2xl bg-[#F5F6FA] border border-[#E5E7EC] flex items-center justify-center mx-auto text-[#6F737D]">
+              <Printer className="w-5 h-5" />
+            </div>
+            <p className="text-sm font-bold text-[#2F3033]">
+              Thermal Receipt Preview ({paperWidthMm}mm)
             </p>
-          </div>
+            <p className="text-xs text-[#6F737D] leading-relaxed max-w-sm mx-auto">
+              When a bill is created, a {paperWidthMm}mm print-ready receipt renders here and opens the browser print dialog. Native Bluetooth ESC/POS printing runs in the Android app.
+            </p>
+          </Card>
         )}
 
-        {/* KOT Preview if Restaurant Order Placed */}
+        {/* Print-only Portal (PRESERVED IDENTICALLY) */}
+        {activeReceiptPreview &&
+          typeof document !== 'undefined' &&
+          createPortal(
+            <div
+              id="smav-print-portal"
+              className={paperWidthMm === 58 ? 'paper-58mm' : 'paper-80mm'}
+            >
+              <ThermalReceiptSlip
+                receipt={activeReceiptPreview}
+                paperWidthMm={paperWidthMm}
+                printOnly
+              />
+            </div>,
+            document.body
+          )}
+
         {activeKotPreview && (
-          <div className="bg-[#121629] border border-[#1e2540] rounded-2xl p-4 shadow-xl">
-            <span className="text-xs font-bold text-white flex items-center gap-1.5 mb-2">
-              <ChefHat className="w-4 h-4 text-amber-400" />
-              Kitchen Order Ticket (KOT - NO PRICES)
+          <Card padding="md">
+            <span className="text-xs font-bold text-[#2F3033] flex items-center gap-1.5 mb-3">
+              <ChefHat className="w-4 h-4 text-[#D97706]" />
+              <span>Kitchen Order Ticket (KOT - NO PRICES)</span>
             </span>
-            <div className="bg-amber-50 text-slate-900 font-mono text-[11px] p-4 rounded border border-amber-200">
+            <div className="bg-[#FFFBEB] text-[#111827] font-mono text-[11px] p-4 rounded-xl border border-[#FDE68A]">
               <p className="text-center font-bold text-xs">*** KITCHEN ORDER TICKET ***</p>
-              <p className="text-center text-[10px]">Token: #{activeKotPreview.tokenNumber} • {activeKotPreview.tableOrCounter}</p>
-              <div className="my-2 border-t border-dashed border-slate-400 pt-1 space-y-1">
+              <p className="text-center text-[10px]">
+                Token: #{activeKotPreview.tokenNumber} · {activeKotPreview.tableOrCounter}
+              </p>
+              <div className="my-2 border-t border-dashed border-[#9CA3AF] pt-1 space-y-1">
                 {activeKotPreview.items?.map((it: any, i: number) => (
                   <div key={i} className="flex justify-between font-bold">
-                    <span>{it.quantity}x {it.name}</span>
-                    <span className="text-[10px] text-slate-600">{it.variant}</span>
+                    <span>
+                      {it.quantity}x {it.name}
+                    </span>
+                    <span className="text-[10px] text-[#4B5563]">{it.variant}</span>
                   </div>
                 ))}
               </div>
-              <p className="text-center text-[9px] text-slate-500 pt-1 border-t border-dashed border-slate-400">
+              <p className="text-center text-[9px] text-[#6B7280] pt-1 border-t border-dashed border-[#9CA3AF]">
                 Time: {activeKotPreview.timestamp}
               </p>
             </div>
-          </div>
+          </Card>
         )}
       </div>
     </div>
   );
 };
+
+interface ThermalReceiptSlipProps {
+  receipt: any;
+  paperWidthMm: 58 | 80;
+  printOnly?: boolean;
+}
+
+const ThermalReceiptSlip: React.FC<ThermalReceiptSlipProps> = ({
+  receipt,
+  paperWidthMm,
+  printOnly = false,
+}) => (
+  <div
+    className={`bg-white text-[#111827] font-mono text-[11px] ${
+      printOnly
+        ? 'w-full p-2'
+        : `mx-auto mt-4 p-5 rounded-xl border border-[#E5E7EC] shadow-sm ${
+            paperWidthMm === 58 ? 'max-w-[280px]' : 'max-w-[340px]'
+          }`
+    }`}
+  >
+    <div className="text-center pb-2 border-b border-dashed border-[#9CA3AF] space-y-0.5">
+      <p className="font-bold text-xs uppercase leading-tight">{receipt.outletName}</p>
+      {receipt.receiptHeader && <p className="text-[10px] text-[#374151]">{receipt.receiptHeader}</p>}
+      {receipt.outletAddress && <p className="text-[10px] text-[#4B5563]">{receipt.outletAddress}</p>}
+      {receipt.outletPhone && <p className="text-[10px] text-[#4B5563]">Tel: {receipt.outletPhone}</p>}
+      {receipt.outletGstin && <p className="text-[10px] text-[#4B5563]">GSTIN: {receipt.outletGstin}</p>}
+      <p className="text-[10px] text-[#4B5563] pt-1">Date: {receipt.timestamp}</p>
+      <p className="font-bold text-[10px]">Bill No: {receipt.billNumber || receipt.orderNumber}</p>
+      {receipt.paymentMode && <p className="text-[10px] uppercase">Mode: {receipt.paymentMode}</p>}
+    </div>
+
+    {(receipt.customerName || receipt.customerPhone) && (
+      <div className="py-1.5 border-b border-dashed border-[#9CA3AF] text-[10px] space-y-0.5">
+        <div className="flex justify-between gap-2">
+          <span>Customer:</span>
+          <span className="font-semibold text-right">
+            {receipt.customerName || 'Walk-in Customer'}
+          </span>
+        </div>
+        {receipt.customerPhone && (
+          <div className="flex justify-between gap-2">
+            <span>Phone:</span>
+            <span className="text-right">{receipt.customerPhone}</span>
+          </div>
+        )}
+      </div>
+    )}
+
+    <div className="py-2.5 border-b border-dashed border-[#9CA3AF] space-y-1.5">
+      {receipt.items?.map((it: any, i: number) => (
+        <div key={i}>
+          <div className="flex justify-between gap-2">
+            <span className="truncate">
+              {it.quantity}x {it.name}
+            </span>
+            <span className="font-bold shrink-0">₹{it.price * it.quantity}</span>
+          </div>
+          {it.stylist && (
+            <p className="text-[10px] text-[#4B5563] pl-3">Stylist: {it.stylist}</p>
+          )}
+        </div>
+      ))}
+    </div>
+
+    <div className="py-2 space-y-0.5">
+      <div className="flex justify-between">
+        <span>Subtotal:</span>
+        <span>₹{receipt.subtotal}</span>
+      </div>
+      <div className="flex justify-between text-[#374151]">
+        <span>Discount:</span>
+        <span>-₹{receipt.discount ?? 0}</span>
+      </div>
+      <div className="flex justify-between">
+        <span>GST:</span>
+        <span>₹{receipt.tax}</span>
+      </div>
+      <div className="flex justify-between font-bold text-xs pt-1.5 border-t border-[#9CA3AF]">
+        <span>GRAND TOTAL:</span>
+        <span>₹{receipt.grandTotal}</span>
+      </div>
+    </div>
+
+    <div className="text-center pt-2 border-t border-dashed border-[#9CA3AF] text-[9px] text-[#4B5563]">
+      <p>{receipt.receiptFooter || 'Thank you! Visit us again.'}</p>
+    </div>
+  </div>
+);

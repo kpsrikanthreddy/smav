@@ -1,22 +1,7 @@
-import React, { useState, useEffect } from 'react';
-import {
-  Printer,
-  Eye,
-  EyeOff,
-  LogIn,
-  KeyRound,
-  AlertCircle,
-  CheckCircle2,
-  Database,
-  Settings2,
-  ShieldCheck,
-  RefreshCw,
-  Sparkles,
-  ExternalLink,
-  ChevronRight,
-  Terminal
-} from 'lucide-react';
-import { UserSession, UserOutletMembership } from '../types';
+import React, { useState } from 'react';
+import { AlertCircle, CheckCircle2, KeyRound, LogIn, Printer } from 'lucide-react';
+import { UserOutletMembership, UserSession } from '../types';
+import { BASE_INPUT_CLASS, Button, Card, FormField, PasswordField } from './ui';
 
 interface LoginScreenProps {
   onLoginSuccess: (session: UserSession, redirectTo?: string) => void;
@@ -25,30 +10,14 @@ interface LoginScreenProps {
 
 export const LoginScreen: React.FC<LoginScreenProps> = ({
   onLoginSuccess,
-  onMultiBusinessFound
+  onMultiBusinessFound,
 }) => {
   const [emailOrId, setEmailOrId] = useState('');
   const [password, setPassword] = useState('');
   const [outletCode, setOutletCode] = useState('');
-  const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [errorDetails, setErrorDetails] = useState<string | null>(null);
-
-  // Central Supabase Connection Status
-  const [supabaseStatus, setSupabaseStatus] = useState<any>(null);
-  const [isConfigModalOpen, setIsConfigModalOpen] = useState(false);
-  const [projectUrlInput, setProjectUrlInput] = useState('');
-  const [publishableKeyInput, setPublishableKeyInput] = useState('');
-  const [configSaving, setConfigSaving] = useState(false);
-  const [configMessage, setConfigMessage] = useState<string | null>(null);
-
-  // Verification Testing Modal Tab
-  const [activeConfigTab, setActiveConfigTab] = useState<'status' | 'verify' | 'settings'>('status');
-  const [verifyEmail, setVerifyEmail] = useState('');
-  const [verifyPassword, setVerifyPassword] = useState('');
-  const [verifyLoading, setVerifyLoading] = useState(false);
-  const [verifyResult, setVerifyResult] = useState<any>(null);
 
   // Forgot Password Modal State
   const [isForgotModalOpen, setIsForgotModalOpen] = useState(false);
@@ -70,23 +39,6 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   const [firstLoginNewPassword, setFirstLoginNewPassword] = useState('');
   const [firstLoginConfirmPassword, setFirstLoginConfirmPassword] = useState('');
 
-  const fetchSupabaseStatus = async () => {
-    try {
-      const res = await fetch('/api/central-supabase/status');
-      if (res.ok) {
-        const data = await res.json();
-        setSupabaseStatus(data);
-        if (data.fullUrl && !projectUrlInput) {
-          setProjectUrlInput(data.fullUrl);
-        }
-      }
-    } catch (_e) {}
-  };
-
-  useEffect(() => {
-    fetchSupabaseStatus();
-  }, []);
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!emailOrId.trim() || !password.trim()) {
@@ -107,8 +59,8 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           emailOrId: emailOrId.trim(),
           password: password.trim(),
           outletCode: outletCode.trim() || undefined,
-          device_id: 'SMAV-POS-' + Math.random().toString(36).substring(2, 8).toUpperCase()
-        })
+          device_id: 'SMAV-POS-' + Math.random().toString(36).substring(2, 8).toUpperCase(),
+        }),
       });
 
       const data = await res.json();
@@ -118,7 +70,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           setPasswordChangeState({
             token: data.passwordChangeToken,
             email: data.email || emailOrId.trim(),
-            outletCode: outletCode.trim() || undefined
+            outletCode: outletCode.trim() || undefined,
           });
           setFirstLoginNewPassword('');
           setFirstLoginConfirmPassword('');
@@ -127,7 +79,9 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           return;
         }
         if (data.requiresPasswordReset) {
-          setErrorMessage('Security notice: Your account requires a password reset to migrate to central auth. Click Forgot Password below.');
+          setErrorMessage(
+            'Security notice: Your account requires a password reset to migrate to central auth. Click Reset your credentials below.'
+          );
         } else {
           setErrorMessage(data.message || 'Invalid credentials. Please verify your details.');
         }
@@ -139,7 +93,11 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       }
 
       if (data.multiBusiness && data.availableOutlets) {
-        onMultiBusinessFound(data.availableOutlets, data.tempToken || '', data.userId || data.session?.userId || '');
+        onMultiBusinessFound(
+          data.availableOutlets,
+          data.tempToken || '',
+          data.userId || data.session?.userId || ''
+        );
         setIsLoading(false);
         return;
       }
@@ -177,8 +135,8 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           passwordChangeToken: passwordChangeState.token,
           newPassword: firstLoginNewPassword,
           outletCode: passwordChangeState.outletCode,
-          device_id: 'SMAV-POS-' + Math.random().toString(36).substring(2, 8).toUpperCase()
-        })
+          device_id: 'SMAV-POS-' + Math.random().toString(36).substring(2, 8).toUpperCase(),
+        }),
       });
 
       const data = await res.json();
@@ -193,7 +151,11 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       setFirstLoginConfirmPassword('');
 
       if (data.multiBusiness && data.availableOutlets) {
-        onMultiBusinessFound(data.availableOutlets, data.tempToken || '', data.userId || data.session?.userId || '');
+        onMultiBusinessFound(
+          data.availableOutlets,
+          data.tempToken || '',
+          data.userId || data.session?.userId || ''
+        );
         return;
       }
 
@@ -204,69 +166,6 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       setErrorMessage(err.message || 'Network connection error. Please try again.');
     } finally {
       setIsLoading(false);
-    }
-  };
-
-  const handleSaveSupabaseConfig = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!projectUrlInput.trim() || !publishableKeyInput.trim()) {
-      setConfigMessage('Both Project URL and Publishable Anon Key are required.');
-      return;
-    }
-
-    setConfigSaving(true);
-    setConfigMessage(null);
-
-    try {
-      const res = await fetch('/api/central-supabase/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          projectUrl: projectUrlInput.trim(),
-          publishableKey: publishableKeyInput.trim()
-        })
-      });
-      const data = await res.json();
-      if (data.success) {
-        setConfigMessage('Central Supabase connected & saved successfully!');
-        fetchSupabaseStatus();
-      } else {
-        setConfigMessage(data.message || 'Failed to update configuration.');
-      }
-    } catch (err: any) {
-      setConfigMessage(err.message || 'Error updating configuration.');
-    } finally {
-      setConfigSaving(false);
-    }
-  };
-
-  const handleRunRealLoginVerification = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!verifyEmail.trim() || !verifyPassword.trim()) return;
-
-    setVerifyLoading(true);
-    setVerifyResult(null);
-
-    try {
-      const res = await fetch('/api/central-supabase/verify-login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: verifyEmail.trim(),
-          password: verifyPassword.trim()
-        })
-      });
-
-      const data = await res.json();
-      setVerifyResult(data);
-      fetchSupabaseStatus();
-    } catch (err: any) {
-      setVerifyResult({
-        success: false,
-        message: err.message || 'Network error running verification'
-      });
-    } finally {
-      setVerifyLoading(false);
     }
   };
 
@@ -286,8 +185,8 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           email: forgotEmail.trim(),
-          outletCode: forgotOutletCode.trim() || undefined
-        })
+          outletCode: forgotOutletCode.trim() || undefined,
+        }),
       });
 
       const data = await res.json();
@@ -329,8 +228,8 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           resetToken,
-          newPassword: newPassword.trim()
-        })
+          newPassword: newPassword.trim(),
+        }),
       });
 
       const data = await res.json();
@@ -354,35 +253,28 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   };
 
   return (
-    <div className="min-h-screen w-full bg-[#0d1021] flex flex-col items-center justify-center p-4 sm:p-6 text-slate-100 font-sans selection:bg-pink-500 selection:text-white relative">
-      {/* Background Ambience */}
-      <div className="absolute inset-0 bg-radial from-[#1e1b4b]/20 via-[#0d1021] to-[#0d1021] pointer-events-none" />
-
-      {/* Main Centered Login Card */}
-      <div className="w-full max-w-[440px] bg-[#121629] border border-[#1e2540] rounded-[24px] shadow-2xl p-7 sm:p-9 relative z-10">
-        {/* Top Header / Branding */}
-        <div className="flex flex-col items-center text-center mb-7">
-          {/* Centered Printer Icon inside rounded squircle */}
-          <div className="w-14 h-14 rounded-2xl bg-[#1b2038] border border-[#2d365e] flex items-center justify-center mb-4 shadow-inner">
-            <Printer className="w-7 h-7 text-[#ff3b80]" strokeWidth={2.2} />
+    <div className="min-h-screen w-full bg-[#F5F6FA] flex items-center justify-center p-4 sm:p-6 text-[#2F3033] font-sans safe-bottom">
+      <Card padding="lg" className="w-full max-w-[420px] shadow-[0_8px_28px_rgba(16,24,40,0.06)]">
+        {/* Compact Brand Header */}
+        <div className="flex flex-col items-center text-center mb-5">
+          <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-[#FF1B7A] via-[#FF6A00] to-[#FFA500] flex items-center justify-center mb-3 shadow-sm">
+            <Printer className="w-6 h-6 text-white" strokeWidth={2.2} />
           </div>
-
-          <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-white">
-            SMAV Print Agent
-          </h1>
-          <p className="text-xs text-slate-400 mt-1">
-            Secure Enterprise Authentication Gateway
-          </p>
+          <h1 className="text-xl font-bold tracking-tight text-[#2F3033]">SMAV Print Agent</h1>
+          <p className="text-xs text-[#6F737D] mt-0.5">Secure Enterprise Authentication Gateway</p>
         </div>
 
-        {/* Error Alert Display */}
+        {/* Inline Error Display */}
         {errorMessage && (
-          <div className="mb-5 p-3.5 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-200 text-xs flex items-start gap-2.5 animate-fadeIn">
-            <AlertCircle className="w-4 h-4 shrink-0 text-rose-400 mt-0.5" />
-            <div className="flex-1">
-              <p className="font-medium">{errorMessage}</p>
+          <div
+            role="alert"
+            className="mb-4 p-3 rounded-xl bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] text-xs flex items-start gap-2"
+          >
+            <AlertCircle className="w-4 h-4 shrink-0 text-[#DC2626] mt-0.5" />
+            <div className="flex-1 min-w-0">
+              <p className="font-medium leading-snug">{errorMessage}</p>
               {errorDetails && (
-                <pre className="mt-2 text-[10px] bg-black/40 p-2 rounded overflow-x-auto text-rose-300 font-mono">
+                <pre className="mt-2 text-[10px] bg-white border border-[#FECACA] p-2 rounded-lg overflow-x-auto text-[#7F1D1D] font-mono">
                   {errorDetails}
                 </pre>
               )}
@@ -390,87 +282,69 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           </div>
         )}
 
-        {/* Forced First-Login Password Change OR Standard Login Form */}
         {passwordChangeState ? (
-          <form onSubmit={handleCompleteFirstLoginPassword} className="space-y-4">
-            <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs space-y-1">
-              <div className="font-bold flex items-center gap-1.5 text-amber-300">
+          <form onSubmit={handleCompleteFirstLoginPassword} className="space-y-3.5">
+            <div className="p-3 rounded-xl bg-[#FFFBEB] border border-[#FDE68A] text-[#92400E] text-xs space-y-1">
+              <div className="font-bold flex items-center gap-1.5 text-[#B45309]">
                 <KeyRound className="w-4 h-4" />
-                Password Change Required
+                <span>Password Change Required</span>
               </div>
               <p className="leading-relaxed">
-                Signed in with an admin-assigned temporary password for <span className="font-mono text-white">{passwordChangeState.email}</span>. Choose a personal password to continue.
+                Signed in with a temporary password for{' '}
+                <span className="font-mono font-semibold text-[#2F3033]">{passwordChangeState.email}</span>. Choose a personal password to continue.
               </p>
             </div>
 
-            <div>
-              <label className="text-xs font-semibold text-slate-300 mb-1.5 block">
-                New Personal Password (min. 8 characters)
-              </label>
-              <input
-                type="password"
-                value={firstLoginNewPassword}
-                onChange={(e) => setFirstLoginNewPassword(e.target.value)}
-                placeholder="Enter new password"
-                minLength={8}
-                required
-                autoFocus
-                className="w-full rounded-xl bg-[#161a33]/90 border border-[#2a3055] text-white placeholder-slate-500 px-4 py-3 text-sm focus:outline-none focus:border-[#ff3b80] focus:ring-1 focus:ring-[#ff3b80]/40 transition"
-              />
-            </div>
+            <PasswordField
+              id="first-login-new-password"
+              label="New Personal Password (min. 8 characters)"
+              value={firstLoginNewPassword}
+              onChange={(e) => setFirstLoginNewPassword(e.target.value)}
+              placeholder="Enter new password"
+              minLength={8}
+              required
+              autoFocus
+            />
 
-            <div>
-              <label className="text-xs font-semibold text-slate-300 mb-1.5 block">
-                Confirm New Password
-              </label>
-              <input
-                type="password"
-                value={firstLoginConfirmPassword}
-                onChange={(e) => setFirstLoginConfirmPassword(e.target.value)}
-                placeholder="Re-enter new password"
-                minLength={8}
-                required
-                className="w-full rounded-xl bg-[#161a33]/90 border border-[#2a3055] text-white placeholder-slate-500 px-4 py-3 text-sm focus:outline-none focus:border-[#ff3b80] focus:ring-1 focus:ring-[#ff3b80]/40 transition"
-              />
-            </div>
+            <PasswordField
+              id="first-login-confirm-password"
+              label="Confirm New Password"
+              value={firstLoginConfirmPassword}
+              onChange={(e) => setFirstLoginConfirmPassword(e.target.value)}
+              placeholder="Re-enter new password"
+              minLength={8}
+              required
+            />
 
-            <div className="pt-2 space-y-2">
-              <div className="p-[2px] rounded-xl bg-gradient-to-r from-[#ff1b7a] via-[#ff6a00] to-[#ffa500] shadow-lg shadow-pink-500/10">
-                <button
-                  type="submit"
-                  disabled={isLoading}
-                  className="w-full bg-[#242938] hover:bg-[#2c3245] disabled:opacity-70 text-white font-semibold py-3 px-4 rounded-[10px] text-sm flex items-center justify-center gap-2 transition duration-200"
-                >
-                  {isLoading ? (
-                    <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                  ) : (
-                    <>
-                      <KeyRound className="w-4 h-4 text-white" />
-                      <span>Set Password &amp; Sign In</span>
-                    </>
-                  )}
-                </button>
-              </div>
-              <button
+            <div className="pt-1 space-y-2">
+              <Button
+                type="submit"
+                fullWidth
+                size="lg"
+                loading={isLoading}
+                leftIcon={<KeyRound className="w-4 h-4" />}
+              >
+                Set Password &amp; Sign In
+              </Button>
+              <Button
                 type="button"
+                variant="ghost"
+                fullWidth
+                size="sm"
                 onClick={() => {
                   setPasswordChangeState(null);
                   setErrorMessage(null);
                 }}
-                className="w-full py-2 text-xs text-slate-400 hover:text-white transition"
               >
                 Back to Sign In
-              </button>
+              </Button>
             </div>
           </form>
         ) : (
-          <form onSubmit={handleSubmit} className="space-y-4">
-            {/* Field 1: Email Address or Username */}
-            <div>
-              <label className="text-xs font-semibold text-slate-300 mb-1.5 block">
-                Email Address or Username
-              </label>
+          <form onSubmit={handleSubmit} className="space-y-3.5">
+            <FormField label="Email Address or Username" htmlFor="login-email-or-id" required>
               <input
+                id="login-email-or-id"
                 type="text"
                 value={emailOrId}
                 onChange={(e) => setEmailOrId(e.target.value)}
@@ -478,77 +352,51 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                 autoComplete="username"
                 required
                 autoFocus
-                className="w-full rounded-xl bg-[#161a33]/90 border border-[#2a3055] text-white placeholder-slate-500 px-4 py-3 text-sm focus:outline-none focus:border-[#ff3b80] focus:ring-1 focus:ring-[#ff3b80]/40 transition"
+                className={BASE_INPUT_CLASS}
               />
-            </div>
+            </FormField>
 
-            {/* Field 2: Password / PIN with show/hide control */}
-            <div>
-              <label className="text-xs font-semibold text-slate-300 mb-1.5 block">
-                Password / PIN
-              </label>
-              <div className="relative">
-                <input
-                  type={showPassword ? 'text' : 'password'}
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Enter password"
-                  required
-                  className="w-full rounded-xl bg-[#161a33]/90 border border-[#2a3055] text-white placeholder-slate-500 px-4 py-3 pr-11 text-sm focus:outline-none focus:border-[#ff3b80] focus:ring-1 focus:ring-[#ff3b80]/40 transition"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPassword(!showPassword)}
-                  className="absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white transition p-1"
-                  aria-label={showPassword ? 'Hide password' : 'Show password'}
-                >
-                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                </button>
-              </div>
-            </div>
+            <PasswordField
+              id="login-password"
+              label="Password / PIN"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="Enter password"
+              autoComplete="current-password"
+              required
+            />
 
-            {/* Field 3: Outlet Code (optional) */}
-            <div>
-              <label className="text-xs font-semibold text-slate-300 mb-1.5 block">
-                Outlet Code (optional)
-              </label>
+            <FormField
+              label="Outlet Code (optional)"
+              htmlFor="login-outlet-code"
+              hint="Used to identify an outlet's authentication provider when required."
+            >
               <input
+                id="login-outlet-code"
                 type="text"
                 value={outletCode}
                 onChange={(e) => setOutletCode(e.target.value)}
                 placeholder="e.g. mozz, glossylooks"
-                className="w-full rounded-xl bg-[#161a33]/90 border border-[#2a3055] text-white placeholder-slate-500 px-4 py-3 text-sm focus:outline-none focus:border-[#ff3b80] focus:ring-1 focus:ring-[#ff3b80]/40 transition font-mono"
+                className={`${BASE_INPUT_CLASS} font-mono`}
               />
-              <p className="text-[11px] text-slate-400 mt-1.5">
-                Used to identify an outlet's authentication provider when required.
-              </p>
-            </div>
+            </FormField>
 
-            {/* Pink-to-Orange Gradient Button */}
-            <div className="pt-2">
-              <div className="p-[2px] rounded-xl bg-gradient-to-r from-[#ff1b7a] via-[#ff6a00] to-[#ffa500] shadow-lg shadow-pink-500/10">
-                <button
-                  type="submit"
-                  disabled={isLoading}
-                  className="w-full bg-[#242938] hover:bg-[#2c3245] disabled:opacity-70 text-white font-semibold py-3 px-4 rounded-[10px] text-sm flex items-center justify-center gap-2 transition duration-200"
-                >
-                  {isLoading ? (
-                    <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                  ) : (
-                    <>
-                      <LogIn className="w-4 h-4 text-white" />
-                      <span>Sign In</span>
-                    </>
-                  )}
-                </button>
-              </div>
+            <div className="pt-1">
+              <Button
+                type="submit"
+                fullWidth
+                size="lg"
+                loading={isLoading}
+                leftIcon={<LogIn className="w-4 h-4" />}
+              >
+                Sign In
+              </Button>
             </div>
           </form>
         )}
 
-        {/* Footer Links & Forgot Password */}
-        <div className="mt-6 text-center space-y-2">
-          <p className="text-xs text-slate-400">
+        <div className="mt-4 pt-3.5 border-t border-[#F0F1F5] text-center">
+          <p className="text-xs text-[#6F737D]">
             Forgot Password?{' '}
             <button
               type="button"
@@ -557,361 +405,119 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                 setForgotMessage(null);
                 setForgotSuccess(false);
               }}
-              className="text-[#ff3b80] hover:text-[#ff6a00] font-medium underline underline-offset-2 transition"
+              className="text-[#FF1B7A] hover:text-[#FF6A00] font-semibold underline underline-offset-2 transition cursor-pointer"
             >
               Reset your credentials
-            </button>{' '}
-            or contact your outlet administrator.
+            </button>
           </p>
         </div>
-      </div>
-
-      {/* Central Supabase Gateway Connection & Verification Modal */}
-      {isConfigModalOpen && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-[#121629] border border-[#1e2540] rounded-2xl p-6 max-w-xl w-full shadow-2xl space-y-5 max-h-[90vh] overflow-y-auto">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
-              <div className="flex items-center gap-2">
-                <Database className="w-5 h-5 text-[#ff3b80]" />
-                <h3 className="text-base font-bold text-white">Central SMAV Supabase Gateway</h3>
-              </div>
-              <button
-                onClick={() => setIsConfigModalOpen(false)}
-                className="text-slate-400 hover:text-white text-xs px-2 py-1 rounded"
-              >
-                ✕
-              </button>
-            </div>
-
-            {/* Navigation Tabs */}
-            <div className="flex items-center gap-2 border-b border-slate-800/80 pb-2 text-xs">
-              <button
-                type="button"
-                onClick={() => setActiveConfigTab('status')}
-                className={`px-3 py-1.5 rounded-lg font-medium transition ${activeConfigTab === 'status' ? 'bg-[#ff3b80]/20 text-[#ff3b80] border border-[#ff3b80]/30' : 'text-slate-400 hover:text-white'}`}
-              >
-                Project Status & Tables
-              </button>
-              <button
-                type="button"
-                onClick={() => setActiveConfigTab('verify')}
-                className={`px-3 py-1.5 rounded-lg font-medium transition ${activeConfigTab === 'verify' ? 'bg-[#ff3b80]/20 text-[#ff3b80] border border-[#ff3b80]/30' : 'text-slate-400 hover:text-white'}`}
-              >
-                Verify Real Superadmin Login
-              </button>
-              <button
-                type="button"
-                onClick={() => setActiveConfigTab('settings')}
-                className={`px-3 py-1.5 rounded-lg font-medium transition ${activeConfigTab === 'settings' ? 'bg-[#ff3b80]/20 text-[#ff3b80] border border-[#ff3b80]/30' : 'text-slate-400 hover:text-white'}`}
-              >
-                Environment Settings
-              </button>
-            </div>
-
-            {/* Tab 1: Project Status & Tables */}
-            {activeConfigTab === 'status' && (
-              <div className="space-y-4">
-                <div className="p-3.5 rounded-xl bg-[#161a33] border border-[#2a3055] space-y-2 text-xs">
-                  <div className="flex items-center justify-between">
-                    <span className="text-slate-400">Gateway Status:</span>
-                    <span className={`font-semibold ${supabaseStatus?.isConfigured ? 'text-emerald-400' : 'text-amber-400'}`}>
-                      {supabaseStatus?.isConfigured ? 'CONNECTED & AUTHORITATIVE' : 'CONFIG REQUIRED'}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-slate-400">Project URL:</span>
-                    <span className="font-mono text-slate-200">{supabaseStatus?.projectUrl || 'Not configured'}</span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-slate-400">Publishable Key:</span>
-                    <span className="font-mono text-slate-200">{supabaseStatus?.publishableKeyPreview || 'None'}</span>
-                  </div>
-                </div>
-
-                {/* Table Schema Check */}
-                <div>
-                  <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">
-                    Authoritative Database Schemas
-                  </h4>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
-                    {[
-                      { name: 'public.smav_outlets', desc: 'Central outlet registry' },
-                      { name: 'public.smav_profiles', desc: 'Superadmin & user profiles (RLS)' },
-                      { name: 'public.smav_user_outlet_roles', desc: 'Tenant membership & roles' },
-                      { name: 'public.smav_devices', desc: 'Authorized hardware devices' },
-                      { name: 'public.smav_audit_logs', desc: 'Security audit trail' }
-                    ].map((tbl) => (
-                      <div key={tbl.name} className="p-2.5 rounded-xl bg-[#161a33]/60 border border-[#232947] flex items-center justify-between">
-                        <div>
-                          <div className="font-mono font-medium text-slate-200">{tbl.name}</div>
-                          <div className="text-[10px] text-slate-400">{tbl.desc}</div>
-                        </div>
-                        <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="p-3 rounded-xl bg-sky-500/10 border border-sky-500/20 text-sky-200 text-xs">
-                  <p className="leading-relaxed">
-                    <strong>RLS Policy:</strong> Users can read strictly their own profile via <code>auth.uid() = id</code>. Superadmin platform role is verified server-side.
-                  </p>
-                </div>
-              </div>
-            )}
-
-            {/* Tab 2: Verify Real Superadmin Login (Requirement 13) */}
-            {activeConfigTab === 'verify' && (
-              <div className="space-y-4">
-                <p className="text-xs text-slate-400 leading-relaxed">
-                  Test your real Superadmin credentials against the central Supabase Auth and <code>public.smav_profiles</code> table.
-                </p>
-
-                <form onSubmit={handleRunRealLoginVerification} className="space-y-3">
-                  <div>
-                    <label className="text-xs font-semibold text-slate-300 mb-1 block">Superadmin Email</label>
-                    <input
-                      type="email"
-                      value={verifyEmail}
-                      onChange={(e) => setVerifyEmail(e.target.value)}
-                      placeholder="name@company.com"
-                      required
-                      className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2.5 text-xs focus:outline-none focus:border-pink-500"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="text-xs font-semibold text-slate-300 mb-1 block">Superadmin Password</label>
-                    <input
-                      type="password"
-                      value={verifyPassword}
-                      onChange={(e) => setVerifyPassword(e.target.value)}
-                      placeholder="Enter password"
-                      required
-                      className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2.5 text-xs focus:outline-none focus:border-pink-500"
-                    />
-                  </div>
-
-                  <div className="pt-2 flex items-center justify-end">
-                    <button
-                      type="submit"
-                      disabled={verifyLoading}
-                      className="px-4 py-2 text-xs font-semibold rounded-xl bg-gradient-to-r from-pink-500 to-amber-500 text-white flex items-center gap-1.5 shadow"
-                    >
-                      {verifyLoading ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
-                      <span>Verify Real Supabase Login</span>
-                    </button>
-                  </div>
-                </form>
-
-                {verifyResult && (
-                  <div className={`p-3.5 rounded-xl text-xs space-y-2 border ${verifyResult.success ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200' : 'bg-rose-500/10 border-rose-500/30 text-rose-200'}`}>
-                    <div className="flex items-center gap-2 font-semibold">
-                      {verifyResult.success ? <CheckCircle2 className="w-4 h-4 text-emerald-400" /> : <AlertCircle className="w-4 h-4 text-rose-400" />}
-                      <span>{verifyResult.message}</span>
-                    </div>
-
-                    {verifyResult.diagnostics && (
-                      <div className="space-y-1 font-mono text-[11px] pt-1">
-                        <div>Step 1 (Supabase Auth signInWithPassword): {verifyResult.diagnostics.step1_auth?.status || 'SKIPPED'}</div>
-                        <div>Step 2 (RLS Profile smav_profiles): {verifyResult.diagnostics.step2_profile?.status || 'SKIPPED'}</div>
-                        <div>Step 3 (platform_role = SUPERADMIN): {verifyResult.diagnostics.step3_role_check?.status || 'SKIPPED'}</div>
-                        <div>Step 4 (is_active = true): {verifyResult.diagnostics.step4_active_check?.status || 'SKIPPED'}</div>
-                        <div>Step 5 (Redirect to /superadmin/outlets): {verifyResult.diagnostics.step5_redirection?.status || 'SKIPPED'}</div>
-                      </div>
-                    )}
-
-                    {verifyResult.success && verifyResult.session && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setIsConfigModalOpen(false);
-                          onLoginSuccess(verifyResult.session, verifyResult.redirectTo);
-                        }}
-                        className="mt-2 w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg text-xs transition flex items-center justify-center gap-1.5"
-                      >
-                        <span>Launch Superadmin Dashboard</span>
-                        <ChevronRight className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Tab 3: Environment Settings */}
-            {activeConfigTab === 'settings' && (
-              <form onSubmit={handleSaveSupabaseConfig} className="space-y-4">
-                <p className="text-xs text-slate-400 leading-relaxed">
-                  Configure the central Supabase project URL and publishable key (never use the secret service-role key).
-                </p>
-
-                {configMessage && (
-                  <div className="p-3 rounded-xl bg-pink-500/15 border border-pink-500/30 text-pink-200 text-xs">
-                    {configMessage}
-                  </div>
-                )}
-
-                <div>
-                  <label className="text-xs font-semibold text-slate-300 mb-1 block">
-                    Central Supabase Project URL (SMAV_SUPABASE_URL)
-                  </label>
-                  <input
-                    type="url"
-                    value={projectUrlInput}
-                    onChange={(e) => setProjectUrlInput(e.target.value)}
-                    placeholder="https://your-project-id.supabase.co"
-                    required
-                    className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2.5 text-xs font-mono focus:outline-none focus:border-pink-500"
-                  />
-                </div>
-
-                <div>
-                  <label className="text-xs font-semibold text-slate-300 mb-1 block">
-                    Central Supabase Publishable Key (SMAV_SUPABASE_ANON_KEY)
-                  </label>
-                  <input
-                    type="password"
-                    value={publishableKeyInput}
-                    onChange={(e) => setPublishableKeyInput(e.target.value)}
-                    placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-                    required
-                    className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2.5 text-xs font-mono focus:outline-none focus:border-pink-500"
-                  />
-                  <p className="text-[11px] text-slate-400 mt-1">
-                    Safe publishable anon key. Server-side proxy enforces Superadmin privileges.
-                  </p>
-                </div>
-
-                <div className="pt-2 flex items-center justify-end gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setIsConfigModalOpen(false)}
-                    className="px-4 py-2 text-xs text-slate-400 hover:text-white"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="submit"
-                    disabled={configSaving}
-                    className="px-4 py-2 text-xs font-semibold rounded-xl bg-gradient-to-r from-pink-500 to-amber-500 text-white shadow"
-                  >
-                    {configSaving ? 'Saving...' : 'Save & Verify Connection'}
-                  </button>
-                </div>
-              </form>
-            )}
-          </div>
-        </div>
-      )}
+      </Card>
 
       {/* Forgot Password / Secure Reset Modal */}
       {isForgotModalOpen && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-[#121629] border border-[#1e2540] rounded-2xl p-6 max-w-md w-full shadow-2xl space-y-4">
-            <div className="flex items-center justify-between pb-2 border-b border-slate-800">
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 bg-[#111827]/45 backdrop-blur-[2px] flex items-center justify-center p-4"
+        >
+          <Card padding="lg" className="max-w-md w-full shadow-xl space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-[#E5E7EC]">
               <div className="flex items-center gap-2">
-                <KeyRound className="w-5 h-5 text-[#ff3b80]" />
-                <h3 className="text-base font-bold text-white">Reset Account Password</h3>
+                <KeyRound className="w-4 h-4 text-[#FF1B7A]" />
+                <h3 className="text-base font-bold text-[#2F3033]">Reset Account Password</h3>
               </div>
               <button
+                type="button"
                 onClick={() => setIsForgotModalOpen(false)}
-                className="text-slate-400 hover:text-white text-xs px-2 py-1 rounded"
+                aria-label="Close password reset dialog"
+                className="w-8 h-8 rounded-lg flex items-center justify-center text-[#6F737D] hover:text-[#2F3033] hover:bg-[#F5F6FA] transition cursor-pointer"
               >
                 ✕
               </button>
             </div>
 
             {forgotMessage && (
-              <div className={`p-3 rounded-xl text-xs flex items-start gap-2 ${
-                forgotSuccess
-                  ? 'bg-emerald-500/15 border border-emerald-500/30 text-emerald-300'
-                  : 'bg-sky-500/15 border border-sky-500/30 text-sky-200'
-              }`}>
-                {forgotSuccess ? <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-400 mt-0.5" /> : <AlertCircle className="w-4 h-4 shrink-0 text-sky-400 mt-0.5" />}
-                <p>{forgotMessage}</p>
+              <div
+                className={`p-3 rounded-xl text-xs flex items-start gap-2 border ${
+                  forgotSuccess
+                    ? 'bg-[#ECFDF5] border-[#BBF7D0] text-[#15803D]'
+                    : 'bg-[#EFF6FF] border-[#BFDBFE] text-[#1D4ED8]'
+                }`}
+              >
+                {forgotSuccess ? (
+                  <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" />
+                ) : (
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                )}
+                <p className="leading-relaxed">{forgotMessage}</p>
               </div>
             )}
 
             {forgotStep === 'request' ? (
               <form onSubmit={handleRequestReset} className="space-y-3.5">
-                <p className="text-xs text-slate-400 leading-relaxed">
-                  Enter your registered email address. The central SMAV authentication gateway will generate a secure time-limited token.
+                <p className="text-xs text-[#6F737D] leading-relaxed">
+                  Enter your registered email address. The central SMAV authentication gateway will issue a reset flow or generate a time-limited token.
                 </p>
-                <div>
-                  <label className="text-xs font-semibold text-slate-300 mb-1 block">Registered Email</label>
+                <FormField label="Registered Email" htmlFor="forgot-email" required>
                   <input
+                    id="forgot-email"
                     type="email"
                     value={forgotEmail}
                     onChange={(e) => setForgotEmail(e.target.value)}
                     placeholder="name@company.com"
                     required
-                    className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2.5 text-xs focus:outline-none focus:border-pink-500"
+                    className={BASE_INPUT_CLASS}
                   />
-                </div>
-                <div>
-                  <label className="text-xs font-semibold text-slate-300 mb-1 block">Outlet Code (optional)</label>
+                </FormField>
+                <FormField label="Outlet Code (optional)" htmlFor="forgot-outlet-code">
                   <input
+                    id="forgot-outlet-code"
                     type="text"
                     value={forgotOutletCode}
                     onChange={(e) => setForgotOutletCode(e.target.value)}
                     placeholder="e.g. glossylooks, mozz"
-                    className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2.5 text-xs focus:outline-none focus:border-pink-500"
+                    className={`${BASE_INPUT_CLASS} font-mono`}
                   />
-                </div>
-                <div className="pt-2 flex items-center justify-end gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setIsForgotModalOpen(false)}
-                    className="px-4 py-2 text-xs text-slate-400 hover:text-white"
-                  >
+                </FormField>
+                <div className="pt-1 flex items-center justify-end gap-2">
+                  <Button variant="outline" size="sm" onClick={() => setIsForgotModalOpen(false)}>
                     Cancel
-                  </button>
-                  <button
-                    type="submit"
-                    disabled={forgotLoading}
-                    className="px-4 py-2 text-xs font-semibold rounded-xl bg-gradient-to-r from-pink-500 to-amber-500 text-white shadow"
-                  >
-                    {forgotLoading ? 'Processing...' : 'Request Reset Token'}
-                  </button>
+                  </Button>
+                  <Button type="submit" size="sm" loading={forgotLoading}>
+                    Request Reset
+                  </Button>
                 </div>
               </form>
             ) : (
               <form onSubmit={handleConfirmReset} className="space-y-3.5">
-                <p className="text-xs text-slate-400 leading-relaxed">
-                  Set a new password for your account. This will update your credentials across authorized SMAV outlets.
+                <p className="text-xs text-[#6F737D] leading-relaxed">
+                  Set a new password for your account across authorized SMAV outlets.
                 </p>
-                <div>
-                  <label className="text-xs font-semibold text-slate-300 mb-1 block">New Password</label>
-                  <input
-                    type="password"
-                    value={newPassword}
-                    onChange={(e) => setNewPassword(e.target.value)}
-                    placeholder="Enter at least 6 characters"
-                    required
-                    minLength={6}
-                    className="w-full rounded-xl bg-[#161a33] border border-[#2a3055] text-white px-3.5 py-2.5 text-xs focus:outline-none focus:border-pink-500"
-                  />
-                </div>
-                <div className="pt-2 flex items-center justify-between">
-                  <button
-                    type="button"
-                    onClick={() => setForgotStep('request')}
-                    className="text-xs text-slate-400 hover:text-white"
-                  >
+                <PasswordField
+                  id="forgot-new-password"
+                  label="New Password"
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  placeholder="Enter at least 6 characters"
+                  required
+                  minLength={6}
+                />
+                <div className="pt-1 flex items-center justify-between gap-2">
+                  <Button variant="ghost" size="sm" onClick={() => setForgotStep('request')}>
                     Back
-                  </button>
-                  <button
+                  </Button>
+                  <Button
                     type="submit"
-                    disabled={forgotLoading || forgotSuccess}
-                    className="px-4 py-2 text-xs font-semibold rounded-xl bg-gradient-to-r from-pink-500 to-amber-500 text-white shadow"
+                    size="sm"
+                    loading={forgotLoading}
+                    disabled={forgotSuccess}
                   >
-                    {forgotLoading ? 'Updating...' : 'Set New Password'}
-                  </button>
+                    Set New Password
+                  </Button>
                 </div>
               </form>
             )}
-          </div>
+          </Card>
         </div>
       )}
     </div>

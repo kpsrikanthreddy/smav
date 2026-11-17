@@ -1,6 +1,5 @@
 package com.smav.printagent.ui.screens
 
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -16,7 +15,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.smav.printagent.data.repository.*
@@ -24,7 +22,8 @@ import com.smav.printagent.model.*
 import com.smav.printagent.network.SmavApiClient
 import com.smav.printagent.network.UnauthorizedSessionException
 import com.smav.printagent.ui.components.*
-import com.smav.printagent.ui.theme.*
+import com.smav.printagent.ui.theme.SmavColors
+import com.smav.printagent.ui.theme.SmavNumericStyles
 import kotlinx.coroutines.launch
 import java.util.Locale
 
@@ -86,56 +85,44 @@ fun AdminDashboardScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         item {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF141B36)),
-                border = BorderStroke(1.dp, Color(0xFF2B355F)),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(session.businessName, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 17.sp)
-                            Text(
-                                "${session.businessType.displayName} • Code: ${session.branchCode.ifBlank { "N/A" }}",
-                                color = Sky400,
-                                fontSize = 12.sp
-                            )
-                        }
-                        IconButton(onClick = { load() }) {
-                            Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = Sky400)
-                        }
+            SmavCard {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(session.businessName, color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+                        Text(
+                            "${session.businessType.displayName} • Code: ${session.branchCode.ifBlank { "N/A" }}",
+                            color = SmavColors.InfoText,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
                     }
+                    IconButton(onClick = { load() }, modifier = Modifier.size(48.dp)) {
+                        Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = SmavColors.InfoText)
+                    }
+                }
 
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(
-                            onClick = { onNavigate(SmavRoute.POS_BILLING) },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF2D82)),
-                            modifier = Modifier.heightIn(min = 48.dp)
-                        ) {
-                            Icon(Icons.Default.PointOfSale, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("Open Outlet POS", fontWeight = FontWeight.Bold)
-                        }
-                        if (session.assignedOutlets.size > 1) {
-                            OutlinedButton(
-                                onClick = onOpenOutletSwitcher,
-                                modifier = Modifier.heightIn(min = 48.dp)
-                            ) {
-                                Icon(Icons.Default.SwapHoriz, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(Modifier.width(6.dp))
-                                Text("Switch Outlet (${session.assignedOutlets.size})")
-                            }
-                        }
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SmavGradientButton(
+                        text = "Open Outlet POS",
+                        icon = Icons.Default.PointOfSale,
+                        onClick = { onNavigate(SmavRoute.POS_BILLING) }
+                    )
+                    if (session.assignedOutlets.size > 1) {
+                        SmavSecondaryButton(
+                            text = "Switch Outlet (${session.assignedOutlets.size})",
+                            icon = Icons.Default.SwapHoriz,
+                            onClick = onOpenOutletSwitcher
+                        )
                     }
                 }
             }
         }
 
-        if (loading) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = Color(0xFFFF2D82)) }
+        if (loading) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = SmavColors.AccentPink) }
         if (errorMsg != null) item { ErrorBannerCard(errorMsg!!, onRetry = { load() }) }
 
         item {
@@ -144,57 +131,39 @@ fun AdminDashboardScreen(
                     title = "Outlet Sales Summary",
                     value = "Rs. ${String.format(Locale.ENGLISH, "%.2f", report?.totalSales ?: 0.0)}",
                     subtitle = "${report?.totalTransactions ?: 0} remote transactions",
-                    accent = Emerald500
+                    accent = SmavColors.StepperGreen
                 )
                 SummaryStatCard(
                     title = "Active Catalog Items",
                     value = "$catalogCount",
                     subtitle = session.businessType.displayName,
-                    accent = Sky400
+                    accent = SmavColors.InfoText
                 )
                 SummaryStatCard(
                     title = "Outlet Staff & POS Users",
                     value = "$staffCount",
                     subtitle = "Assigned to ${session.branchCode.ifBlank { session.businessName }}",
-                    accent = Color(0xFFFF2D82)
+                    accent = SmavColors.AccentPink
                 )
                 SummaryStatCard(
                     title = "Offline Pending Sync",
                     value = "$pendingSyncCount",
                     subtitle = if (pendingSyncCount == 0) "All bills synced" else "Tap Sync Status to upload",
-                    accent = if (pendingSyncCount == 0) Emerald500 else Amber500
+                    accent = if (pendingSyncCount == 0) SmavColors.StepperGreen else SmavColors.WarningText
                 )
             }
         }
 
         item {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF121629)),
-                border = BorderStroke(1.dp, Color(0xFF252E54)),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("Quick Actions", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(onClick = { onNavigate(SmavRoute.ADMIN_STAFF) }, modifier = Modifier.heightIn(min = 48.dp)) {
-                            Text("Manage Staff")
-                        }
-                        OutlinedButton(onClick = { onNavigate(SmavRoute.ADMIN_CATALOG) }, modifier = Modifier.heightIn(min = 48.dp)) {
-                            Text("Catalog & Prices")
-                        }
-                        OutlinedButton(onClick = { onNavigate(SmavRoute.ADMIN_REPORTS) }, modifier = Modifier.heightIn(min = 48.dp)) {
-                            Text("Reports")
-                        }
-                        OutlinedButton(onClick = { onNavigate(SmavRoute.ADMIN_SYNC) }, modifier = Modifier.heightIn(min = 48.dp)) {
-                            Text("Sync & Outbox")
-                        }
-                        OutlinedButton(onClick = { onNavigate(SmavRoute.PRINTER_SETTINGS) }, modifier = Modifier.heightIn(min = 48.dp)) {
-                            Text("Printers")
-                        }
-                        OutlinedButton(onClick = { onNavigate(SmavRoute.ADMIN_SETTINGS) }, modifier = Modifier.heightIn(min = 48.dp)) {
-                            Text("Outlet Settings")
-                        }
-                    }
+            SmavCard {
+                Text("Quick Actions", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SmavSecondaryButton("Manage Staff", onClick = { onNavigate(SmavRoute.ADMIN_STAFF) })
+                    SmavSecondaryButton("Catalog & Prices", onClick = { onNavigate(SmavRoute.ADMIN_CATALOG) })
+                    SmavSecondaryButton("Reports", onClick = { onNavigate(SmavRoute.ADMIN_REPORTS) })
+                    SmavSecondaryButton("Sync & Outbox", onClick = { onNavigate(SmavRoute.ADMIN_SYNC) })
+                    SmavSecondaryButton("Printers", onClick = { onNavigate(SmavRoute.PRINTER_SETTINGS) })
+                    SmavSecondaryButton("Outlet Settings", onClick = { onNavigate(SmavRoute.ADMIN_SETTINGS) })
                 }
             }
         }
@@ -221,6 +190,7 @@ fun AdminStaffScreen(
     var showCreate by remember { mutableStateOf(false) }
     var editUser by remember { mutableStateOf<OutletAdminItem?>(null) }
     var resetUser by remember { mutableStateOf<OutletAdminItem?>(null) }
+    var confirmToggleUser by remember { mutableStateOf<OutletAdminItem?>(null) }
 
     val outletCode = session.branchCode.ifBlank { session.assignedOutlets.firstOrNull { it.businessId == session.businessId }?.branchCode ?: "" }
 
@@ -258,83 +228,100 @@ fun AdminStaffScreen(
     ) {
         item {
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    onClick = { showCreate = true },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF2D82)),
-                    modifier = Modifier.heightIn(min = 48.dp)
-                ) {
-                    Icon(Icons.Default.PersonAdd, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Add POS Staff", fontWeight = FontWeight.Bold)
-                }
-                OutlinedButton(onClick = { load() }, enabled = !loading, modifier = Modifier.heightIn(min = 48.dp)) {
-                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Refresh")
-                }
+                SmavGradientButton(
+                    text = "Add POS Staff",
+                    icon = Icons.Default.PersonAdd,
+                    onClick = { showCreate = true }
+                )
+                SmavSecondaryButton(
+                    text = "Refresh",
+                    icon = Icons.Default.Refresh,
+                    enabled = !loading,
+                    onClick = { load() }
+                )
             }
         }
 
         item { SearchField(search, { search = it }, "Search outlet staff by name or email") }
 
         if (banner != null) {
-            item {
-                Card(colors = CardDefaults.cardColors(containerColor = Emerald500.copy(alpha = 0.16f))) {
-                    Text(banner!!, color = Emerald500, fontSize = 13.sp, modifier = Modifier.padding(12.dp))
-                }
-            }
+            item { SmavSuccessBannerCard(banner!!) }
         }
         if (errorMsg != null) item { ErrorBannerCard(errorMsg!!, onRetry = { load() }) }
-        if (loading || busy) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = Color(0xFFFF2D82)) }
+        if (loading || busy) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = SmavColors.AccentPink) }
 
         if (!loading && filtered.isEmpty()) {
             item { EmptyStateCard("No Staff Found", "Add POS billing users for this outlet.", Icons.Default.Group) }
         }
 
         items(filtered, key = { it.userId }) { u ->
-            Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF121629)),
-                border = BorderStroke(1.dp, Color(0xFF252E54)),
-                shape = RoundedCornerShape(14.dp)
-            ) {
-                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.Top
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(u.fullName, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                            Text(u.email, color = Color(0xFF94A3B8), fontSize = 12.sp)
-                            Text("Role: ${u.displayRole.ifBlank { "POS_BILLING" }}", color = Sky400, fontSize = 12.sp)
-                        }
-                        StatusBadgeChip(
-                            text = if (u.isActive) "Active" else "Disabled",
-                            color = if (u.isActive) Emerald500 else Rose600
-                        )
+            SmavCard {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.Top
+                ) {
+                    Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                        Text(u.fullName, color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                        Text(u.email, color = SmavColors.TextSecondary, fontSize = 12.sp)
+                        Text("Role: ${u.displayRole.ifBlank { "POS_BILLING" }}", color = SmavColors.InfoText, fontSize = 12.sp, fontWeight = FontWeight.Medium)
                     }
+                    StatusBadgeChip(
+                        text = if (u.isActive) "Active" else "Disabled",
+                        color = if (u.isActive) SmavColors.StepperGreen else SmavColors.DangerText
+                    )
+                }
 
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(onClick = { editUser = u }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Edit") }
-                        OutlinedButton(onClick = { resetUser = u }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Reset Password") }
-                        OutlinedButton(
-                            onClick = {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SmavSecondaryButton("Edit", onClick = { editUser = u })
+                    SmavSecondaryButton("Reset Password", onClick = { resetUser = u })
+                    SmavSecondaryButton(
+                        text = if (u.isActive) "Disable" else "Enable",
+                        textColor = if (u.isActive) SmavColors.DangerText else SmavColors.StepperGreen,
+                        onClick = {
+                            if (u.isActive) {
+                                confirmToggleUser = u
+                            } else {
                                 busy = true
                                 scope.launch {
-                                    adminRepo.setOutletUserStatus(u.userId, u.email, outletCode, !u.isActive)
+                                    adminRepo.setOutletUserStatus(u.userId, u.email, outletCode, true)
                                         .onSuccess { msg -> banner = msg; load() }
                                         .onFailure { err -> errorMsg = SmavApiClient.friendlyThrowable(err) }
                                     busy = false
                                 }
-                            },
-                            modifier = Modifier.heightIn(min = 48.dp)
-                        ) {
-                            Text(if (u.isActive) "Disable" else "Enable", color = if (u.isActive) Rose600 else Emerald500)
+                            }
                         }
-                    }
+                    )
                 }
             }
         }
+    }
+
+    confirmToggleUser?.let { target ->
+        AlertDialog(
+            onDismissRequest = { confirmToggleUser = null },
+            containerColor = SmavColors.Surface,
+            title = { Text("Disable ${target.fullName}?", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold) },
+            text = { Text("This staff account will be blocked from signing in until re-enabled.", color = SmavColors.TextSecondary) },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        confirmToggleUser = null
+                        busy = true
+                        scope.launch {
+                            adminRepo.setOutletUserStatus(target.userId, target.email, outletCode, false)
+                                .onSuccess { msg -> banner = msg; load() }
+                                .onFailure { err -> errorMsg = SmavApiClient.friendlyThrowable(err) }
+                            busy = false
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = SmavColors.DangerText, contentColor = Color.White)
+                ) { Text("Disable") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmToggleUser = null }) { Text("Cancel", color = SmavColors.TextSecondary) }
+            }
+        )
     }
 
     if (showCreate) {
@@ -365,17 +352,15 @@ fun AdminStaffScreen(
                 }
             }
         ) {
-            OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Full Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(value = email, onValueChange = { email = it }, label = { Text("Email Address") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(value = username, onValueChange = { username = it }, label = { Text("Username (optional)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(value = phone, onValueChange = { phone = it }, label = { Text("Phone (optional)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(
+            OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Full Name") }, singleLine = true, colors = smavOutlinedFieldColors(), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(value = email, onValueChange = { email = it }, label = { Text("Email Address") }, singleLine = true, colors = smavOutlinedFieldColors(), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(value = username, onValueChange = { username = it }, label = { Text("Username (optional)") }, singleLine = true, colors = smavOutlinedFieldColors(), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(value = phone, onValueChange = { phone = it }, label = { Text("Phone (optional)") }, singleLine = true, colors = smavOutlinedFieldColors(), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth())
+            SmavPasswordField(
+                label = "Temporary Password (min 8 chars)",
                 value = pass,
                 onValueChange = { pass = it },
-                label = { Text("Temporary Password (min 8 chars)") },
-                visualTransformation = PasswordVisualTransformation(),
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
+                placeholder = "Minimum 8 characters"
             )
         }
     }
@@ -406,10 +391,10 @@ fun AdminStaffScreen(
                 }
             }
         ) {
-            Text(target.email, color = Sky400, fontSize = 12.sp)
-            OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Full Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(value = username, onValueChange = { username = it }, label = { Text("Username") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(value = phone, onValueChange = { phone = it }, label = { Text("Phone") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            Text(target.email, color = SmavColors.InfoText, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+            OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Full Name") }, singleLine = true, colors = smavOutlinedFieldColors(), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(value = username, onValueChange = { username = it }, label = { Text("Username") }, singleLine = true, colors = smavOutlinedFieldColors(), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(value = phone, onValueChange = { phone = it }, label = { Text("Phone") }, singleLine = true, colors = smavOutlinedFieldColors(), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth())
         }
     }
 
@@ -428,14 +413,12 @@ fun AdminStaffScreen(
                 }
             }
         ) {
-            Text("Issue temporary password for ${target.fullName}", color = Color(0xFFCBD5E1), fontSize = 13.sp)
-            OutlinedTextField(
+            Text("Issue temporary password for ${target.fullName}", color = SmavColors.TextSecondary, fontSize = 13.sp)
+            SmavPasswordField(
+                label = "Temporary Password (min 8 chars)",
                 value = newPass,
                 onValueChange = { newPass = it },
-                label = { Text("Temporary Password (min 8 chars)") },
-                visualTransformation = PasswordVisualTransformation(),
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
+                placeholder = "Minimum 8 characters"
             )
         }
     }
@@ -502,30 +485,24 @@ fun AdminCatalogScreen(
     ) {
         item {
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
+                SmavGradientButton(
+                    text = when (session.businessType) {
+                        BusinessType.SALON -> "Add Service"
+                        BusinessType.RESTAURANT -> "Add Menu Item"
+                        else -> "Add Product"
+                    },
+                    icon = Icons.Default.Add,
                     onClick = {
                         editId = null; editName = ""; editCategory = ""; editSubcategory = ""; editPrice = ""; editIsVeg = true
                         showItemDialog = true
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF2D82)),
-                    modifier = Modifier.heightIn(min = 48.dp)
-                ) {
-                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        when (session.businessType) {
-                            BusinessType.SALON -> "Add Service"
-                            BusinessType.RESTAURANT -> "Add Menu Item"
-                            else -> "Add Product"
-                        },
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-                OutlinedButton(onClick = { load() }, enabled = !loading, modifier = Modifier.heightIn(min = 48.dp)) {
-                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Refresh")
-                }
+                    }
+                )
+                SmavSecondaryButton(
+                    text = "Refresh",
+                    icon = Icons.Default.Refresh,
+                    enabled = !loading,
+                    onClick = { load() }
+                )
             }
         }
 
@@ -534,14 +511,10 @@ fun AdminCatalogScreen(
             item { FilterFlowRow(categories, selectedCategory, { it }, { selectedCategory = it }) }
         }
         if (banner != null) {
-            item {
-                Card(colors = CardDefaults.cardColors(containerColor = Emerald500.copy(alpha = 0.16f))) {
-                    Text(banner!!, color = Emerald500, fontSize = 13.sp, modifier = Modifier.padding(12.dp))
-                }
-            }
+            item { SmavSuccessBannerCard(banner!!) }
         }
         if (errorMsg != null) item { ErrorBannerCard(errorMsg!!, onRetry = { load() }) }
-        if (loading) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = Color(0xFFFF2D82)) }
+        if (loading) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = SmavColors.AccentPink) }
 
         val q = search.trim().lowercase(Locale.ENGLISH)
 
@@ -616,30 +589,32 @@ fun AdminCatalogScreen(
             confirmText = "Save",
             confirmEnabled = editName.isNotBlank() && parsedPrice != null && parsedPrice >= 0.0,
             onConfirm = {
-                val priceVal = parsedPrice ?: return@MobileFormDialog
-                scope.launch {
-                    val res = when (session.businessType) {
-                        BusinessType.SALON -> adminRepo.saveSalonServiceItem(editId, editName, editCategory, editSubcategory, priceVal)
-                        BusinessType.RESTAURANT -> adminRepo.saveRestaurantMenuItemRemote(editId, editName, editCategory, priceVal, editIsVeg)
-                        else -> adminRepo.saveRetailProductRemote(editId, editName, editCategory, priceVal)
+                if (parsedPrice != null) {
+                    val priceVal = parsedPrice
+                    scope.launch {
+                        val res = when (session.businessType) {
+                            BusinessType.SALON -> adminRepo.saveSalonServiceItem(editId, editName, editCategory, editSubcategory, priceVal)
+                            BusinessType.RESTAURANT -> adminRepo.saveRestaurantMenuItemRemote(editId, editName, editCategory, priceVal, editIsVeg)
+                            else -> adminRepo.saveRetailProductRemote(editId, editName, editCategory, priceVal)
+                        }
+                        res.onSuccess {
+                            showItemDialog = false
+                            banner = "\"$editName\" saved at Rs. ${String.format(Locale.ENGLISH, "%.2f", priceVal)}"
+                            load()
+                        }.onFailure { err -> errorMsg = SmavApiClient.friendlyThrowable(err) }
                     }
-                    res.onSuccess {
-                        showItemDialog = false
-                        banner = "\"$editName\" saved at Rs. ${String.format(Locale.ENGLISH, "%.2f", priceVal)}"
-                        load()
-                    }.onFailure { err -> errorMsg = SmavApiClient.friendlyThrowable(err) }
                 }
             }
         ) {
-            OutlinedTextField(value = editName, onValueChange = { editName = it }, label = { Text("Item Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(value = editCategory, onValueChange = { editCategory = it }, label = { Text("Category") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(value = editName, onValueChange = { editName = it }, label = { Text("Item Name") }, singleLine = true, colors = smavOutlinedFieldColors(), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(value = editCategory, onValueChange = { editCategory = it }, label = { Text("Category") }, singleLine = true, colors = smavOutlinedFieldColors(), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth())
             if (session.businessType == BusinessType.SALON) {
-                OutlinedTextField(value = editSubcategory, onValueChange = { editSubcategory = it }, label = { Text("Subcategory (optional)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = editSubcategory, onValueChange = { editSubcategory = it }, label = { Text("Subcategory (optional)") }, singleLine = true, colors = smavOutlinedFieldColors(), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth())
             }
             if (session.businessType == BusinessType.RESTAURANT) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     Switch(checked = editIsVeg, onCheckedChange = { editIsVeg = it })
-                    Text(if (editIsVeg) "Vegetarian Dish" else "Non-Vegetarian Dish", color = Color.White)
+                    Text(if (editIsVeg) "Vegetarian Dish" else "Non-Vegetarian Dish", color = SmavColors.TextPrimary)
                 }
             }
             OutlinedTextField(
@@ -648,6 +623,8 @@ fun AdminCatalogScreen(
                 label = { Text("Price (Rs.)") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                 singleLine = true,
+                colors = smavOutlinedFieldColors(),
+                shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.fillMaxWidth()
             )
         }
@@ -661,31 +638,24 @@ private fun CatalogEditableRowCard(
     price: Double,
     onEdit: () -> Unit
 ) {
-    Card(
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF121629)),
-        border = BorderStroke(1.dp, Color(0xFF252E54)),
-        shape = RoundedCornerShape(12.dp)
-    ) {
+    SmavCard {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
+            modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(title, color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-                Text(subtitle, color = Color(0xFF94A3B8), fontSize = 12.sp)
+            Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                Text(title, color = SmavColors.TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                Text(subtitle, color = SmavColors.TextSecondary, fontSize = 12.sp)
             }
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    "Rs. ${String.format(Locale.ENGLISH, "%.2f", price)}",
-                    color = Emerald500,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 14.sp
+                    text = "Rs. ${String.format(Locale.ENGLISH, "%.2f", price)}",
+                    style = SmavNumericStyles.Price,
+                    color = SmavColors.StepperGreen
                 )
                 IconButton(onClick = onEdit, modifier = Modifier.size(48.dp)) {
-                    Icon(Icons.Default.Edit, contentDescription = "Edit Price", tint = Sky400)
+                    Icon(Icons.Default.Edit, contentDescription = "Edit Price", tint = SmavColors.InfoText)
                 }
             }
         }
@@ -734,20 +704,22 @@ fun AdminReportsScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("Outlet Sales & Tax Report", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 17.sp)
-                IconButton(onClick = { load() }) { Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = Sky400) }
+                Text("Outlet Sales & Tax Report", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+                IconButton(onClick = { load() }, modifier = Modifier.size(48.dp)) {
+                    Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = SmavColors.InfoText)
+                }
             }
         }
 
-        if (loading) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = Color(0xFFFF2D82)) }
+        if (loading) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = SmavColors.AccentPink) }
         if (errorMsg != null) item { ErrorBannerCard(errorMsg!!, onRetry = { load() }) }
 
         summary?.let { s ->
             item {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    SummaryStatCard("Total Sales (${s.outletName.ifBlank { session.businessName }})", "Rs. ${String.format(Locale.ENGLISH, "%.2f", s.totalSales)}", accent = Emerald500)
-                    SummaryStatCard("Total Tax Collected", "Rs. ${String.format(Locale.ENGLISH, "%.2f", s.totalTax)}", accent = Sky400)
-                    SummaryStatCard("Remote Synced Transactions", "${s.totalTransactions}", "Pending device queue: $pendingSyncCount", accent = Amber500)
+                    SummaryStatCard("Total Sales (${s.outletName.ifBlank { session.businessName }})", "Rs. ${String.format(Locale.ENGLISH, "%.2f", s.totalSales)}", accent = SmavColors.StepperGreen)
+                    SummaryStatCard("Total Tax Collected", "Rs. ${String.format(Locale.ENGLISH, "%.2f", s.totalTax)}", accent = SmavColors.InfoText)
+                    SummaryStatCard("Remote Synced Transactions", "${s.totalTransactions}", "Pending device queue: $pendingSyncCount", accent = SmavColors.WarningText)
                 }
             }
 
@@ -755,21 +727,21 @@ fun AdminReportsScreen(
                 item { EmptyStateCard("No Synced Transactions Yet", "New bills created on POS will appear here after sync.") }
             } else {
                 items(s.transactions, key = { it.id }) { tx ->
-                    Card(
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFF121629)),
-                        border = BorderStroke(1.dp, Color(0xFF252E54)),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
+                    SmavCard {
                         Row(
-                            modifier = Modifier.fillMaxWidth().padding(12.dp),
+                            modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(tx.referenceNumber, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                                Text("${tx.subtitle} • ${tx.paymentMode.uppercase(Locale.ENGLISH)}", color = Color(0xFF94A3B8), fontSize = 12.sp)
+                            Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                                Text(tx.referenceNumber, color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                Text("${tx.subtitle} • ${tx.paymentMode.uppercase(Locale.ENGLISH)}", color = SmavColors.TextSecondary, fontSize = 12.sp)
                             }
-                            Text("Rs. ${String.format(Locale.ENGLISH, "%.2f", tx.grandTotal)}", color = Emerald500, fontWeight = FontWeight.Bold)
+                            Text(
+                                text = "Rs. ${String.format(Locale.ENGLISH, "%.2f", tx.grandTotal)}",
+                                style = SmavNumericStyles.Price,
+                                color = SmavColors.StepperGreen
+                            )
                         }
                     }
                 }
@@ -822,95 +794,81 @@ fun AdminSyncScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         item {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF141B36)),
-                border = BorderStroke(1.dp, Color(0xFF2B355F)),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("Offline Billing Queue & Sync Outbox", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 17.sp)
-                    Text("Pending local bills on this device: $pendingSyncCount", color = if (pendingSyncCount > 0) Amber500 else Emerald500, fontWeight = FontWeight.SemiBold)
-                    if (syncSummary.isNotBlank()) {
-                        Text(syncSummary, color = Color(0xFF94A3B8), fontSize = 12.sp)
-                    }
-                    Button(
-                        onClick = {
-                            busy = true; message = null; errorMsg = null
-                            scope.launch {
-                                syncRepo.syncAllPending()
-                                    .onSuccess { count ->
-                                        message = if (count > 0) "Synced $count transaction(s) to cloud." else "No pending outlet transactions needed upload."
-                                        load()
-                                    }
-                                    .onFailure { err ->
-                                        if (err is UnauthorizedSessionException) onUnauthorized(err.message ?: "Session expired.")
-                                        else errorMsg = SmavApiClient.friendlyThrowable(err)
-                                    }
-                                busy = false
-                            }
-                        },
-                        enabled = !busy,
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF2D82)),
-                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
-                    ) {
-                        Icon(Icons.Default.CloudSync, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Sync Pending Device Bills Now", fontWeight = FontWeight.Bold)
-                    }
+            SmavCard {
+                Text("Offline Billing Queue & Sync Outbox", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+                Text(
+                    "Pending local bills on this device: $pendingSyncCount",
+                    color = if (pendingSyncCount > 0) SmavColors.WarningText else SmavColors.StepperGreen,
+                    fontWeight = FontWeight.SemiBold
+                )
+                if (syncSummary.isNotBlank()) {
+                    Text(syncSummary, color = SmavColors.TextSecondary, fontSize = 12.sp)
                 }
+                SmavGradientButton(
+                    text = "Sync Pending Device Bills Now",
+                    icon = Icons.Default.CloudSync,
+                    enabled = !busy,
+                    busy = busy,
+                    modifier = Modifier.fillMaxWidth(),
+                    onClick = {
+                        busy = true; message = null; errorMsg = null
+                        scope.launch {
+                            syncRepo.syncAllPending()
+                                .onSuccess { count ->
+                                    message = if (count > 0) "Synced $count transaction(s) to cloud." else "No pending outlet transactions needed upload."
+                                    load()
+                                }
+                                .onFailure { err ->
+                                    if (err is UnauthorizedSessionException) onUnauthorized(err.message ?: "Session expired.")
+                                    else errorMsg = SmavApiClient.friendlyThrowable(err)
+                                }
+                            busy = false
+                        }
+                    }
+                )
             }
         }
 
-        if (busy) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = Color(0xFFFF2D82)) }
+        if (busy) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = SmavColors.AccentPink) }
         if (message != null) {
-            item {
-                Card(colors = CardDefaults.cardColors(containerColor = Emerald500.copy(alpha = 0.16f))) {
-                    Text(message!!, color = Emerald500, fontSize = 13.sp, modifier = Modifier.padding(12.dp))
-                }
-            }
+            item { SmavSuccessBannerCard(message!!) }
         }
         if (errorMsg != null) item { ErrorBannerCard(errorMsg!!) }
 
-        item { Text("User Provisioning Sync Outbox", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp) }
+        item { Text("User Provisioning Sync Outbox", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 15.sp) }
 
         if (outbox.isEmpty()) {
             item { EmptyStateCard("Outbox Clear", "No pending staff sync records in the server outbox.") }
         } else {
             items(outbox, key = { it.id }) { item ->
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFF121629)),
-                    border = BorderStroke(1.dp, Color(0xFF252E54)),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(item.targetLabel, color = Color.White, fontWeight = FontWeight.SemiBold)
-                            StatusBadgeChip(
-                                text = item.status,
-                                color = if (item.status == "SYNCED") Emerald500 else Amber500
-                            )
-                        }
-                        if (item.lastError != null) {
-                            Text(item.lastError, color = Color(0xFFFDA4AF), fontSize = 12.sp)
-                        }
-                        if (item.status != "SYNCED") {
-                            OutlinedButton(
-                                onClick = {
-                                    busy = true
-                                    scope.launch {
-                                        adminRepo.retrySyncOutbox(item.id)
-                                            .onSuccess { msg -> message = msg; load() }
-                                            .onFailure { err -> errorMsg = SmavApiClient.friendlyThrowable(err) }
-                                        busy = false
-                                    }
-                                },
-                                modifier = Modifier.heightIn(min = 44.dp)
-                            ) { Text("Retry Outbox Item") }
-                        }
+                SmavCard {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(item.targetLabel, color = SmavColors.TextPrimary, fontWeight = FontWeight.SemiBold)
+                        StatusBadgeChip(
+                            text = item.status,
+                            color = if (item.status == "SYNCED") SmavColors.StepperGreen else SmavColors.WarningText
+                        )
+                    }
+                    if (item.lastError != null) {
+                        Text(item.lastError, color = SmavColors.DangerText, fontSize = 12.sp)
+                    }
+                    if (item.status != "SYNCED") {
+                        SmavSecondaryButton(
+                            text = "Retry Outbox Item",
+                            onClick = {
+                                busy = true
+                                scope.launch {
+                                    adminRepo.retrySyncOutbox(item.id)
+                                        .onSuccess { msg -> message = msg; load() }
+                                        .onFailure { err -> errorMsg = SmavApiClient.friendlyThrowable(err) }
+                                    busy = false
+                                }
+                            }
+                        )
                     }
                 }
             }
@@ -927,7 +885,6 @@ fun AdminSettingsScreen(
     onOpenOutletSwitcher: () -> Unit,
     onUnauthorized: (String) -> Unit
 ) {
-    val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
 
     var outlet by remember { mutableStateOf<AdminOutletItem?>(null) }
@@ -960,70 +917,62 @@ fun AdminSettingsScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         item {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF121629)),
-                border = BorderStroke(1.dp, Color(0xFF252E54)),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Outlet Profile", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                    Text("Name: ${outlet?.name ?: session.businessName}", color = Color(0xFFCBD5E1), fontSize = 13.sp)
-                    Text("Category: ${session.businessType.displayName}", color = Sky400, fontSize = 13.sp)
-                    Text("Code: ${outlet?.code ?: session.branchCode}", color = Color(0xFF94A3B8), fontSize = 12.sp)
-                    if (!outlet?.address.isNullOrBlank()) Text("Address: ${outlet!!.address}", color = Color(0xFF94A3B8), fontSize = 12.sp)
-                    if (!outlet?.phone.isNullOrBlank()) Text("Phone: ${outlet!!.phone}", color = Color(0xFF94A3B8), fontSize = 12.sp)
-                    if (!outlet?.gstin.isNullOrBlank()) Text("GSTIN: ${outlet!!.gstin}", color = Color(0xFF94A3B8), fontSize = 12.sp)
-                    if (session.assignedOutlets.size > 1) {
-                        OutlinedButton(
-                            onClick = onOpenOutletSwitcher,
-                            modifier = Modifier.fillMaxWidth().padding(top = 6.dp).heightIn(min = 48.dp)
-                        ) { Text("Switch Active Outlet") }
-                    }
+            SmavCard {
+                Text("Outlet Profile", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Text("Name: ${outlet?.name ?: session.businessName}", color = SmavColors.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                Text("Category: ${session.businessType.displayName}", color = SmavColors.InfoText, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                Text("Code: ${outlet?.code ?: session.branchCode}", color = SmavColors.TextSecondary, fontSize = 12.sp)
+                if (!outlet?.address.isNullOrBlank()) Text("Address: ${outlet!!.address}", color = SmavColors.TextSecondary, fontSize = 12.sp)
+                if (!outlet?.phone.isNullOrBlank()) Text("Phone: ${outlet!!.phone}", color = SmavColors.TextSecondary, fontSize = 12.sp)
+                if (!outlet?.gstin.isNullOrBlank()) Text("GSTIN: ${outlet!!.gstin}", color = SmavColors.TextSecondary, fontSize = 12.sp)
+                if (session.assignedOutlets.size > 1) {
+                    SmavSecondaryButton(
+                        text = "Switch Active Outlet",
+                        icon = Icons.Default.SwapHoriz,
+                        onClick = onOpenOutletSwitcher,
+                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                    )
                 }
             }
         }
 
         item {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF121629)),
-                border = BorderStroke(1.dp, Color(0xFF252E54)),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("Device Receipt Configuration", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                    OutlinedTextField(
-                        value = receiptHeader,
-                        onValueChange = { receiptHeader = it },
-                        label = { Text("Thermal Receipt Header") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    OutlinedTextField(
-                        value = receiptFooter,
-                        onValueChange = { receiptFooter = it },
-                        label = { Text("Thermal Receipt Footer") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Button(
-                        onClick = {
-                            sessionManager.saveReceiptConfig(session.businessId, receiptHeader, receiptFooter)
-                            savedMsg = "Receipt header and footer saved on this terminal."
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF2D82)),
-                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
-                    ) { Text("Save Receipt Settings", fontWeight = FontWeight.Bold) }
-                    OutlinedButton(
-                        onClick = onOpenPrinterSettings,
-                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
-                    ) {
-                        Icon(Icons.Default.Print, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Open Bluetooth Printer Settings")
-                    }
-                    if (savedMsg != null) {
-                        Text(savedMsg!!, color = Emerald500, fontSize = 12.sp)
-                    }
+            SmavCard {
+                Text("Device Receipt Configuration", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                OutlinedTextField(
+                    value = receiptHeader,
+                    onValueChange = { receiptHeader = it },
+                    label = { Text("Thermal Receipt Header") },
+                    singleLine = true,
+                    colors = smavOutlinedFieldColors(),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = receiptFooter,
+                    onValueChange = { receiptFooter = it },
+                    label = { Text("Thermal Receipt Footer") },
+                    singleLine = true,
+                    colors = smavOutlinedFieldColors(),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                SmavGradientButton(
+                    text = "Save Receipt Settings",
+                    onClick = {
+                        sessionManager.saveReceiptConfig(session.businessId, receiptHeader, receiptFooter)
+                        savedMsg = "Receipt header and footer saved on this terminal."
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                SmavSecondaryButton(
+                    text = "Open Bluetooth Printer Settings",
+                    icon = Icons.Default.Print,
+                    onClick = onOpenPrinterSettings,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (savedMsg != null) {
+                    SmavSuccessBannerCard(savedMsg!!)
                 }
             }
         }

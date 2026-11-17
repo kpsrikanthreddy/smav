@@ -1,1 +1,86 @@
 @import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --color-canvas: #F5F6FA;
+  --color-surface: #FFFFFF;
+  --color-ink: #2F3033;
+  --color-muted: #6F737D;
+  --color-hairline: #E5E7EC;
+  --color-stepper: #15803D;
+}
+
+@layer base {
+  html,
+  body {
+    background-color: #F5F6FA;
+    color: #2F3033;
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+
+  button,
+  a,
+  select,
+  input,
+  textarea {
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Preserve SMAV thermal receipt print portal and media print rules untouched */
+@media screen {
+  #smav-print-portal {
+    display: none;
+  }
+}
+
+@media print {
+  @page {
+    margin: 4mm;
+  }
+
+  html,
+  body {
+    margin: 0 !important;
+    padding: 0 !important;
+    background: #ffffff !important;
+    color: #000000 !important;
+  }
+
+  #root {
+    display: none !important;
+  }
+
+  #smav-print-portal {
+    display: block !important;
+    margin: 0 auto !important;
+    padding: 0 !important;
+    background: #ffffff !important;
+    color: #000000 !important;
+  }
+
+  #smav-print-portal.paper-58mm {
+    width: 58mm !important;
+    max-width: 58mm !important;
+  }
+
+  #smav-print-portal.paper-80mm {
+    width: 80mm !important;
+    max-width: 80mm !important;
+  }
+}

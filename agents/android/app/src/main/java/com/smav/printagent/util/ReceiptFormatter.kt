@@ -33,8 +33,12 @@ object ReceiptFormatter {
         b.textLine("Luxury Salon & Spa")
         b.setBold(false)
         b.textLine(branch.name)
-        b.textLine(branch.address)
-        b.textLine("Tel: ${branch.phone}")
+        if (branch.address.isNotBlank()) {
+            b.textLine(branch.address)
+        }
+        if (branch.phone.isNotBlank()) {
+            b.textLine("Tel: ${branch.phone}")
+        }
         if (branch.gstin.isNotBlank()) {
             b.textLine("GSTIN: ${branch.gstin}")
         }

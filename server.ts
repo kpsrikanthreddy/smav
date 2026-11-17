@@ -1,5 +1,6 @@
 import { registerCatalogSource, resolveCatalogSource, glossyLooksSource } from './services/catalogSources';
 import { previewCatalogImport, importMissingCatalogItems, type SourceCatalogItem } from './services/catalogImport';
+import { fetchGlossyLooksStaff, isGlossyLooksOutlet, type NormalizedStylist, type SalonStaffFetchResult } from './services/salonStaff';
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
@@ -1586,7 +1587,8 @@ export interface AuthoritativeMenuItem {
 
 let salonServices: AuthoritativeSalonService[] = [];
 
-let stylists: any[] = [];
+let stylists: Array<NormalizedStylist & { specialty: string; branchId: string; isAvailable: boolean }> = [];
+let lastStaffDiagnostic: Pick<SalonStaffFetchResult, 'success' | 'diagnosticCode' | 'upstreamStatus' | 'message'> | null = null;
 let salonAppointments: any[] = [];
 let restaurantMenu: AuthoritativeMenuItem[] = [];
 
@@ -1624,7 +1626,15 @@ export async function syncLiveSupabaseCatalogs() {
     const [srvRes, catRes, staffRes] = await Promise.all([
       fetch('https://www.glossylooks.in/api/services', { signal: AbortSignal.timeout(8000) }).then(r => { if (!r.ok) throw Error('Salon services API unavailable'); return r.json(); }).catch(() => null),
       fetch('https://www.glossylooks.in/api/categories', { signal: AbortSignal.timeout(8000) }).then(r => r.json()).catch(() => null),
-      fetch('https://www.glossylooks.in/api/staff', { signal: AbortSignal.timeout(8000) }).then(r => r.json()).catch(() => null)
+      fetchGlossyLooksStaff({
+        outlet: {
+          id: 'outlet_glossy_gach',
+          code: 'glossylooks',
+          name: SUPABASE_CONFIG.the_glossy_looks.business_name
+        },
+        staffApiUrl: `${SUPABASE_CONFIG.the_glossy_looks.upstream_api}/staff`,
+        integrationKey: process.env.GLOSSYLOOKS_INTEGRATION_KEY?.trim() || ''
+      })
     ]);
 
     if (srvRes && Array.isArray(srvRes) && catRes && Array.isArray(catRes)) {
@@ -1646,21 +1656,21 @@ export async function syncLiveSupabaseCatalogs() {
       }));
     }
 
-    const staffRows = Array.isArray(staffRes) ? staffRes :
-      (Array.isArray(staffRes?.staff) ? staffRes.staff :
-      (Array.isArray(staffRes?.data) ? staffRes.data : []));
-    // Staff API is authoritative; do not invent staff or use the logged-in owner as stylist.
-    stylists = staffRows
-      .filter((st: any) => st && st.id && (st.name || st.full_name) && st.is_active !== false && st.active !== false && st.status !== 'inactive')
-      .map((st: any) => ({
-        id: String(st.id),
-        name: String(st.name || st.full_name),
-        specialty: st.specialty || st.role || 'Salon stylist',
-        branchId: String(st.branch_id || st.branchId || 'outlet_glossy_gach'),
-        phone: st.phone || '',
-        skills: st.skills || [],
-        isAvailable: true
+    lastStaffDiagnostic = {
+      success: staffRes.success,
+      diagnosticCode: staffRes.diagnosticCode,
+      upstreamStatus: staffRes.upstreamStatus,
+      message: staffRes.message
+    };
+    if (staffRes.success) {
+      // Staff API is authoritative; do not invent staff or store personal info.
+      stylists = staffRes.stylists.map(st => ({
+        ...st,
+        specialty: st.role,
+        branchId: st.outletId,
+        isAvailable: st.available
       }));
+    }
 
     const menuRes = await fetch('https://www.starters4u.in/api/menu', { signal: AbortSignal.timeout(8000) }).then(r => { if (!r.ok) throw Error('Restaurant menu API unavailable'); return r.json(); }).catch(() => null);
     if (menuRes && Array.isArray(menuRes)) {
@@ -4366,14 +4376,46 @@ app.get('/api/pos/init', requireAuth, async (req, res) => {
 
   if (outlet.category === 'salon') {
     const activeServices = salonServices.filter(s => !s.isDeleted && s.isActive);
+    const staffResult = await fetchGlossyLooksStaff({
+      outlet: {
+        id: outlet.id,
+        code: outlet.code,
+        name: outlet.name,
+        supabaseUrl: outlet.supabaseUrl
+      },
+      staffApiUrl: `${SUPABASE_CONFIG.the_glossy_looks.upstream_api}/staff`,
+      integrationKey: process.env.GLOSSYLOOKS_INTEGRATION_KEY?.trim() || ''
+    });
+
+    const normalizedStylists = staffResult.stylists.map(st => ({
+      ...st,
+      specialty: st.role,
+      branchId: st.outletId,
+      isAvailable: st.available
+    }));
+
+    if (staffResult.success && isGlossyLooksOutlet(outlet)) {
+      stylists = normalizedStylists;
+      lastStaffDiagnostic = {
+        success: staffResult.success,
+        diagnosticCode: staffResult.diagnosticCode,
+        upstreamStatus: staffResult.upstreamStatus,
+        message: staffResult.message
+      };
+    }
+
     res.json({
       success: true,
       outlet,
       category: 'salon',
       revision: salonCatalogRevision,
       services: activeServices,
-      stylists: stylists.filter(st => st.isAvailable && (!st.branchId || st.branchId === outlet.id || st.branchId === outlet.code)),
-      stylistError: stylists.length ? null : 'No active staff returned by the upstream Glossy Looks API. Verify /api/staff and access permissions.',
+      stylists: normalizedStylists,
+      stylistError: staffResult.success
+        ? (normalizedStylists.length ? null : 'No active stylists returned for this outlet from the Glossy Looks staff API.')
+        : staffResult.message,
+      stylistDiagnosticCode: staffResult.diagnosticCode,
+      stylistUpstreamStatus: staffResult.upstreamStatus,
       appointments: salonAppointments
     });
   } else if (outlet.category === 'restaurant') {
@@ -4673,8 +4715,111 @@ app.get('/api/salon/services', requireAuth, (req, res) => {
   res.json({ business_id: 'the_glossy_looks', current_revision: salonCatalogRevision, services: salonServices.filter(s => !s.isDeleted && s.isActive) });
 });
 
-app.get('/api/salon/stylists', requireAuth, (req, res) => {
-  res.json({ business_id: 'the_glossy_looks', stylists });
+app.get('/api/salon/stylists', requireAuth, async (req, res) => {
+  const session: UserSession = (req as any).userSession;
+  const requestedOutletId = typeof req.query.outletId === 'string' ? req.query.outletId.trim() : '';
+
+  let targetOutlet = session.activeOutlet;
+  if (requestedOutletId) {
+    if (session.role === 'superadmin') {
+      try {
+        const registered = await getRegisteredOutlet(req, requestedOutletId);
+        if (!registered) {
+          return res.status(404).json({
+            success: false,
+            code: 'OUTLET_NOT_FOUND',
+            upstreamStatus: null,
+            message: 'Selected outlet was not found.'
+          });
+        }
+        if (!registered.isActive) {
+          return res.status(403).json({
+            success: false,
+            code: 'OUTLET_INACTIVE',
+            upstreamStatus: null,
+            message: 'Selected outlet is inactive.'
+          });
+        }
+        targetOutlet = registered;
+      } catch (e: any) {
+        return res.status(503).json({
+          success: false,
+          code: 'OUTLET_LOOKUP_FAILED',
+          upstreamStatus: null,
+          message: 'Could not verify selected outlet authorization.'
+        });
+      }
+    } else if (
+      requestedOutletId.toLowerCase() !== session.activeOutlet.id.toLowerCase() &&
+      requestedOutletId.toLowerCase() !== session.activeOutlet.code.toLowerCase()
+    ) {
+      return res.status(403).json({
+        success: false,
+        code: 'OUTLET_FORBIDDEN',
+        upstreamStatus: null,
+        message: 'Forbidden: You are not authorized to access stylists for another outlet.'
+      });
+    }
+  }
+
+  if (targetOutlet.category !== 'salon') {
+    return res.status(400).json({
+      success: false,
+      code: 'NOT_SALON_OUTLET',
+      upstreamStatus: null,
+      message: 'Stylists are only available for salon outlets.'
+    });
+  }
+
+  const staffResult = await fetchGlossyLooksStaff({
+    outlet: {
+      id: targetOutlet.id,
+      code: targetOutlet.code,
+      name: targetOutlet.name,
+      supabaseUrl: targetOutlet.supabaseUrl
+    },
+    staffApiUrl: `${SUPABASE_CONFIG.the_glossy_looks.upstream_api}/staff`,
+    integrationKey: process.env.GLOSSYLOOKS_INTEGRATION_KEY?.trim() || ''
+  });
+
+  if (!staffResult.success) {
+    const httpStatus =
+      staffResult.diagnosticCode === 'STAFF_CONFIG_ERROR' ? 503
+      : staffResult.diagnosticCode === 'STAFF_UPSTREAM_TIMEOUT' ? 504
+      : 502;
+    return res.status(httpStatus).json({
+      success: false,
+      code: staffResult.diagnosticCode,
+      upstreamStatus: staffResult.upstreamStatus,
+      message: staffResult.message || 'Could not load stylists from upstream Glossy Looks staff API.'
+    });
+  }
+
+  if (isGlossyLooksOutlet(targetOutlet)) {
+    stylists = staffResult.stylists.map(st => ({
+      ...st,
+      specialty: st.role,
+      branchId: st.outletId,
+      isAvailable: st.available
+    }));
+    lastStaffDiagnostic = {
+      success: staffResult.success,
+      diagnosticCode: staffResult.diagnosticCode,
+      upstreamStatus: staffResult.upstreamStatus,
+      message: staffResult.message
+    };
+  }
+
+  return res.json({
+    success: true,
+    stylists: staffResult.stylists,
+    ...(staffResult.stylists.length === 0
+      ? {
+          diagnosticCode: staffResult.diagnosticCode,
+          message: staffResult.message || 'No active stylists returned for this outlet from the Glossy Looks staff API.'
+        }
+      : {})
+  });
 });
 
 app.get('/api/salon/appointments', requireAuth, (req, res) => {

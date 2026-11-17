@@ -20,6 +20,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -136,8 +137,8 @@ fun SmavAppScaffold(
         drawerContent = {
             ModalDrawerSheet(
                 modifier = Modifier.widthIn(max = 310.dp),
-                drawerContainerColor = Color(0xFF0E142A),
-                drawerContentColor = Color.White
+                drawerContainerColor = SmavColors.Surface,
+                drawerContentColor = SmavColors.TextPrimary
             ) {
                 Column(
                     modifier = Modifier
@@ -149,9 +150,9 @@ fun SmavAppScaffold(
                 ) {
                     // Drawer header card
                     Surface(
-                        color = Color(0xFF161D3B),
+                        color = SmavColors.Background,
                         shape = RoundedCornerShape(14.dp),
-                        border = BorderStroke(1.dp, Color(0xFF2B355F)),
+                        border = BorderStroke(1.dp, SmavColors.Border),
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Column(
@@ -166,19 +167,19 @@ fun SmavAppScaffold(
                                 StatusBadgeChip(
                                     text = session.visibleRole,
                                     color = when {
-                                        session.role.isSuperadmin() -> Color(0xFFFF2D82)
-                                        session.role.isAdminOrAbove() -> Sky400
-                                        else -> Emerald500
+                                        session.role.isSuperadmin() -> SmavColors.AccentPink
+                                        session.role.isAdminOrAbove() -> SmavColors.InfoText
+                                        else -> SmavColors.StepperGreen
                                     }
                                 )
                                 StatusBadgeChip(
                                     text = if (isOnline) "ONLINE" else "OFFLINE",
-                                    color = if (isOnline) Emerald500 else Amber500
+                                    color = if (isOnline) SmavColors.StepperGreen else SmavColors.WarningText
                                 )
                             }
                             Text(
                                 text = session.userName,
-                                color = Color.White,
+                                color = SmavColors.TextPrimary,
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 16.sp,
                                 maxLines = 1,
@@ -186,14 +187,14 @@ fun SmavAppScaffold(
                             )
                             Text(
                                 text = session.businessName,
-                                color = Color(0xFFB3C3E6),
+                                color = SmavColors.TextSecondary,
                                 fontSize = 13.sp,
                                 maxLines = 2,
                                 overflow = TextOverflow.Ellipsis
                             )
                             Text(
                                 text = session.businessType.displayName,
-                                color = Sky400,
+                                color = SmavColors.InfoText,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.SemiBold
                             )
@@ -206,18 +207,23 @@ fun SmavAppScaffold(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .padding(top = 4.dp)
-                                        .heightIn(min = 42.dp),
-                                    shape = RoundedCornerShape(10.dp)
+                                        .heightIn(min = 44.dp),
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(1.dp, SmavColors.Border),
+                                    colors = ButtonDefaults.outlinedButtonColors(
+                                        containerColor = SmavColors.Surface,
+                                        contentColor = SmavColors.TextPrimary
+                                    )
                                 ) {
                                     Icon(Icons.Default.SwapHoriz, contentDescription = null, modifier = Modifier.size(18.dp))
                                     Spacer(Modifier.width(6.dp))
-                                    Text("Switch Active Outlet", fontSize = 13.sp)
+                                    Text("Switch Active Outlet", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                                 }
                             }
                         }
                     }
 
-                    HorizontalDivider(color = Color(0xFF232C52), modifier = Modifier.padding(vertical = 4.dp))
+                    HorizontalDivider(color = SmavColors.Border, modifier = Modifier.padding(vertical = 4.dp))
 
                     drawerItems.forEach { item ->
                         NavigationDrawerItem(
@@ -232,27 +238,34 @@ fun SmavAppScaffold(
                                     text = item.label,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
-                                    fontSize = 14.sp
+                                    fontSize = 14.sp,
+                                    fontWeight = if (currentRoute == item.route) FontWeight.SemiBold else FontWeight.Medium
                                 )
                             },
                             badge = when (item.route) {
                                 SmavRoute.OFFLINE_SYNC, SmavRoute.ADMIN_SYNC -> if (pendingSyncCount > 0) {
-                                    { Text("$pendingSyncCount", color = Amber500, fontWeight = FontWeight.Bold) }
+                                    {
+                                        Text(
+                                            text = "$pendingSyncCount",
+                                            style = SmavNumericStyles.Counter.copy(fontSize = 12.sp),
+                                            color = SmavColors.WarningText
+                                        )
+                                    }
                                 } else null
                                 else -> null
                             },
                             colors = NavigationDrawerItemDefaults.colors(
-                                selectedContainerColor = Color(0xFF232D58),
-                                selectedTextColor = Color.White,
-                                selectedIconColor = Color(0xFFFF2D82),
-                                unselectedTextColor = Color(0xFFCBD5E1),
-                                unselectedIconColor = Color(0xFF94A3B8)
+                                selectedContainerColor = SmavColors.AccentPink.copy(alpha = 0.08f),
+                                selectedTextColor = SmavColors.AccentPink,
+                                selectedIconColor = SmavColors.AccentPink,
+                                unselectedTextColor = SmavColors.TextPrimary,
+                                unselectedIconColor = SmavColors.TextSecondary
                             ),
                             shape = RoundedCornerShape(12.dp)
                         )
                     }
 
-                    HorizontalDivider(color = Color(0xFF232C52), modifier = Modifier.padding(vertical = 4.dp))
+                    HorizontalDivider(color = SmavColors.Border, modifier = Modifier.padding(vertical = 4.dp))
 
                     NavigationDrawerItem(
                         selected = false,
@@ -260,8 +273,8 @@ fun SmavAppScaffold(
                             scope.launch { drawerState.close() }
                             showSignOutDialog = true
                         },
-                        icon = { Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null, tint = Rose600) },
-                        label = { Text("Sign Out", color = Rose600, fontWeight = FontWeight.SemiBold) },
+                        icon = { Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null, tint = SmavColors.DangerText) },
+                        label = { Text("Sign Out", color = SmavColors.DangerText, fontWeight = FontWeight.SemiBold) },
                         shape = RoundedCornerShape(12.dp)
                     )
                 }
@@ -270,24 +283,24 @@ fun SmavAppScaffold(
     ) {
         Scaffold(
             modifier = Modifier.fillMaxSize(),
-            containerColor = Color(0xFF0B0E1B),
+            containerColor = SmavColors.Background,
             contentWindowInsets = WindowInsets.safeDrawing,
             topBar = {
-                Column(modifier = Modifier.background(Slate900)) {
+                Column(modifier = Modifier.background(SmavColors.Surface)) {
                     TopAppBar(
                         navigationIcon = {
                             IconButton(
                                 onClick = { scope.launch { drawerState.open() } },
                                 modifier = Modifier.size(48.dp)
                             ) {
-                                Icon(Icons.Default.Menu, contentDescription = "Open menu", tint = Color.White)
+                                Icon(Icons.Default.Menu, contentDescription = "Open menu", tint = SmavColors.TextPrimary)
                             }
                         },
                         title = {
                             Column {
                                 Text(
                                     text = currentRoute.title,
-                                    color = Color.White,
+                                    color = SmavColors.TextPrimary,
                                     fontWeight = FontWeight.Bold,
                                     fontSize = 16.sp,
                                     maxLines = 1,
@@ -295,7 +308,7 @@ fun SmavAppScaffold(
                                 )
                                 Text(
                                     text = "${session.businessName} • ${session.visibleRole}",
-                                    color = Color(0xFF94A3B8),
+                                    color = SmavColors.TextSecondary,
                                     fontSize = 11.sp,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
@@ -308,7 +321,7 @@ fun SmavAppScaffold(
                                     onClick = { onNavigate(homeRoute) },
                                     modifier = Modifier.size(48.dp)
                                 ) {
-                                    Icon(Icons.Default.Home, contentDescription = "Home", tint = Sky400)
+                                    Icon(Icons.Default.Home, contentDescription = "Home", tint = SmavColors.TextPrimary)
                                 }
                             }
                             IconButton(
@@ -318,40 +331,39 @@ fun SmavAppScaffold(
                                 Icon(
                                     Icons.Default.Print,
                                     contentDescription = "Printer Settings",
-                                    tint = if (anyPrinterConnected) Emerald500 else Color(0xFF64748B)
+                                    tint = if (anyPrinterConnected) SmavColors.StepperGreen else SmavColors.TextSecondary
                                 )
                             }
                         },
-                        colors = TopAppBarDefaults.topAppBarColors(containerColor = Slate900)
+                        colors = TopAppBarDefaults.topAppBarColors(containerColor = SmavColors.Surface)
                     )
 
-                    // Compact responsive status bar — wraps cleanly on 360dp & 1.3x font scale
                     FlowRow(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .background(Color(0xFF0E142A))
-                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                            .background(SmavColors.SurfaceSubtle)
+                            .padding(horizontal = 14.dp, vertical = 6.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         StatusBadgeChip(
                             text = if (isOnline) "Online" else "Offline Mode",
-                            color = if (isOnline) Emerald500 else Amber500
+                            color = if (isOnline) SmavColors.StepperGreen else SmavColors.WarningText
                         )
                         StatusBadgeChip(
                             text = session.businessType.displayName,
                             color = when (session.businessType) {
-                                BusinessType.SALON -> Color(0xFFFF2D82)
-                                BusinessType.RESTAURANT -> Amber500
-                                BusinessType.RETAIL -> Sky400
-                                BusinessType.OTHER -> Color(0xFF94A3B8)
+                                BusinessType.SALON -> SmavColors.AccentPink
+                                BusinessType.RESTAURANT -> SmavColors.WarningText
+                                BusinessType.RETAIL -> SmavColors.InfoText
+                                BusinessType.OTHER -> SmavColors.TextSecondary
                             }
                         )
                         if (pendingSyncCount > 0) {
                             Surface(
-                                color = Amber500.copy(alpha = 0.16f),
+                                color = SmavColors.WarningBg,
                                 shape = RoundedCornerShape(8.dp),
-                                border = BorderStroke(1.dp, Amber500.copy(alpha = 0.45f)),
+                                border = BorderStroke(1.dp, SmavColors.WarningBorder),
                                 modifier = Modifier.clickable {
                                     onNavigate(
                                         if (session.role.isAdminOnly()) SmavRoute.ADMIN_SYNC else SmavRoute.OFFLINE_SYNC
@@ -360,7 +372,7 @@ fun SmavAppScaffold(
                             ) {
                                 Text(
                                     text = "$pendingSyncCount pending sync",
-                                    color = Amber500,
+                                    color = SmavColors.WarningText,
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.SemiBold,
                                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
@@ -369,20 +381,21 @@ fun SmavAppScaffold(
                         }
                         if (!anyPrinterConnected) {
                             Surface(
-                                color = Color(0xFF1E293B),
+                                color = SmavColors.Surface,
                                 shape = RoundedCornerShape(8.dp),
+                                border = BorderStroke(1.dp, SmavColors.Border),
                                 modifier = Modifier.clickable { onNavigate(SmavRoute.PRINTER_SETTINGS) }
                             ) {
                                 Text(
                                     text = "Printer not connected",
-                                    color = Color(0xFFCBD5E1),
+                                    color = SmavColors.TextSecondary,
                                     fontSize = 11.sp,
                                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
                                 )
                             }
                         }
                     }
-                    HorizontalDivider(color = Color(0xFF1E293B))
+                    HorizontalDivider(color = SmavColors.Border)
                 }
             }
         ) { innerPadding ->
@@ -393,8 +406,8 @@ fun SmavAppScaffold(
     if (showSignOutDialog) {
         AlertDialog(
             onDismissRequest = { showSignOutDialog = false },
-            containerColor = Color(0xFF121629),
-            title = { Text("Sign Out of SMAV?", color = Color.White, fontWeight = FontWeight.Bold) },
+            containerColor = SmavColors.Surface,
+            title = { Text("Sign Out of SMAV?", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold) },
             text = {
                 Text(
                     text = if (pendingSyncCount > 0) {
@@ -402,7 +415,7 @@ fun SmavAppScaffold(
                     } else {
                         "Are you sure you want to end your current session?"
                     },
-                    color = Color(0xFFCBD5E1)
+                    color = SmavColors.TextSecondary
                 )
             },
             confirmButton = {
@@ -411,11 +424,13 @@ fun SmavAppScaffold(
                         showSignOutDialog = false
                         onSignOutConfirmed()
                     },
-                    colors = ButtonDefaults.buttonColors(containerColor = Rose600)
-                ) { Text("Sign Out") }
+                    colors = ButtonDefaults.buttonColors(containerColor = SmavColors.DangerText, contentColor = Color.White)
+                ) { Text("Sign Out", fontWeight = FontWeight.SemiBold) }
             },
             dismissButton = {
-                TextButton(onClick = { showSignOutDialog = false }) { Text("Cancel") }
+                TextButton(onClick = { showSignOutDialog = false }) {
+                    Text("Cancel", color = SmavColors.TextSecondary)
+                }
             }
         )
     }
@@ -425,9 +440,9 @@ fun SmavAppScaffold(
 fun StatusBadgeChip(text: String, color: Color, modifier: Modifier = Modifier) {
     Surface(
         modifier = modifier,
-        color = color.copy(alpha = 0.16f),
+        color = color.copy(alpha = 0.10f),
         shape = RoundedCornerShape(8.dp),
-        border = BorderStroke(1.dp, color.copy(alpha = 0.45f))
+        border = BorderStroke(1.dp, color.copy(alpha = 0.25f))
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
@@ -457,23 +472,28 @@ fun SummaryStatCard(
     title: String,
     value: String,
     subtitle: String = "",
-    accent: Color = Sky400,
+    accent: Color = SmavColors.TextPrimary,
     modifier: Modifier = Modifier
 ) {
     Card(
         modifier = modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF131933)),
-        border = BorderStroke(1.dp, Color(0xFF232C52)),
-        shape = RoundedCornerShape(14.dp)
+        colors = CardDefaults.cardColors(containerColor = SmavColors.Surface),
+        border = BorderStroke(1.dp, SmavColors.Border),
+        shape = RoundedCornerShape(14.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
     ) {
         Column(
             modifier = Modifier.padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            Text(title, color = Color(0xFF94A3B8), fontSize = 12.sp, fontWeight = FontWeight.Medium)
-            Text(value, color = accent, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Text(title, color = SmavColors.TextSecondary, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+            Text(
+                text = value,
+                style = SmavNumericStyles.StatValue,
+                color = accent
+            )
             if (subtitle.isNotBlank()) {
-                Text(subtitle, color = Color(0xFFCBD5E1), fontSize = 11.sp)
+                Text(subtitle, color = SmavColors.TextMuted, fontSize = 11.sp)
             }
         }
     }
@@ -497,12 +517,25 @@ fun <T> FilterFlowRow(
             FilterChip(
                 selected = isSelected,
                 onClick = { onSelect(item) },
-                label = { Text(labelOf(item), maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                label = {
+                    Text(
+                        labelOf(item),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
+                    )
+                },
                 colors = FilterChipDefaults.filterChipColors(
-                    selectedContainerColor = Color(0xFFFF2D82).copy(alpha = 0.22f),
+                    selectedContainerColor = SmavColors.TextPrimary,
                     selectedLabelColor = Color.White,
-                    containerColor = Color(0xFF161A33),
-                    labelColor = Color(0xFFCBD5E1)
+                    containerColor = SmavColors.Surface,
+                    labelColor = SmavColors.TextSecondary
+                ),
+                border = FilterChipDefaults.filterChipBorder(
+                    enabled = true,
+                    selected = isSelected,
+                    borderColor = SmavColors.Border,
+                    selectedBorderColor = SmavColors.TextPrimary
                 )
             )
         }
@@ -521,24 +554,17 @@ fun SearchField(
         onValueChange = onQueryChange,
         modifier = modifier.fillMaxWidth(),
         singleLine = true,
-        leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = Color(0xFF94A3B8)) },
+        leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = SmavColors.TextMuted) },
         trailingIcon = if (query.isNotEmpty()) {
             {
                 IconButton(onClick = { onQueryChange("") }) {
-                    Icon(Icons.Default.Close, contentDescription = "Clear", tint = Color(0xFF94A3B8))
+                    Icon(Icons.Default.Close, contentDescription = "Clear", tint = SmavColors.TextSecondary)
                 }
             }
         } else null,
-        placeholder = { Text(placeholder, color = Color(0xFF64748B), maxLines = 1, overflow = TextOverflow.Ellipsis) },
+        placeholder = { Text(placeholder, color = SmavColors.TextMuted, maxLines = 1, overflow = TextOverflow.Ellipsis) },
         shape = RoundedCornerShape(12.dp),
-        colors = OutlinedTextFieldDefaults.colors(
-            focusedContainerColor = Color(0xFF121832),
-            unfocusedContainerColor = Color(0xFF121832),
-            focusedTextColor = Color.White,
-            unfocusedTextColor = Color.White,
-            focusedBorderColor = Color(0xFFFF2D82),
-            unfocusedBorderColor = Color(0xFF2A3256)
-        )
+        colors = smavOutlinedFieldColors()
     )
 }
 
@@ -546,23 +572,28 @@ fun SearchField(
 fun ErrorBannerCard(message: String, onRetry: (() -> Unit)? = null) {
     Card(
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = Color(0x33E11D48)),
-        border = BorderStroke(1.dp, Rose600.copy(alpha = 0.5f)),
+        colors = CardDefaults.cardColors(containerColor = SmavColors.DangerBg),
+        border = BorderStroke(1.dp, SmavColors.DangerBorder),
         shape = RoundedCornerShape(12.dp)
     ) {
         Column(
             modifier = Modifier.padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text(message, color = Color(0xFFFDA4AF), fontSize = 13.sp)
+            Text(message, color = SmavColors.DangerText, fontSize = 13.sp, fontWeight = FontWeight.Medium)
             if (onRetry != null) {
                 OutlinedButton(
                     onClick = onRetry,
+                    border = BorderStroke(1.dp, SmavColors.DangerBorder),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = SmavColors.Surface,
+                        contentColor = SmavColors.DangerText
+                    ),
                     modifier = Modifier.heightIn(min = 42.dp)
                 ) {
                     Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(6.dp))
-                    Text("Retry")
+                    Text("Retry", fontWeight = FontWeight.SemiBold)
                 }
             }
         }
@@ -573,20 +604,20 @@ fun ErrorBannerCard(message: String, onRetry: (() -> Unit)? = null) {
 fun EmptyStateCard(title: String, subtitle: String, icon: ImageVector = Icons.Default.Inbox) {
     Card(
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF121629)),
-        border = BorderStroke(1.dp, Color(0xFF232C52)),
+        colors = CardDefaults.cardColors(containerColor = SmavColors.Surface),
+        border = BorderStroke(1.dp, SmavColors.Border),
         shape = RoundedCornerShape(14.dp)
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(20.dp),
+                .padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            Icon(icon, contentDescription = null, tint = Color(0xFF64748B), modifier = Modifier.size(32.dp))
-            Text(title, color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
-            Text(subtitle, color = Color(0xFF94A3B8), fontSize = 13.sp)
+            Icon(icon, contentDescription = null, tint = SmavColors.TextMuted, modifier = Modifier.size(32.dp))
+            Text(title, color = SmavColors.TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 15.sp, textAlign = TextAlign.Center)
+            Text(subtitle, color = SmavColors.TextSecondary, fontSize = 13.sp, textAlign = TextAlign.Center)
         }
     }
 }
@@ -610,14 +641,15 @@ fun MobileFormDialog(
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 24.dp)
                 .imePadding(),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF121629)),
-            border = BorderStroke(1.dp, Color(0xFF2B355F)),
-            shape = RoundedCornerShape(18.dp)
+            colors = CardDefaults.cardColors(containerColor = SmavColors.Surface),
+            border = BorderStroke(1.dp, SmavColors.Border),
+            shape = RoundedCornerShape(18.dp),
+            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 620.dp)
+                    .heightIn(max = 640.dp)
             ) {
                 Row(
                     modifier = Modifier
@@ -626,12 +658,12 @@ fun MobileFormDialog(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+                    Text(title, color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 17.sp)
                     IconButton(onClick = { if (!isSaving) onDismiss() }) {
-                        Icon(Icons.Default.Close, contentDescription = "Close", tint = Color(0xFF94A3B8))
+                        Icon(Icons.Default.Close, contentDescription = "Close", tint = SmavColors.TextSecondary)
                     }
                 }
-                HorizontalDivider(color = Color(0xFF232C52))
+                HorizontalDivider(color = SmavColors.Border)
                 Column(
                     modifier = Modifier
                         .weight(1f, fill = false)
@@ -640,38 +672,26 @@ fun MobileFormDialog(
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                     content = content
                 )
-                HorizontalDivider(color = Color(0xFF232C52))
+                HorizontalDivider(color = SmavColors.Border)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 16.dp, vertical = 12.dp),
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    OutlinedButton(
+                    SmavSecondaryButton(
+                        text = "Cancel",
                         onClick = onDismiss,
                         enabled = !isSaving,
-                        modifier = Modifier
-                            .weight(1f)
-                            .heightIn(min = 48.dp)
-                    ) { Text("Cancel") }
-                    Button(
+                        modifier = Modifier.weight(1f)
+                    )
+                    SmavGradientButton(
+                        text = confirmText,
                         onClick = onConfirm,
-                        enabled = confirmEnabled && !isSaving,
-                        modifier = Modifier
-                            .weight(1f)
-                            .heightIn(min = 48.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF2D82))
-                    ) {
-                        if (isSaving) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(18.dp),
-                                color = Color.White,
-                                strokeWidth = 2.dp
-                            )
-                        } else {
-                            Text(confirmText, fontWeight = FontWeight.Bold)
-                        }
-                    }
+                        enabled = confirmEnabled,
+                        busy = isSaving,
+                        modifier = Modifier.weight(1f)
+                    )
                 }
             }
         }
@@ -693,9 +713,10 @@ fun OutletSelectorDialog(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(16.dp),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF121629)),
-            border = BorderStroke(1.dp, Color(0xFF2B355F)),
-            shape = RoundedCornerShape(18.dp)
+            colors = CardDefaults.cardColors(containerColor = SmavColors.Surface),
+            border = BorderStroke(1.dp, SmavColors.Border),
+            shape = RoundedCornerShape(18.dp),
+            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
         ) {
             Column(
                 modifier = Modifier
@@ -704,7 +725,7 @@ fun OutletSelectorDialog(
                     .padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text("Select Active Outlet", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                Text("Select Active Outlet", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 18.sp)
                 Column(
                     modifier = Modifier
                         .weight(1f, fill = false)
@@ -718,31 +739,31 @@ fun OutletSelectorDialog(
                                 .fillMaxWidth()
                                 .clickable { onSelect(option) },
                             colors = CardDefaults.cardColors(
-                                containerColor = if (selected) Color(0xFF1E2A4F) else Color(0xFF161B33)
+                                containerColor = if (selected) SmavColors.InfoBg else SmavColors.SurfaceSubtle
                             ),
-                            border = BorderStroke(1.dp, if (selected) Sky400 else Color(0xFF263055)),
+                            border = BorderStroke(1.dp, if (selected) SmavColors.InfoText else SmavColors.Border),
                             shape = RoundedCornerShape(12.dp)
                         ) {
                             Column(
                                 modifier = Modifier.padding(12.dp),
                                 verticalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
-                                Text(option.businessName, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                                Text(option.businessName, color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 15.sp)
                                 Text(
                                     "${option.normalizedBusinessType.displayName} • Code: ${option.branchCode.ifBlank { "N/A" }}",
-                                    color = Sky400,
-                                    fontSize = 12.sp
+                                    color = SmavColors.InfoText,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Medium
                                 )
                             }
                         }
                     }
                 }
-                OutlinedButton(
+                SmavSecondaryButton(
+                    text = "Close",
                     onClick = onDismiss,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 48.dp)
-                ) { Text("Close") }
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
         }
     }

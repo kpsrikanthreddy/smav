@@ -390,6 +390,12 @@ interface ApiService {
     @GET("api/salon/stylists")
     suspend fun getSalonStylists(@Header("Authorization") token: String): Response<SalonStylistsResponse>
 
+    @GET("api/salon/stylists")
+    suspend fun getSalonStylistsRaw(
+        @Header("Authorization") token: String,
+        @Query("outletId") outletId: String? = null
+    ): Response<JsonObject>
+
     @GET("api/salon/appointments")
     suspend fun getSalonAppointments(@Header("Authorization") token: String): Response<SalonAppointmentsResponse>
 

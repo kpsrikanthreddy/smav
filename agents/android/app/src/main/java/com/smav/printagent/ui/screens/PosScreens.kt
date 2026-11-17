@@ -16,7 +16,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.smav.printagent.data.local.AppDatabase
@@ -56,15 +55,12 @@ fun PosBillingRouterScreen(
                 subtitle = "You are currently in Central Enterprise Headquarters view. Choose a Salon, Restaurant, or Retail outlet to launch POS billing.",
                 icon = Icons.Default.PointOfSale
             )
-            Button(
+            SmavGradientButton(
+                text = "Choose Authorized Outlet",
+                icon = Icons.Default.SwapHoriz,
                 onClick = onOpenOutletSwitcher,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF2D82)),
-                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
-            ) {
-                Icon(Icons.Default.SwapHoriz, contentDescription = null)
-                Spacer(Modifier.width(8.dp))
-                Text("Choose Authorized Outlet", fontWeight = FontWeight.Bold)
-            }
+                modifier = Modifier.fillMaxWidth()
+            )
         }
         return
     }
@@ -183,12 +179,11 @@ private fun SalonPosScreen(
     var printFeedback by remember { mutableStateOf<String?>(null) }
 
     val services = bundle?.salonServices.orEmpty()
-    val stylists = remember(bundle?.stylists, session.userId, session.userName) {
-        val remote = bundle?.stylists.orEmpty()
-        if (remote.isNotEmpty()) remote else listOf(
-            Stylist(id = session.userId.ifBlank { "front_desk" }, name = session.userName.ifBlank { "Front Desk" }, specialty = "General")
-        )
-    }
+    val stylists = bundle?.stylists.orEmpty()
+    val stylistWarning = bundle?.stylistWarning
+        ?: if (!loading && bundle != null && stylists.isEmpty()) {
+            "No active stylists returned for this outlet. Tap Retry to reload."
+        } else null
     val appointments = bundle?.appointments.orEmpty()
 
     val categories = remember(services) {
@@ -206,6 +201,15 @@ private fun SalonPosScreen(
             (selectedCategory == "All" || s.category == selectedCategory) &&
                 (selectedSubcategory == "All" || s.subcategory == selectedSubcategory) &&
                 (q.isBlank() || s.name.lowercase(Locale.ENGLISH).contains(q) || s.category.lowercase(Locale.ENGLISH).contains(q))
+        }
+    }
+
+    val qtyByServiceId = remember(cart) {
+        cart.groupBy { it.service.id }.mapValues { (_, items) -> items.sumOf { it.quantity } }
+    }
+    val stylistsByServiceId = remember(cart) {
+        cart.groupBy { it.service.id }.mapValues { (_, items) ->
+            items.mapNotNull { it.stylist?.name }.distinct().joinToString(", ")
         }
     }
 
@@ -228,36 +232,36 @@ private fun SalonPosScreen(
         ) {
             item {
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = onRefresh, enabled = !loading, modifier = Modifier.heightIn(min = 44.dp)) {
-                        Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Sync Catalog (${services.size})")
-                    }
+                    SmavSecondaryButton(
+                        text = "Sync Catalog (${services.size})",
+                        icon = Icons.Default.Refresh,
+                        enabled = !loading,
+                        onClick = onRefresh
+                    )
                     if (appointments.isNotEmpty()) {
-                        OutlinedButton(onClick = { showAppointmentsDialog = true }, modifier = Modifier.heightIn(min = 44.dp)) {
-                            Icon(Icons.Default.CalendarToday, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text("Appointments (${appointments.size})")
-                        }
+                        SmavSecondaryButton(
+                            text = "Appointments (${appointments.size})",
+                            icon = Icons.Default.CalendarToday,
+                            onClick = { showAppointmentsDialog = true }
+                        )
                     }
-                    OutlinedButton(onClick = onOpenRecentBills, modifier = Modifier.heightIn(min = 44.dp)) {
-                        Icon(Icons.Default.ReceiptLong, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Recent Bills")
-                    }
+                    SmavSecondaryButton(
+                        text = "Recent Bills",
+                        icon = Icons.Default.ReceiptLong,
+                        onClick = onOpenRecentBills
+                    )
                 }
             }
 
             if (bundle?.fromCache == true) {
                 item {
-                    Card(colors = CardDefaults.cardColors(containerColor = Amber500.copy(alpha = 0.16f))) {
-                        Text("Using offline cached catalog (${services.size} services).", color = Amber500, fontSize = 12.sp, modifier = Modifier.padding(10.dp))
-                    }
+                    SmavWarningBannerCard("Using offline cached catalog (${services.size} services).")
                 }
             }
 
-            if (loading) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = Color(0xFFFF2D82)) }
+            if (loading) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = SmavColors.AccentPink) }
             if (loadError != null) item { ErrorBannerCard(loadError, onRetry = onRefresh) }
+            if (stylistWarning != null) item { ErrorBannerCard(stylistWarning, onRetry = onRefresh) }
             if (billingError != null) item { ErrorBannerCard(billingError!!) }
 
             item { SearchField(search, { search = it }, "Search hair, skin, spa services...") }
@@ -281,71 +285,77 @@ private fun SalonPosScreen(
             }
 
             items(filteredServices, key = { it.id }) { srv ->
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFF121629)),
-                    border = BorderStroke(1.dp, Color(0xFF252E54)),
-                    shape = RoundedCornerShape(14.dp)
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(12.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(srv.name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                            Text(
-                                "${srv.category}${if (srv.subcategory.isNotBlank()) " • ${srv.subcategory}" else ""}",
-                                color = Color(0xFF94A3B8),
-                                fontSize = 11.sp
-                            )
-                            Text("Rs. ${String.format(Locale.ENGLISH, "%.2f", srv.price)} (+${srv.gstPercent.toInt()}% GST)", color = Emerald500, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                val qty = qtyByServiceId[srv.id] ?: 0
+                val assignedStylistNames = stylistsByServiceId[srv.id].orEmpty()
+                SmavItemCard(
+                    title = srv.name,
+                    subtitle = "${srv.category}${if (srv.subcategory.isNotBlank()) " • ${srv.subcategory}" else ""}",
+                    meta = "+${srv.gstPercent.toInt()}% GST",
+                    price = srv.price,
+                    quantity = qty,
+                    enabled = !loading && stylists.isNotEmpty(),
+                    disabledReason = if (!loading && stylists.isEmpty()) "Active stylist required" else null,
+                    onIncrement = {
+                        if (stylists.isEmpty()) {
+                            billingError = stylistWarning ?: "No active stylists available. Tap Retry to load stylists."
+                        } else {
+                            billingError = null
+                            val lastIdx = cart.indexOfLast { it.service.id == srv.id }
+                            if (lastIdx >= 0) {
+                                cart = cart.toMutableList().also { list ->
+                                    list[lastIdx] = list[lastIdx].copy(quantity = list[lastIdx].quantity + 1)
+                                }
+                            } else {
+                                pendingServiceToPickStylist = srv
+                            }
                         }
-                        Button(
-                            onClick = { pendingServiceToPickStylist = srv },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF2D82)),
-                            modifier = Modifier.heightIn(min = 48.dp)
-                        ) {
-                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text("Add")
+                    },
+                    onDecrement = {
+                        val lastIdx = cart.indexOfLast { it.service.id == srv.id }
+                        if (lastIdx >= 0) {
+                            val current = cart[lastIdx]
+                            cart = if (current.quantity <= 1) {
+                                cart.toMutableList().also { it.removeAt(lastIdx) }
+                            } else {
+                                cart.toMutableList().also { it[lastIdx] = current.copy(quantity = current.quantity - 1) }
+                            }
                         }
-                    }
-                }
+                    },
+                    footer = if (qty > 0 && assignedStylistNames.isNotBlank()) {
+                        {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Stylist: $assignedStylistNames",
+                                    color = SmavColors.StepperGreen,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                TextButton(
+                                    onClick = { pendingServiceToPickStylist = srv },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                                ) {
+                                    Text("Add / Change Stylist", color = SmavColors.AccentPink, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                            }
+                        }
+                    } else null
+                )
             }
         }
 
-        // Bottom Checkout Bar
-        Surface(
-            color = Color(0xFF121629),
-            tonalElevation = 6.dp,
-            border = BorderStroke(1.dp, Color(0xFF2B355F)),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 10.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("${cart.sumOf { it.quantity }} service(s) in cart", color = Color(0xFF94A3B8), fontSize = 12.sp)
-                    Text("Total: Rs. ${String.format(Locale.ENGLISH, "%.0f", grandTotal)}", color = Emerald500, fontWeight = FontWeight.Bold, fontSize = 17.sp)
-                }
-                Button(
-                    onClick = { showCartSheet = true },
-                    enabled = cart.isNotEmpty(),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF2D82)),
-                    modifier = Modifier.heightIn(min = 48.dp)
-                ) {
-                    Icon(Icons.Default.ShoppingCartCheckout, contentDescription = null)
-                    Spacer(Modifier.width(6.dp))
-                    Text("Review & Bill", fontWeight = FontWeight.Bold)
-                }
-            }
-        }
+        SmavCheckoutBottomBar(
+            countLabel = "${cart.sumOf { it.quantity }} service(s) in cart",
+            totalAmount = grandTotal,
+            ctaText = "Review & Bill",
+            ctaEnabled = cart.isNotEmpty(),
+            ctaIcon = Icons.Default.ShoppingCartCheckout,
+            onCtaClick = { showCartSheet = true }
+        )
     }
 
     pendingServiceToPickStylist?.let { srv ->
@@ -355,10 +365,13 @@ private fun SalonPosScreen(
             confirmText = "Cancel",
             onConfirm = { pendingServiceToPickStylist = null }
         ) {
-            Text(srv.name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
-            Text("Choose stylist for this service:", color = Color(0xFF94A3B8), fontSize = 12.sp)
+            Text(srv.name, color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            Text("Choose required stylist for this service:", color = SmavColors.TextSecondary, fontSize = 12.sp)
             stylists.forEach { stylist ->
-                Button(
+                SmavSecondaryButton(
+                    text = "${stylist.name}${if (stylist.specialty.isNotBlank()) " (${stylist.specialty})" else ""}",
+                    icon = Icons.Default.Person,
+                    modifier = Modifier.fillMaxWidth(),
                     onClick = {
                         val existingIdx = cart.indexOfFirst { it.service.id == srv.id && it.stylist?.id == stylist.id }
                         cart = if (existingIdx >= 0) {
@@ -369,12 +382,8 @@ private fun SalonPosScreen(
                             cart + SalonCartItem(service = srv, stylist = stylist, quantity = 1)
                         }
                         pendingServiceToPickStylist = null
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E2646)),
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
-                ) {
-                    Text("${stylist.name}${if (stylist.specialty.isNotBlank()) " (${stylist.specialty})" else ""}", color = Color.White)
-                }
+                    }
+                )
             }
         }
     }
@@ -387,8 +396,7 @@ private fun SalonPosScreen(
             onConfirm = { showAppointmentsDialog = false }
         ) {
             appointments.forEach { appt ->
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFF181E3B)),
+                SmavCard(
                     onClick = {
                         customerName = appt.customerName
                         customerPhone = appt.customerPhone
@@ -400,11 +408,9 @@ private fun SalonPosScreen(
                         showAppointmentsDialog = false
                     }
                 ) {
-                    Column(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                        Text("${appt.customerName} (${appt.customerPhone})", color = Color.White, fontWeight = FontWeight.Bold)
-                        Text("${appt.serviceName} • ${appt.appointmentTime}", color = Sky400, fontSize = 12.sp)
-                        Text("Tap to load into POS bill", color = Emerald500, fontSize = 11.sp)
-                    }
+                    Text("${appt.customerName} (${appt.customerPhone})", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold)
+                    Text("${appt.serviceName} • ${appt.appointmentTime}", color = SmavColors.InfoText, fontSize = 12.sp)
+                    Text("Tap to load into POS bill", color = SmavColors.StepperGreen, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
         }
@@ -415,72 +421,98 @@ private fun SalonPosScreen(
             title = "Finalize Salon Bill",
             onDismiss = { showCartSheet = false },
             confirmText = "Generate & Print Bill",
-            confirmEnabled = effectiveCart.isNotEmpty() && !busyBilling,
+            confirmEnabled = effectiveCart.isNotEmpty() && !busyBilling && stylists.isNotEmpty() && effectiveCart.none { it.stylist == null || it.stylist.id.isBlank() },
             isSaving = busyBilling,
             onConfirm = {
-                busyBilling = true
-                billingError = null
-                scope.launch {
-                    val res = billingRepo.createSalonBill(
-                        cartItems = effectiveCart,
-                        customerName = customerName,
-                        customerPhone = customerPhone,
-                        paymentMode = paymentMode,
-                        branch = branch,
-                        cashierName = session.userName,
-                        shouldPrint = true
-                    )
-                    res.onSuccess { bill ->
-                        completedBill = bill
-                        printFeedback = "Saved offline & queued for cloud sync."
-                        cart = emptyList()
-                        customerName = ""
-                        customerPhone = ""
-                        discountPercentText = "0"
-                        showCartSheet = false
-                    }.onFailure { err ->
-                        billingError = err.message ?: "Failed to generate bill."
+                if (!busyBilling) {
+                    if (effectiveCart.any { it.stylist == null || it.stylist.id.isBlank() }) {
+                        billingError = "Select a stylist for every salon service before printing."
+                    } else {
+                        busyBilling = true
+                        billingError = null
+                        scope.launch {
+                            val res = billingRepo.createSalonBill(
+                                cartItems = effectiveCart,
+                                customerName = customerName,
+                                customerPhone = customerPhone,
+                                paymentMode = paymentMode,
+                                branch = branch,
+                                cashierName = session.userName,
+                                shouldPrint = false
+                            )
+                            res.onSuccess { bill ->
+                                completedBill = bill
+                                cart = emptyList()
+                                customerName = ""
+                                customerPhone = ""
+                                discountPercentText = "0"
+                                showCartSheet = false
+
+                                val printRes = billingRepo.reprintSalonBill(bill.id, branch, session.userName)
+                                printFeedback = printRes.fold(
+                                    { "Bill ${bill.billNumber} saved and printed via Bluetooth ESC/POS." },
+                                    { err -> "Bill ${bill.billNumber} saved, but Bluetooth print failed (${err.message ?: "Printer unavailable"}). Tap Reprint after connecting printer." }
+                                )
+                            }.onFailure { err ->
+                                billingError = err.message ?: "Failed to generate bill."
+                            }
+                            busyBilling = false
+                        }
                     }
-                    busyBilling = false
                 }
             }
         ) {
             effectiveCart.forEachIndexed { idx, item ->
-                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF181E3B))) {
+                SmavCard {
                     Row(
-                        modifier = Modifier.fillMaxWidth().padding(10.dp),
+                        modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(item.service.name, color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                            Text("Stylist: ${item.stylist?.name ?: "Staff"}", color = Sky400, fontSize = 11.sp)
-                            Text("Rs. ${String.format(Locale.ENGLISH, "%.2f", item.totalAmount)}", color = Emerald500, fontSize = 12.sp)
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(item.service.name, color = SmavColors.TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                            Text("Stylist: ${item.stylist?.name ?: "Staff"}", color = SmavColors.InfoText, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                            Text(
+                                text = "Rs. ${String.format(Locale.ENGLISH, "%.2f", item.totalAmount)}",
+                                style = SmavNumericStyles.Price,
+                                color = SmavColors.StepperGreen
+                            )
                         }
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            IconButton(onClick = {
+                        SmavQuantityStepper(
+                            quantity = item.quantity,
+                            itemName = item.service.name,
+                            onDecrement = {
                                 cart = if (item.quantity <= 1) {
                                     cart.toMutableList().also { it.removeAt(idx) }
                                 } else {
                                     cart.toMutableList().also { it[idx] = it[idx].copy(quantity = it[idx].quantity - 1) }
                                 }
-                            }) { Icon(Icons.Default.Remove, contentDescription = "Decrease") }
-                            Text("${item.quantity}", color = Color.White, fontWeight = FontWeight.Bold)
-                            IconButton(onClick = {
+                            },
+                            onIncrement = {
                                 cart = cart.toMutableList().also { it[idx] = it[idx].copy(quantity = it[idx].quantity + 1) }
-                            }) { Icon(Icons.Default.Add, contentDescription = "Increase") }
-                        }
+                            }
+                        )
                     }
                 }
             }
 
-            OutlinedTextField(value = customerName, onValueChange = { customerName = it }, label = { Text("Customer Name (Optional)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(
+                value = customerName,
+                onValueChange = { customerName = it },
+                label = { Text("Customer Name (Optional)") },
+                singleLine = true,
+                colors = smavOutlinedFieldColors(),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            )
             OutlinedTextField(
                 value = customerPhone,
                 onValueChange = { customerPhone = it },
                 label = { Text("Customer Phone (Optional)") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
                 singleLine = true,
+                colors = smavOutlinedFieldColors(),
+                shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.fillMaxWidth()
             )
             OutlinedTextField(
@@ -489,47 +521,52 @@ private fun SalonPosScreen(
                 label = { Text("Discount (%)") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                 singleLine = true,
+                colors = smavOutlinedFieldColors(),
+                shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.fillMaxWidth()
             )
-            Text("Payment Mode", color = Color(0xFFCBD5E1), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            Text("Payment Mode", color = SmavColors.TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
             FilterFlowRow(
                 items = listOf("upi", "cash", "card", "split"),
                 selected = paymentMode,
                 labelOf = { it.uppercase(Locale.ENGLISH) },
                 onSelect = { paymentMode = it }
             )
-            SummaryStatCard("Net Payable (incl. GST)", "Rs. ${String.format(Locale.ENGLISH, "%.0f", grandTotal)}", accent = Emerald500)
+            SummaryStatCard("Net Payable (incl. GST)", "Rs. ${String.format(Locale.ENGLISH, "%.0f", grandTotal)}", accent = SmavColors.StepperGreen)
         }
     }
 
     completedBill?.let { bill ->
         AlertDialog(
             onDismissRequest = { completedBill = null },
-            containerColor = Color(0xFF121629),
-            title = { Text("Bill Generated", color = Emerald500, fontWeight = FontWeight.Bold) },
+            containerColor = SmavColors.Surface,
+            title = { Text("Bill Generated", color = SmavColors.StepperGreen, fontWeight = FontWeight.Bold) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Bill No: ${bill.billNumber}", color = Color.White, fontWeight = FontWeight.Bold)
-                    Text("Amount: Rs. ${String.format(Locale.ENGLISH, "%.2f", bill.grandTotal)}", color = Emerald500)
-                    Text("Payment: ${bill.paymentMode.uppercase(Locale.ENGLISH)}", color = Color(0xFFCBD5E1))
-                    if (printFeedback != null) Text(printFeedback!!, color = Sky400, fontSize = 12.sp)
+                    Text("Bill No: ${bill.billNumber}", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold)
+                    Text("Amount: Rs. ${String.format(Locale.ENGLISH, "%.2f", bill.grandTotal)}", style = SmavNumericStyles.Price, color = SmavColors.StepperGreen)
+                    Text("Payment: ${bill.paymentMode.uppercase(Locale.ENGLISH)}", color = SmavColors.TextSecondary)
+                    if (printFeedback != null) Text(printFeedback!!, color = SmavColors.InfoText, fontSize = 12.sp)
                 }
             },
             confirmButton = {
-                Button(onClick = {
-                    scope.launch {
-                        val res = billingRepo.reprintSalonBill(bill.id, branch, session.userName)
-                        printFeedback = res.fold(
-                            { "Receipt reprinted via Bluetooth." },
-                            { "Printer unavailable (${it.message}). Check Printer Settings." }
-                        )
-                    }
-                }) { Text("Reprint") }
+                Button(
+                    onClick = {
+                        scope.launch {
+                            val res = billingRepo.reprintSalonBill(bill.id, branch, session.userName)
+                            printFeedback = res.fold(
+                                { "Receipt reprinted via Bluetooth." },
+                                { "Printer unavailable (${it.message}). Check Printer Settings." }
+                            )
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = SmavColors.AccentPink, contentColor = Color.White)
+                ) { Text("Reprint", fontWeight = FontWeight.Bold) }
             },
             dismissButton = {
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    TextButton(onClick = onOpenPrinterSettings) { Text("Printers") }
-                    TextButton(onClick = { completedBill = null }) { Text("Done") }
+                    TextButton(onClick = onOpenPrinterSettings) { Text("Printers", color = SmavColors.InfoText) }
+                    TextButton(onClick = { completedBill = null }) { Text("Done", color = SmavColors.TextSecondary) }
                 }
             }
         )
@@ -590,6 +627,10 @@ private fun RestaurantPosScreen(
         }
     }
 
+    val qtyByMenuId = remember(cart) {
+        cart.groupBy { it.item.id }.mapValues { (_, items) -> items.sumOf { it.quantity } }
+    }
+
     val subtotal = cart.sumOf { it.subtotal }
     val estimatedGrandTotal = Math.round(subtotal * 1.05).toDouble()
 
@@ -604,40 +645,51 @@ private fun RestaurantPosScreen(
         ) {
             item {
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = onRefresh, enabled = !loading, modifier = Modifier.heightIn(min = 44.dp)) {
-                        Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Sync Menu (${menu.size})")
-                    }
-                    OutlinedButton(onClick = onOpenRecentBills, modifier = Modifier.heightIn(min = 44.dp)) {
-                        Icon(Icons.Default.ReceiptLong, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Orders & Reprint")
-                    }
+                    SmavSecondaryButton(
+                        text = "Sync Menu (${menu.size})",
+                        icon = Icons.Default.Refresh,
+                        enabled = !loading,
+                        onClick = onRefresh
+                    )
+                    SmavSecondaryButton(
+                        text = "Orders & Reprint",
+                        icon = Icons.Default.ReceiptLong,
+                        onClick = onOpenRecentBills
+                    )
                     FilterChip(
                         selected = vegOnly,
                         onClick = { vegOnly = !vegOnly },
-                        label = { Text("Veg Only") }
+                        label = { Text("Veg Only", fontWeight = FontWeight.SemiBold) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = SmavColors.StepperGreen,
+                            selectedLabelColor = Color.White,
+                            containerColor = SmavColors.Surface,
+                            labelColor = SmavColors.TextSecondary
+                        )
                     )
                 }
             }
 
             item {
-                Text("Order Mode", color = Color(0xFFCBD5E1), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                FilterFlowRow(OrderType.entries, orderType, { it.label }, {
-                    orderType = it
-                    if (it != OrderType.DINE_IN) selectedTable = it.label else if (!selectedTable.startsWith("Table")) selectedTable = tables.first().tableNumber
-                })
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Order Mode", color = SmavColors.TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    FilterFlowRow(OrderType.entries, orderType, { it.label }, {
+                        orderType = it
+                        if (it != OrderType.DINE_IN) selectedTable = it.label else if (!selectedTable.startsWith("Table")) selectedTable = tables.first().tableNumber
+                    })
+                }
             }
 
             if (orderType == OrderType.DINE_IN) {
                 item {
-                    Text("Table", color = Color(0xFFCBD5E1), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                    FilterFlowRow(tables.map { it.tableNumber }, selectedTable, { it }, { selectedTable = it })
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Table", color = SmavColors.TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        FilterFlowRow(tables.map { it.tableNumber }, selectedTable, { it }, { selectedTable = it })
+                    }
                 }
             }
 
-            if (loading) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = Amber500) }
+            if (loading) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = SmavColors.AccentOrange) }
             if (loadError != null) item { ErrorBannerCard(loadError, onRetry = onRefresh) }
             if (orderError != null) item { ErrorBannerCard(orderError!!) }
 
@@ -651,78 +703,49 @@ private fun RestaurantPosScreen(
             }
 
             items(filteredMenu, key = { it.id }) { m ->
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFF121629)),
-                    border = BorderStroke(1.dp, Color(0xFF252E54)),
-                    shape = RoundedCornerShape(14.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(12.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                StatusBadgeChip(
-                                    text = if (m.isVeg) "VEG" else "NON-VEG",
-                                    color = if (m.isVeg) Emerald500 else Rose600
-                                )
-                                Text(m.category, color = Color(0xFF94A3B8), fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                val qty = qtyByMenuId[m.id] ?: 0
+                SmavItemCard(
+                    title = m.name,
+                    subtitle = m.category,
+                    badgeText = if (m.isVeg) "VEG" else "NON-VEG",
+                    badgeColor = if (m.isVeg) SmavColors.StepperGreen else Color(0xFFE11D48),
+                    price = m.basePrice,
+                    quantity = qty,
+                    onIncrement = {
+                        if (m.variants.isNotEmpty()) {
+                            pendingVariantItem = m
+                        } else {
+                            val idx = cart.indexOfFirst { it.item.id == m.id && it.selectedVariant == null }
+                            cart = if (idx >= 0) {
+                                cart.toMutableList().also { it[idx] = it[idx].copy(quantity = it[idx].quantity + 1) }
+                            } else {
+                                cart + RestaurantCartItem(m)
                             }
-                            Text(m.name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp, modifier = Modifier.padding(top = 4.dp))
-                            Text("Rs. ${String.format(Locale.ENGLISH, "%.2f", m.basePrice)}", color = Amber500, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                         }
-                        Button(
-                            onClick = {
-                                if (m.variants.isNotEmpty()) {
-                                    pendingVariantItem = m
-                                } else {
-                                    val idx = cart.indexOfFirst { it.item.id == m.id && it.selectedVariant == null }
-                                    cart = if (idx >= 0) {
-                                        cart.toMutableList().also { it[idx] = it[idx].copy(quantity = it[idx].quantity + 1) }
-                                    } else {
-                                        cart + RestaurantCartItem(m)
-                                    }
-                                }
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = Amber500, contentColor = Color.Black),
-                            modifier = Modifier.heightIn(min = 48.dp)
-                        ) {
-                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text("Add", fontWeight = FontWeight.Bold)
+                    },
+                    onDecrement = {
+                        val lastIdx = cart.indexOfLast { it.item.id == m.id }
+                        if (lastIdx >= 0) {
+                            val current = cart[lastIdx]
+                            cart = if (current.quantity <= 1) {
+                                cart.toMutableList().also { it.removeAt(lastIdx) }
+                            } else {
+                                cart.toMutableList().also { it[lastIdx] = current.copy(quantity = current.quantity - 1) }
+                            }
                         }
                     }
-                }
+                )
             }
         }
 
-        Surface(
-            color = Color(0xFF121629),
-            border = BorderStroke(1.dp, Color(0xFF2B355F)),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("${cart.sumOf { it.quantity }} item(s) • $selectedTable", color = Color(0xFF94A3B8), fontSize = 12.sp)
-                    Text("Total: Rs. ${String.format(Locale.ENGLISH, "%.0f", estimatedGrandTotal)}", color = Amber500, fontWeight = FontWeight.Bold, fontSize = 17.sp)
-                }
-                Button(
-                    onClick = { showCartSheet = true },
-                    enabled = cart.isNotEmpty(),
-                    colors = ButtonDefaults.buttonColors(containerColor = Amber500, contentColor = Color.Black),
-                    modifier = Modifier.heightIn(min = 48.dp)
-                ) {
-                    Icon(Icons.Default.Kitchen, contentDescription = null)
-                    Spacer(Modifier.width(6.dp))
-                    Text("KOT & Bill", fontWeight = FontWeight.Bold)
-                }
-            }
-        }
+        SmavCheckoutBottomBar(
+            countLabel = "${cart.sumOf { it.quantity }} item(s) • $selectedTable",
+            totalAmount = estimatedGrandTotal,
+            ctaText = "KOT & Bill",
+            ctaEnabled = cart.isNotEmpty(),
+            ctaIcon = Icons.Default.Kitchen,
+            onCtaClick = { showCartSheet = true }
+        )
     }
 
     pendingVariantItem?.let { item ->
@@ -733,18 +756,25 @@ private fun RestaurantPosScreen(
             confirmText = "Cancel",
             onConfirm = { pendingVariantItem = null }
         ) {
-            Text(item.name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
-            OutlinedTextField(value = note, onValueChange = { note = it }, label = { Text("Kitchen Note (optional)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            Text(item.name, color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            OutlinedTextField(
+                value = note,
+                onValueChange = { note = it },
+                label = { Text("Kitchen Note (optional)") },
+                singleLine = true,
+                colors = smavOutlinedFieldColors(),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            )
             item.variants.forEach { variant ->
-                Button(
+                SmavSecondaryButton(
+                    text = "${variant.name} (Rs. ${String.format(Locale.ENGLISH, "%.0f", item.basePrice + variant.priceDelta)})",
+                    modifier = Modifier.fillMaxWidth(),
                     onClick = {
                         cart = cart + RestaurantCartItem(item, variant, 1, note)
                         pendingVariantItem = null
-                    },
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
-                ) {
-                    Text("${variant.name} (Rs. ${String.format(Locale.ENGLISH, "%.0f", item.basePrice + variant.priceDelta)})")
-                }
+                    }
+                )
             }
         }
     }
@@ -786,48 +816,76 @@ private fun RestaurantPosScreen(
             }
         ) {
             cart.forEachIndexed { idx, c ->
-                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF181E3B))) {
+                SmavCard {
                     Row(
-                        modifier = Modifier.fillMaxWidth().padding(10.dp),
+                        modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("${c.item.name}${c.selectedVariant?.let { " [${it.name}]" } ?: ""}", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                            Text("Rs. ${String.format(Locale.ENGLISH, "%.2f", c.subtotal)}", color = Amber500, fontSize = 12.sp)
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text("${c.item.name}${c.selectedVariant?.let { " [${it.name}]" } ?: ""}", color = SmavColors.TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                            Text(
+                                text = "Rs. ${String.format(Locale.ENGLISH, "%.2f", c.subtotal)}",
+                                style = SmavNumericStyles.Price,
+                                color = SmavColors.StepperGreen
+                            )
                         }
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            IconButton(onClick = {
+                        SmavQuantityStepper(
+                            quantity = c.quantity,
+                            itemName = c.item.name,
+                            onDecrement = {
                                 cart = if (c.quantity <= 1) cart.toMutableList().also { it.removeAt(idx) }
                                 else cart.toMutableList().also { it[idx] = it[idx].copy(quantity = it[idx].quantity - 1) }
-                            }) { Icon(Icons.Default.Remove, contentDescription = "Decrease") }
-                            Text("${c.quantity}", color = Color.White, fontWeight = FontWeight.Bold)
-                            IconButton(onClick = {
+                            },
+                            onIncrement = {
                                 cart = cart.toMutableList().also { it[idx] = it[idx].copy(quantity = it[idx].quantity + 1) }
-                            }) { Icon(Icons.Default.Add, contentDescription = "Increase") }
-                        }
+                            }
+                        )
                     }
                 }
             }
-            OutlinedTextField(value = specialInstructions, onValueChange = { specialInstructions = it }, label = { Text("Kitchen Instructions (optional)") }, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(value = customerName, onValueChange = { customerName = it }, label = { Text("Customer Name (optional)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(value = customerPhone, onValueChange = { customerPhone = it }, label = { Text("Customer Phone (optional)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(
+                value = specialInstructions,
+                onValueChange = { specialInstructions = it },
+                label = { Text("Kitchen Instructions (optional)") },
+                colors = smavOutlinedFieldColors(),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            )
+            OutlinedTextField(
+                value = customerName,
+                onValueChange = { customerName = it },
+                label = { Text("Customer Name (optional)") },
+                singleLine = true,
+                colors = smavOutlinedFieldColors(),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            )
+            OutlinedTextField(
+                value = customerPhone,
+                onValueChange = { customerPhone = it },
+                label = { Text("Customer Phone (optional)") },
+                singleLine = true,
+                colors = smavOutlinedFieldColors(),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            )
             FilterFlowRow(listOf("upi", "cash", "card"), paymentMode, { it.uppercase(Locale.ENGLISH) }, { paymentMode = it })
-            SummaryStatCard("Grand Total (incl. 5% GST)", "Rs. ${String.format(Locale.ENGLISH, "%.0f", estimatedGrandTotal)}", accent = Amber500)
+            SummaryStatCard("Grand Total (incl. 5% GST)", "Rs. ${String.format(Locale.ENGLISH, "%.0f", estimatedGrandTotal)}", accent = SmavColors.StepperGreen)
         }
     }
 
     completedOrder?.let { ord ->
         AlertDialog(
             onDismissRequest = { completedOrder = null },
-            containerColor = Color(0xFF121629),
-            title = { Text("Order #${ord.tokenNumber} Created", color = Amber500, fontWeight = FontWeight.Bold) },
+            containerColor = SmavColors.Surface,
+            title = { Text("Order #${ord.tokenNumber} Created", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Order No: ${ord.orderNumber}", color = Color.White, fontWeight = FontWeight.Bold)
-                    Text("Table/Counter: ${ord.tableOrCounter}", color = Color(0xFFCBD5E1))
-                    Text("Total: Rs. ${String.format(Locale.ENGLISH, "%.2f", ord.grandTotal)}", color = Emerald500)
-                    if (printFeedback != null) Text(printFeedback!!, color = Sky400, fontSize = 12.sp)
+                    Text("Order No: ${ord.orderNumber}", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold)
+                    Text("Table/Counter: ${ord.tableOrCounter}", color = SmavColors.TextSecondary)
+                    Text("Total: Rs. ${String.format(Locale.ENGLISH, "%.2f", ord.grandTotal)}", style = SmavNumericStyles.Price, color = SmavColors.StepperGreen)
+                    if (printFeedback != null) Text(printFeedback!!, color = SmavColors.InfoText, fontSize = 12.sp)
                 }
             },
             confirmButton = {
@@ -837,17 +895,23 @@ private fun RestaurantPosScreen(
                             val r = billingRepo.reprintRestaurantKot(ord.id)
                             printFeedback = r.fold({ "KOT reprinted." }, { "KOT printer offline: ${it.message}" })
                         }
-                    }) { Text("Reprint KOT") }
-                    Button(onClick = {
-                        scope.launch {
-                            val r = billingRepo.reprintRestaurantBill(ord.id, branch)
-                            printFeedback = r.fold({ "Bill reprinted." }, { "Bill printer offline: ${it.message}" })
-                        }
-                    }) { Text("Reprint Bill") }
+                    }) { Text("Reprint KOT", color = SmavColors.TextPrimary) }
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                val r = billingRepo.reprintRestaurantBill(ord.id, branch)
+                                printFeedback = r.fold({ "Bill reprinted." }, { "Bill printer offline: ${it.message}" })
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = SmavColors.AccentPink, contentColor = Color.White)
+                    ) { Text("Reprint Bill") }
                 }
             },
             dismissButton = {
-                TextButton(onClick = { completedOrder = null }) { Text("Done") }
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    TextButton(onClick = onOpenPrinterSettings) { Text("Printers", color = SmavColors.InfoText) }
+                    TextButton(onClick = { completedOrder = null }) { Text("Done", color = SmavColors.TextSecondary) }
+                }
             }
         )
     }
@@ -891,6 +955,9 @@ private fun RetailPosScreen(
                 (q.isBlank() || it.name.lowercase(Locale.ENGLISH).contains(q) || it.sku.lowercase(Locale.ENGLISH).contains(q))
         }
     }
+    val qtyByProductId = remember(cart) {
+        cart.associate { it.product.id to it.quantity }
+    }
     val grandTotal = Math.round(cart.sumOf { it.totalAmount }).toDouble()
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -902,15 +969,20 @@ private fun RetailPosScreen(
         ) {
             item {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = onRefresh, enabled = !loading, modifier = Modifier.heightIn(min = 44.dp)) {
-                        Text("Refresh (${products.size})")
-                    }
-                    OutlinedButton(onClick = onOpenRecentBills, modifier = Modifier.heightIn(min = 44.dp)) {
-                        Text("Recent Bills")
-                    }
+                    SmavSecondaryButton(
+                        text = "Refresh (${products.size})",
+                        icon = Icons.Default.Refresh,
+                        enabled = !loading,
+                        onClick = onRefresh
+                    )
+                    SmavSecondaryButton(
+                        text = "Recent Bills",
+                        icon = Icons.Default.ReceiptLong,
+                        onClick = onOpenRecentBills
+                    )
                 }
             }
-            if (loading) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth()) }
+            if (loading) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = SmavColors.AccentPink) }
             if (loadError != null) item { ErrorBannerCard(loadError, onRetry = onRefresh) }
             item { SearchField(search, { search = it }, "Search retail products or SKU...") }
             if (categories.size > 1) item { FilterFlowRow(categories, selectedCat, { it }, { selectedCat = it }) }
@@ -918,47 +990,38 @@ private fun RetailPosScreen(
                 item { EmptyStateCard("No Products Found", "Add products from Outlet Admin Catalog or check filter.", Icons.Default.ShoppingBag) }
             }
             items(filtered, key = { it.id }) { p ->
-                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF121629)), border = BorderStroke(1.dp, Color(0xFF252E54))) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(12.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(p.name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                            Text("${p.category} • Stock: ${p.stockQuantity}", color = Color(0xFF94A3B8), fontSize = 11.sp)
-                            Text("Rs. ${String.format(Locale.ENGLISH, "%.2f", p.price)}", color = Sky400, fontWeight = FontWeight.Bold)
+                val qty = qtyByProductId[p.id] ?: 0
+                SmavItemCard(
+                    title = p.name,
+                    subtitle = p.category,
+                    meta = "Stock: ${p.stockQuantity}",
+                    price = p.price,
+                    quantity = qty,
+                    onIncrement = {
+                        val idx = cart.indexOfFirst { it.product.id == p.id }
+                        cart = if (idx >= 0) cart.toMutableList().also { it[idx] = it[idx].copy(quantity = it[idx].quantity + 1) }
+                        else cart + RetailCartItem(p)
+                    },
+                    onDecrement = {
+                        val idx = cart.indexOfFirst { it.product.id == p.id }
+                        if (idx >= 0) {
+                            val current = cart[idx]
+                            cart = if (current.quantity <= 1) cart.toMutableList().also { it.removeAt(idx) }
+                            else cart.toMutableList().also { it[idx] = current.copy(quantity = current.quantity - 1) }
                         }
-                        Button(
-                            onClick = {
-                                val idx = cart.indexOfFirst { it.product.id == p.id }
-                                cart = if (idx >= 0) cart.toMutableList().also { it[idx] = it[idx].copy(quantity = it[idx].quantity + 1) }
-                                else cart + RetailCartItem(p)
-                            },
-                            modifier = Modifier.heightIn(min = 48.dp)
-                        ) { Text("Add") }
                     }
-                }
+                )
             }
         }
 
-        Surface(color = Color(0xFF121629), border = BorderStroke(1.dp, Color(0xFF2B355F)), modifier = Modifier.fillMaxWidth()) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column {
-                    Text("${cart.sumOf { it.quantity }} item(s)", color = Color(0xFF94A3B8), fontSize = 12.sp)
-                    Text("Total: Rs. ${String.format(Locale.ENGLISH, "%.0f", grandTotal)}", color = Sky400, fontWeight = FontWeight.Bold, fontSize = 17.sp)
-                }
-                Button(
-                    onClick = { showCheckout = true },
-                    enabled = cart.isNotEmpty(),
-                    modifier = Modifier.heightIn(min = 48.dp)
-                ) { Text("Checkout & Print") }
-            }
-        }
+        SmavCheckoutBottomBar(
+            countLabel = "${cart.sumOf { it.quantity }} item(s)",
+            totalAmount = grandTotal,
+            ctaText = "Checkout & Print",
+            ctaEnabled = cart.isNotEmpty(),
+            ctaIcon = Icons.Default.ShoppingCartCheckout,
+            onCtaClick = { showCheckout = true }
+        )
     }
 
     if (showCheckout) {
@@ -981,34 +1044,51 @@ private fun RetailPosScreen(
                 }
             }
         ) {
-            OutlinedTextField(value = customerName, onValueChange = { customerName = it }, label = { Text("Customer Name (optional)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(value = customerPhone, onValueChange = { customerPhone = it }, label = { Text("Phone (optional)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(
+                value = customerName,
+                onValueChange = { customerName = it },
+                label = { Text("Customer Name (optional)") },
+                singleLine = true,
+                colors = smavOutlinedFieldColors(),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            )
+            OutlinedTextField(
+                value = customerPhone,
+                onValueChange = { customerPhone = it },
+                label = { Text("Phone (optional)") },
+                singleLine = true,
+                colors = smavOutlinedFieldColors(),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            )
             FilterFlowRow(listOf("upi", "cash", "card"), paymentMode, { it.uppercase(Locale.ENGLISH) }, { paymentMode = it })
-            SummaryStatCard("Total Due", "Rs. ${String.format(Locale.ENGLISH, "%.0f", grandTotal)}", accent = Sky400)
+            SummaryStatCard("Total Due", "Rs. ${String.format(Locale.ENGLISH, "%.0f", grandTotal)}", accent = SmavColors.StepperGreen)
         }
     }
 
     completedBill?.let { b ->
         AlertDialog(
             onDismissRequest = { completedBill = null },
-            containerColor = Color(0xFF121629),
-            title = { Text("Retail Receipt Saved", color = Sky400, fontWeight = FontWeight.Bold) },
+            containerColor = SmavColors.Surface,
+            title = { Text("Retail Receipt Saved", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("Bill No: ${b.billNumber}", color = Color.White, fontWeight = FontWeight.Bold)
-                    Text("Total: Rs. ${String.format(Locale.ENGLISH, "%.2f", b.grandTotal)}", color = Emerald500)
-                    if (msg != null) Text(msg!!, color = Amber500, fontSize = 12.sp)
+                    Text("Bill No: ${b.billNumber}", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold)
+                    Text("Total: Rs. ${String.format(Locale.ENGLISH, "%.2f", b.grandTotal)}", style = SmavNumericStyles.Price, color = SmavColors.StepperGreen)
+                    if (msg != null) Text(msg!!, color = SmavColors.WarningText, fontSize = 12.sp)
                 }
             },
             confirmButton = {
-                Button(onClick = {
-                    scope.launch { billingRepo.reprintRetailBill(b.id, branch, session.userName) }
-                }) { Text("Reprint") }
+                Button(
+                    onClick = { scope.launch { billingRepo.reprintRetailBill(b.id, branch, session.userName) } },
+                    colors = ButtonDefaults.buttonColors(containerColor = SmavColors.AccentPink, contentColor = Color.White)
+                ) { Text("Reprint") }
             },
             dismissButton = {
                 Row {
-                    TextButton(onClick = onOpenPrinterSettings) { Text("Printers") }
-                    TextButton(onClick = { completedBill = null }) { Text("Done") }
+                    TextButton(onClick = onOpenPrinterSettings) { Text("Printers", color = SmavColors.InfoText) }
+                    TextButton(onClick = { completedBill = null }) { Text("Done", color = SmavColors.TextSecondary) }
                 }
             }
         )
@@ -1056,8 +1136,13 @@ fun RecentBillsScreen(
     ) {
         if (feedback != null) {
             item {
-                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF161D3B))) {
-                    Text(feedback!!, color = Sky400, fontSize = 13.sp, modifier = Modifier.padding(12.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = SmavColors.InfoBg),
+                    border = BorderStroke(1.dp, SmavColors.InfoBorder),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text(feedback!!, color = SmavColors.InfoText, fontSize = 13.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(12.dp))
                 }
             }
         }
@@ -1068,30 +1153,32 @@ fun RecentBillsScreen(
                     item { EmptyStateCard("No Salon Bills Yet", "Bills generated on this device for ${session.businessName} appear here.") }
                 } else {
                     items(salonBills, key = { it.id }) { bill ->
-                        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF121629)), border = BorderStroke(1.dp, Color(0xFF252E54))) {
-                            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                    Text(bill.billNumber, color = Color.White, fontWeight = FontWeight.Bold)
-                                    StatusBadgeChip(bill.syncStatus, if (bill.syncStatus == "SYNCED") Emerald500 else Amber500)
-                                }
+                        SmavCard {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text(bill.billNumber, color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold)
+                                StatusBadgeChip(bill.syncStatus, if (bill.syncStatus == "SYNCED") SmavColors.StepperGreen else SmavColors.WarningText)
+                            }
+                            Text(
+                                "${bill.customerName ?: "Walk-in Guest"} • ${BillIdGenerator.getFormattedDateTime(bill.createdAtLocal)}",
+                                color = SmavColors.TextSecondary,
+                                fontSize = 12.sp
+                            )
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                                 Text(
-                                    "${bill.customerName ?: "Walk-in Guest"} • ${BillIdGenerator.getFormattedDateTime(bill.createdAtLocal)}",
-                                    color = Color(0xFF94A3B8),
-                                    fontSize = 12.sp
+                                    text = "Rs. ${String.format(Locale.ENGLISH, "%.2f", bill.grandTotal)} (${bill.paymentMode.uppercase(Locale.ENGLISH)})",
+                                    style = SmavNumericStyles.Price,
+                                    color = SmavColors.StepperGreen
                                 )
-                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                                    Text("Rs. ${String.format(Locale.ENGLISH, "%.2f", bill.grandTotal)} (${bill.paymentMode.uppercase(Locale.ENGLISH)})", color = Emerald500, fontWeight = FontWeight.Bold)
-                                    OutlinedButton(onClick = {
+                                SmavSecondaryButton(
+                                    text = "Reprint",
+                                    icon = Icons.Default.Print,
+                                    onClick = {
                                         scope.launch {
                                             val r = billingRepo.reprintSalonBill(bill.id, branch, session.userName)
                                             feedback = r.fold({ "Reprinted ${bill.billNumber}" }, { "Print failed: ${it.message}" })
                                         }
-                                    }, modifier = Modifier.heightIn(min = 44.dp)) {
-                                        Icon(Icons.Default.Print, contentDescription = null, modifier = Modifier.size(16.dp))
-                                        Spacer(Modifier.width(4.dp))
-                                        Text("Reprint")
                                     }
-                                }
+                                )
                             }
                         }
                     }
@@ -1103,28 +1190,36 @@ fun RecentBillsScreen(
                     item { EmptyStateCard("No Restaurant Orders Yet", "Orders generated on this device for ${session.businessName} appear here.") }
                 } else {
                     items(restOrders, key = { it.id }) { ord ->
-                        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF121629)), border = BorderStroke(1.dp, Color(0xFF252E54))) {
-                            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                    Text("${ord.orderNumber} (Token #${ord.tokenNumber})", color = Color.White, fontWeight = FontWeight.Bold)
-                                    StatusBadgeChip(ord.syncStatus, if (ord.syncStatus == "SYNCED") Emerald500 else Amber500)
-                                }
-                                Text("${ord.tableOrCounter} • ${BillIdGenerator.getFormattedDateTime(ord.createdAtLocal)}", color = Color(0xFF94A3B8), fontSize = 12.sp)
-                                Text("Rs. ${String.format(Locale.ENGLISH, "%.2f", ord.grandTotal)}", color = Amber500, fontWeight = FontWeight.Bold)
-                                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    OutlinedButton(onClick = {
+                        SmavCard {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text("${ord.orderNumber} (Token #${ord.tokenNumber})", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold)
+                                StatusBadgeChip(ord.syncStatus, if (ord.syncStatus == "SYNCED") SmavColors.StepperGreen else SmavColors.WarningText)
+                            }
+                            Text("${ord.tableOrCounter} • ${BillIdGenerator.getFormattedDateTime(ord.createdAtLocal)}", color = SmavColors.TextSecondary, fontSize = 12.sp)
+                            Text(
+                                text = "Rs. ${String.format(Locale.ENGLISH, "%.2f", ord.grandTotal)}",
+                                style = SmavNumericStyles.Price,
+                                color = SmavColors.StepperGreen
+                            )
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                SmavSecondaryButton(
+                                    text = "Reprint KOT",
+                                    onClick = {
                                         scope.launch {
                                             val r = billingRepo.reprintRestaurantKot(ord.id)
                                             feedback = r.fold({ "KOT reprinted for ${ord.orderNumber}" }, { "KOT print failed: ${it.message}" })
                                         }
-                                    }, modifier = Modifier.heightIn(min = 44.dp)) { Text("Reprint KOT") }
-                                    OutlinedButton(onClick = {
+                                    }
+                                )
+                                SmavSecondaryButton(
+                                    text = "Reprint Bill",
+                                    onClick = {
                                         scope.launch {
                                             val r = billingRepo.reprintRestaurantBill(ord.id, branch)
                                             feedback = r.fold({ "Bill reprinted for ${ord.orderNumber}" }, { "Bill print failed: ${it.message}" })
                                         }
-                                    }, modifier = Modifier.heightIn(min = 44.dp)) { Text("Reprint Bill") }
-                                }
+                                    }
+                                )
                             }
                         }
                     }
@@ -1136,20 +1231,26 @@ fun RecentBillsScreen(
                     item { EmptyStateCard("No Retail Bills Yet", "Retail receipts generated on this device appear here.") }
                 } else {
                     items(retailBills, key = { it.id }) { b ->
-                        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF121629)), border = BorderStroke(1.dp, Color(0xFF252E54))) {
-                            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                    Text(b.billNumber, color = Color.White, fontWeight = FontWeight.Bold)
-                                    StatusBadgeChip(b.syncStatus, if (b.syncStatus == "SYNCED") Emerald500 else Amber500)
-                                }
-                                Text("Rs. ${String.format(Locale.ENGLISH, "%.2f", b.grandTotal)}", color = Sky400, fontWeight = FontWeight.Bold)
-                                OutlinedButton(onClick = {
+                        SmavCard {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text(b.billNumber, color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold)
+                                StatusBadgeChip(b.syncStatus, if (b.syncStatus == "SYNCED") SmavColors.StepperGreen else SmavColors.WarningText)
+                            }
+                            Text(
+                                text = "Rs. ${String.format(Locale.ENGLISH, "%.2f", b.grandTotal)}",
+                                style = SmavNumericStyles.Price,
+                                color = SmavColors.StepperGreen
+                            )
+                            SmavSecondaryButton(
+                                text = "Reprint Receipt",
+                                icon = Icons.Default.Print,
+                                onClick = {
                                     scope.launch {
                                         val r = billingRepo.reprintRetailBill(b.id, branch, session.userName)
                                         feedback = r.fold({ "Reprinted ${b.billNumber}" }, { "Print failed: ${it.message}" })
                                     }
-                                }, modifier = Modifier.heightIn(min = 44.dp)) { Text("Reprint Receipt") }
-                            }
+                                }
+                            )
                         }
                     }
                 }
@@ -1187,10 +1288,15 @@ fun OfflineSyncStatusScreen(
             title = "Pending Cloud Sync (${session.businessName})",
             value = "$pendingSyncCount bill(s)",
             subtitle = if (pendingSyncCount == 0) "All offline bills for this outlet are synced." else "Bills stay safe on this device until uploaded.",
-            accent = if (pendingSyncCount == 0) Emerald500 else Amber500
+            accent = if (pendingSyncCount == 0) SmavColors.StepperGreen else SmavColors.WarningText
         )
 
-        Button(
+        SmavGradientButton(
+            text = if (syncing) "Synchronizing..." else "Sync Pending Bills Now",
+            icon = Icons.Default.CloudSync,
+            enabled = !syncing,
+            busy = syncing,
+            modifier = Modifier.fillMaxWidth(),
             onClick = {
                 syncing = true; message = null; errorMsg = null
                 scope.launch {
@@ -1204,21 +1310,11 @@ fun OfflineSyncStatusScreen(
                         }
                     syncing = false
                 }
-            },
-            enabled = !syncing,
-            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF2D82)),
-            modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp)
-        ) {
-            Icon(Icons.Default.CloudSync, contentDescription = null)
-            Spacer(Modifier.width(8.dp))
-            Text(if (syncing) "Synchronizing..." else "Sync Pending Bills Now", fontWeight = FontWeight.Bold)
-        }
-
-        if (syncing) LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = Color(0xFFFF2D82))
-        if (message != null) {
-            Card(colors = CardDefaults.cardColors(containerColor = Emerald500.copy(alpha = 0.16f))) {
-                Text(message!!, color = Emerald500, fontSize = 13.sp, modifier = Modifier.padding(12.dp))
             }
+        )
+
+        if (message != null) {
+            SmavSuccessBannerCard(message!!)
         }
         if (errorMsg != null) ErrorBannerCard(errorMsg!!)
     }

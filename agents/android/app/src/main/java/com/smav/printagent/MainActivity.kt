@@ -2,15 +2,18 @@ package com.smav.printagent
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Login
+import androidx.compose.material.icons.automirrored.filled.Login
 import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -18,13 +21,14 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.google.gson.JsonObject
@@ -36,12 +40,22 @@ import com.smav.printagent.network.*
 import com.smav.printagent.ui.components.*
 import com.smav.printagent.ui.screens.*
 import com.smav.printagent.ui.theme.SMAVTheme
+import com.smav.printagent.ui.theme.SmavColors
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.light(
+                android.graphics.Color.TRANSPARENT,
+                android.graphics.Color.TRANSPARENT
+            ),
+            navigationBarStyle = SystemBarStyle.light(
+                android.graphics.Color.TRANSPARENT,
+                android.graphics.Color.TRANSPARENT
+            )
+        )
 
         val sessions = SessionManager(applicationContext)
         val database = AppDatabase.getInstance(applicationContext)
@@ -214,6 +228,7 @@ private fun CompactLoginScreen(
     onMultiOutlet: (token: String, userId: String, email: String, options: List<AvailableBusinessOption>) -> Unit
 ) {
     val scope = rememberCoroutineScope()
+    val scrollState = rememberScrollState()
     var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var outletCode by remember { mutableStateOf("") }
@@ -221,182 +236,201 @@ private fun CompactLoginScreen(
     var busy by remember { mutableStateOf(false) }
     var message by remember(initialMessage) { mutableStateOf(initialMessage) }
 
-    val pageBackground = Color(0xFF080D21)
-    val cardBackground = Color(0xFF0E142A)
-    val fieldBackground = Color(0xFF121832)
-    val outline = Color(0xFF30385B)
-    val secondaryText = Color(0xFF8FA6D7)
-
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(pageBackground)
+            .background(SmavColors.Background)
             .windowInsetsPadding(WindowInsets.safeDrawing)
-            .padding(8.dp),
-        contentAlignment = Alignment.TopCenter
+            .imePadding()
+            .verticalScroll(scrollState)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        contentAlignment = Alignment.Center
     ) {
-        Column(
+        Card(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(cardBackground, RoundedCornerShape(24.dp))
-                .padding(horizontal = 22.dp, vertical = 20.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
+                .widthIn(max = 420.dp),
+            shape = RoundedCornerShape(22.dp),
+            colors = CardDefaults.cardColors(containerColor = SmavColors.Surface),
+            border = BorderStroke(1.dp, SmavColors.Border),
+            elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
         ) {
-            Surface(
-                modifier = Modifier.size(52.dp),
-                shape = RoundedCornerShape(16.dp),
-                color = Color(0xFF171E38),
-                border = BorderStroke(1.dp, outline)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(Icons.Default.Print, "Printer", tint = Color(0xFFFF2D82), modifier = Modifier.size(28.dp))
-                }
-            }
-            Spacer(Modifier.height(12.dp))
-            Text("SMAV Print Agent", color = Color.White, fontSize = 25.sp, fontWeight = FontWeight.Bold)
-            Spacer(Modifier.height(3.dp))
-            Text(
-                "Secure Enterprise Authentication Gateway",
-                color = Color(0xFF78A7E8),
-                fontSize = 12.sp,
-                maxLines = 1
-            )
-            Spacer(Modifier.height(20.dp))
-
-            LoginLabel("Email Address or Username")
-            OutlinedTextField(
-                value = username,
-                onValueChange = { username = it },
-                placeholder = { Text("name@company.com or username", color = Color(0xFF64749F)) },
-                singleLine = true,
-                colors = loginFieldColors(fieldBackground, outline),
-                shape = RoundedCornerShape(16.dp),
-                modifier = Modifier.fillMaxWidth().height(56.dp)
-            )
-            Spacer(Modifier.height(12.dp))
-
-            LoginLabel("Password / PIN")
-            OutlinedTextField(
-                value = password,
-                onValueChange = { password = it },
-                placeholder = { Text("Enter password", color = Color(0xFF64749F)) },
-                singleLine = true,
-                visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                trailingIcon = {
-                    IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                Surface(
+                    modifier = Modifier.size(48.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    color = SmavColors.Surface,
+                    border = BorderStroke(1.dp, SmavColors.Border),
+                    shadowElevation = 1.dp
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
                         Icon(
-                            if (passwordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                            "Show or hide password",
-                            tint = secondaryText
+                            imageVector = Icons.Default.Print,
+                            contentDescription = "SMAV Print Agent",
+                            tint = SmavColors.AccentPink,
+                            modifier = Modifier.size(26.dp)
                         )
                     }
-                },
-                colors = loginFieldColors(fieldBackground, outline),
-                shape = RoundedCornerShape(16.dp),
-                modifier = Modifier.fillMaxWidth().height(56.dp)
-            )
-            Spacer(Modifier.height(12.dp))
-
-            LoginLabel("Outlet Code (optional)")
-            OutlinedTextField(
-                value = outletCode,
-                onValueChange = { outletCode = it },
-                placeholder = { Text("e.g. mozz, glossylooks", color = Color(0xFF64749F)) },
-                singleLine = true,
-                colors = loginFieldColors(fieldBackground, outline),
-                shape = RoundedCornerShape(16.dp),
-                modifier = Modifier.fillMaxWidth().height(56.dp)
-            )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "Used to identify an outlet's authentication provider when required.",
-                color = Color(0xFF78A7E8),
-                fontSize = 11.sp,
-                maxLines = 1,
-                modifier = Modifier.fillMaxWidth()
-            )
-            Spacer(Modifier.height(18.dp))
-
-            Button(
-                onClick = {
-                    busy = true
-                    message = ""
-                    scope.launch {
-                        try {
-                            val serverUrl = sessions.getServerUrl()
-                            require(serverUrl.startsWith("https://")) { "Valid HTTPS SMAV server configuration required." }
-                            val body = JsonObject().apply {
-                                addProperty("emailOrId", username.trim())
-                                addProperty("email", username.trim())
-                                addProperty("password", password)
-                                if (outletCode.isNotBlank()) addProperty("outletCode", outletCode.trim())
-                                addProperty("device_id", sessions.deviceId)
-                            }
-                            val api = SmavApiClient.create(sessions)
-                            val resp = api.loginRaw(body)
-                            val reply = SmavApiClient.unwrapOrThrow(resp) { it }
-                            val isMulti = reply.optBool("multiBusiness", false) || reply.optBool("multi_business", false)
-                            if (isMulti) {
-                                val tToken = reply.optString("tempToken", "temp_token")
-                                val uId = reply.optString("userId", "user_id").ifBlank {
-                                    reply.get("session").asJsonObjectOrNull()?.optString("userId").orEmpty()
-                                }
-                                val optionsArr = reply.getAsJsonArray("availableOutlets")
-                                    ?: reply.getAsJsonArray("available_businesses")
-                                val options = adminRepo.parseAssignedOutlets(optionsArr)
-                                require((tToken.isNotBlank() || uId.isNotBlank()) && options.isNotEmpty()) {
-                                    "Server did not provide selectable outlets."
-                                }
-                                password = ""
-                                onMultiOutlet(tToken, uId, username.trim(), options)
-                            } else {
-                                val session = adminRepo.parseSessionPayload(reply, username.trim())
-                                sessions.saveStaffSession(session)
-                                password = ""
-                                onLoginSuccess(session)
-                            }
-                        } catch (e: Exception) {
-                            message = SmavApiClient.friendlyThrowable(e, "Login failed.")
-                        } finally {
-                            busy = false
-                        }
-                    }
-                },
-                enabled = !busy && username.isNotBlank() && password.isNotBlank(),
-                modifier = Modifier.fillMaxWidth().height(56.dp),
-                shape = RoundedCornerShape(16.dp),
-                border = BorderStroke(3.dp, Brush.horizontalGradient(listOf(Color(0xFFFF1F81), Color(0xFFFFA000)))),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Color(0xFF24293A),
-                    contentColor = Color.White,
-                    disabledContainerColor = Color(0xFF24293A),
-                    disabledContentColor = Color(0xFF71788D)
-                )
-            ) {
-                Icon(Icons.Default.Login, contentDescription = null)
-                Spacer(Modifier.width(12.dp))
-                Text("Sign In", fontSize = 18.sp, fontWeight = FontWeight.Bold)
-            }
-
-            Spacer(Modifier.height(6.dp))
-            TextButton(onClick = { message = "Please contact your outlet administrator to reset your credentials." }) {
-                Text("Forgot Password? ", color = secondaryText)
-                Text("Reset your credentials", color = Color(0xFFFF2D82), fontWeight = FontWeight.Bold)
-            }
-            if (busy) {
-                Spacer(Modifier.height(10.dp))
-                LinearProgressIndicator(Modifier.fillMaxWidth(), color = Color(0xFFFF2D82))
-            }
-            if (message.isNotBlank()) {
+                }
                 Spacer(Modifier.height(10.dp))
                 Text(
-                    message,
-                    color = Color(0xFFFFA5B8),
-                    textAlign = TextAlign.Center,
-                    fontSize = 13.sp,
+                    text = "SMAV Print Agent",
+                    color = SmavColors.TextPrimary,
+                    fontSize = 23.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = "Secure Enterprise Authentication Gateway",
+                    color = SmavColors.TextSecondary,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(Modifier.height(16.dp))
+
+                LoginLabel("Email Address or Username")
+                OutlinedTextField(
+                    value = username,
+                    onValueChange = { username = it },
+                    placeholder = { Text("name@company.com or username", color = SmavColors.TextMuted, fontSize = 13.sp) },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                    colors = loginFieldColors(),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
+                )
+                Spacer(Modifier.height(10.dp))
+
+                LoginLabel("Password / PIN")
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    placeholder = { Text("Enter password", color = SmavColors.TextMuted, fontSize = 13.sp) },
+                    singleLine = true,
+                    visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Password,
+                        imeAction = ImeAction.Next
+                    ),
+                    trailingIcon = {
+                        IconButton(onClick = { passwordVisible = !passwordVisible }, modifier = Modifier.size(48.dp)) {
+                            Icon(
+                                if (passwordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                "Show or hide password",
+                                tint = SmavColors.TextSecondary
+                            )
+                        }
+                    },
+                    colors = loginFieldColors(),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
+                )
+                Spacer(Modifier.height(10.dp))
+
+                LoginLabel("Outlet Code (optional)")
+                OutlinedTextField(
+                    value = outletCode,
+                    onValueChange = { outletCode = it },
+                    placeholder = { Text("e.g. mozz, glossylooks", color = SmavColors.TextMuted, fontSize = 13.sp) },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    colors = loginFieldColors(),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = "Used to identify an outlet's authentication provider when required.",
+                    color = SmavColors.TextSecondary,
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.fillMaxWidth()
                 )
+                Spacer(Modifier.height(16.dp))
+
+                SmavGradientButton(
+                    text = if (busy) "Signing In..." else "Sign In",
+                    icon = Icons.AutoMirrored.Filled.Login,
+                    enabled = !busy && username.isNotBlank() && password.isNotBlank(),
+                    busy = busy,
+                    modifier = Modifier.fillMaxWidth().height(50.dp),
+                    onClick = {
+                        busy = true
+                        message = ""
+                        scope.launch {
+                            try {
+                                val serverUrl = sessions.getServerUrl()
+                                require(serverUrl.startsWith("https://")) { "Valid HTTPS SMAV server configuration required." }
+                                val body = JsonObject().apply {
+                                    addProperty("emailOrId", username.trim())
+                                    addProperty("email", username.trim())
+                                    addProperty("password", password)
+                                    if (outletCode.isNotBlank()) addProperty("outletCode", outletCode.trim())
+                                    addProperty("device_id", sessions.deviceId)
+                                }
+                                val api = SmavApiClient.create(sessions)
+                                val resp = api.loginRaw(body)
+                                val reply = SmavApiClient.unwrapOrThrow(resp) { it }
+                                val isMulti = reply.optBool("multiBusiness", false) || reply.optBool("multi_business", false)
+                                if (isMulti) {
+                                    val tToken = reply.optString("tempToken", "temp_token")
+                                    val uId = reply.optString("userId", "user_id").ifBlank {
+                                        reply.get("session").asJsonObjectOrNull()?.optString("userId").orEmpty()
+                                    }
+                                    val optionsArr = reply.getAsJsonArray("availableOutlets")
+                                        ?: reply.getAsJsonArray("available_businesses")
+                                    val options = adminRepo.parseAssignedOutlets(optionsArr)
+                                    require((tToken.isNotBlank() || uId.isNotBlank()) && options.isNotEmpty()) {
+                                        "Server did not provide selectable outlets."
+                                    }
+                                    password = ""
+                                    onMultiOutlet(tToken, uId, username.trim(), options)
+                                } else {
+                                    val session = adminRepo.parseSessionPayload(reply, username.trim())
+                                    sessions.saveStaffSession(session)
+                                    password = ""
+                                    onLoginSuccess(session)
+                                }
+                            } catch (e: Exception) {
+                                message = SmavApiClient.friendlyThrowable(e, "Login failed.")
+                            } finally {
+                                busy = false
+                            }
+                        }
+                    }
+                )
+
+                Spacer(Modifier.height(6.dp))
+                TextButton(onClick = { message = "Please contact your outlet administrator to reset your credentials." }) {
+                    Text("Forgot Password? ", color = SmavColors.TextSecondary, fontSize = 13.sp)
+                    Text("Reset your credentials", color = SmavColors.AccentPink, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                }
+
+                if (message.isNotBlank()) {
+                    Spacer(Modifier.height(6.dp))
+                    Surface(
+                        color = SmavColors.DangerBg,
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, SmavColors.DangerBorder),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = message,
+                            color = SmavColors.DangerText,
+                            textAlign = TextAlign.Center,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)
+                        )
+                    }
+                }
             }
         }
     }
@@ -629,21 +663,14 @@ private fun SmavAuthenticatedApp(
 @Composable
 private fun LoginLabel(text: String) {
     Text(
-        text,
-        color = Color(0xFFDCE7FF),
+        text = text,
+        color = SmavColors.TextPrimary,
         fontSize = 13.sp,
         fontWeight = FontWeight.SemiBold,
-        modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp)
+        modifier = Modifier.fillMaxWidth().padding(bottom = 5.dp)
     )
 }
 
 @Composable
-private fun loginFieldColors(background: Color, outline: Color) = OutlinedTextFieldDefaults.colors(
-    focusedTextColor = Color.White,
-    unfocusedTextColor = Color.White,
-    focusedContainerColor = background,
-    unfocusedContainerColor = background,
-    focusedBorderColor = Color(0xFF50618F),
-    unfocusedBorderColor = outline,
-    cursorColor = Color(0xFFFF2D82)
-)
+private fun loginFieldColors() = smavOutlinedFieldColors()
+

@@ -166,10 +166,12 @@ export interface SalonService {
 export interface Stylist {
   id: string;
   name: string;
-  specialty: string;
-  branchId: string;
-  phone?: string;
-  isAvailable: boolean;
+  role?: string;
+  outletId?: string;
+  available?: boolean;
+  specialty?: string;
+  branchId?: string;
+  isAvailable?: boolean;
 }
 
 export interface Appointment {

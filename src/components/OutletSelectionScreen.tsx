@@ -1,6 +1,15 @@
 import React from 'react';
-import { Scissors, Utensils, ShoppingBag, Building2, ArrowRight, ShieldCheck, LogOut } from 'lucide-react';
+import {
+  ArrowRight,
+  Building2,
+  LogOut,
+  Scissors,
+  ShieldCheck,
+  ShoppingBag,
+  Utensils,
+} from 'lucide-react';
 import { UserOutletMembership, getVisibleRole } from '../types';
+import { Button, Card, StatusBadge } from './ui';
 
 interface OutletSelectionScreenProps {
   availableOutlets: UserOutletMembership[];
@@ -13,103 +22,86 @@ export const OutletSelectionScreen: React.FC<OutletSelectionScreenProps> = ({
   availableOutlets,
   tempToken,
   onSelectOutlet,
-  onLogout
+  onLogout,
 }) => {
   const getCategoryIcon = (category: string) => {
     switch (category) {
       case 'salon':
-        return <Scissors className="w-5 h-5 text-rose-400" />;
+        return <Scissors className="w-5 h-5 text-[#FF1B7A]" />;
       case 'restaurant':
-        return <Utensils className="w-5 h-5 text-amber-400" />;
+        return <Utensils className="w-5 h-5 text-[#FF6A00]" />;
       case 'retail':
-        return <ShoppingBag className="w-5 h-5 text-emerald-400" />;
+        return <ShoppingBag className="w-5 h-5 text-[#15803D]" />;
       default:
-        return <Building2 className="w-5 h-5 text-sky-400" />;
-    }
-  };
-
-  const getCategoryTheme = (category: string) => {
-    switch (category) {
-      case 'salon':
-        return 'border-rose-500/20 bg-rose-500/5 hover:border-rose-500/50';
-      case 'restaurant':
-        return 'border-amber-500/20 bg-amber-500/5 hover:border-amber-500/50';
-      case 'retail':
-        return 'border-emerald-500/20 bg-emerald-500/5 hover:border-emerald-500/50';
-      default:
-        return 'border-sky-500/20 bg-sky-500/5 hover:border-sky-500/50';
+        return <Building2 className="w-5 h-5 text-[#1D4ED8]" />;
     }
   };
 
   return (
-    <div className="min-h-screen bg-[#0B0E1B] text-slate-100 flex items-center justify-center p-4 sm:p-6 lg:p-8 font-sans">
-      <div className="w-full max-w-xl bg-[#121629] border border-[#1e2540] rounded-3xl p-6 sm:p-8 shadow-2xl space-y-6">
-        
-        {/* Header */}
-        <div className="flex items-start justify-between">
-          <div>
-            <div className="flex items-center gap-2 mb-1">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              <span className="text-xs uppercase tracking-wider font-semibold text-slate-400">
-                Multi-Tenant Account Verified
-              </span>
-            </div>
-            <h2 className="text-2xl font-bold text-white tracking-tight">Select Active Outlet</h2>
-            <p className="text-xs text-slate-400 mt-1">
-              Your credentials are authorized for multiple enterprise outlets. Choose your destination:
+    <div className="min-h-screen bg-[#F5F6FA] text-[#2F3033] flex items-center justify-center p-4 sm:p-6 font-sans safe-bottom">
+      <Card padding="lg" className="w-full max-w-xl shadow-[0_8px_28px_rgba(16,24,40,0.06)] space-y-5">
+        <div className="flex items-start justify-between gap-3">
+          <div className="space-y-1">
+            <StatusBadge label="Multi-Tenant Verified" tone="success" dot />
+            <h2 className="text-xl sm:text-2xl font-bold text-[#2F3033] tracking-tight pt-1">
+              Select Active Outlet
+            </h2>
+            <p className="text-xs text-[#6F737D]">
+              Choose the authorized enterprise outlet workspace to open.
             </p>
           </div>
-          <button
+          <Button
+            variant="outline"
+            size="sm"
             onClick={onLogout}
-            title="Sign Out"
-            className="text-slate-400 hover:text-rose-400 p-2 rounded-xl bg-slate-800/60 hover:bg-slate-800 transition text-xs flex items-center gap-1.5"
+            leftIcon={<LogOut className="w-3.5 h-3.5" />}
           >
-            <LogOut className="w-4 h-4" />
-            <span className="hidden sm:inline">Sign Out</span>
-          </button>
+            Sign Out
+          </Button>
         </div>
 
-        {/* Outlets Grid */}
-        <div className="space-y-3.5">
+        <div className="space-y-3">
           {availableOutlets.map((outlet) => (
-            <div
+            <button
               key={outlet.outletId}
+              type="button"
               onClick={() => onSelectOutlet(outlet.outletId, tempToken)}
-              className={`p-4 rounded-2xl border transition-all cursor-pointer flex items-center justify-between gap-4 group ${getCategoryTheme(outlet.outletCategory)}`}
+              className="w-full text-left p-4 rounded-2xl bg-white border border-[#E5E7EC] hover:border-[#FF1B7A]/50 hover:shadow-sm transition flex items-center justify-between gap-3 group cursor-pointer"
             >
-              <div className="flex items-center gap-3.5">
-                <div className="w-12 h-12 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-center shadow-inner group-hover:scale-105 transition">
+              <div className="flex items-center gap-3.5 min-w-0">
+                <div className="w-11 h-11 rounded-xl bg-[#F5F6FA] border border-[#E5E7EC] flex items-center justify-center shrink-0">
                   {getCategoryIcon(outlet.outletCategory)}
                 </div>
-                <div>
-                  <div className="flex items-center gap-2">
-                    <h3 className="text-sm font-bold text-white group-hover:text-pink-400 transition">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h3 className="text-sm font-bold text-[#2F3033] group-hover:text-[#FF1B7A] transition truncate">
                       {outlet.outletName}
                     </h3>
-                    <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300 uppercase">
+                    <span className="text-[11px] font-mono text-[#6F737D] uppercase">
                       {outlet.outletCode}
                     </span>
                   </div>
-                  <p className="text-xs text-slate-400 mt-0.5">
-                    Role: <span className="text-white font-semibold">{getVisibleRole(outlet.displayRole || outlet.role)}</span>
-                    {outlet.isPrimary && <span className="ml-2 text-sky-400 font-semibold">• Primary</span>}
+                  <p className="text-xs text-[#6F737D] mt-0.5">
+                    Role: <span className="font-semibold text-[#2F3033]">{getVisibleRole(outlet.displayRole || outlet.role)}</span>
+                    {outlet.isPrimary && (
+                      <span className="ml-2 text-[#1D4ED8] font-semibold">· Primary</span>
+                    )}
                   </p>
                 </div>
               </div>
 
-              <div className="w-9 h-9 rounded-xl bg-slate-800 group-hover:bg-gradient-to-r group-hover:from-pink-500 group-hover:to-orange-500 flex items-center justify-center text-slate-400 group-hover:text-white transition shadow">
+              <div className="w-9 h-9 rounded-xl bg-[#F5F6FA] group-hover:bg-gradient-to-r group-hover:from-[#FF1B7A] group-hover:to-[#FF6A00] flex items-center justify-center text-[#6F737D] group-hover:text-white transition shrink-0">
                 <ArrowRight className="w-4 h-4" />
               </div>
-            </div>
+            </button>
           ))}
         </div>
 
-        {/* Security Notice */}
-        <div className="pt-2 border-t border-slate-800/80 flex items-center gap-2 text-xs text-slate-400">
-          <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
-          <span>Server-enforced tenant isolation. Only data for your selected outlet will be loaded.</span>
+        <div className="pt-3 border-t border-[#E5E7EC] flex items-center gap-2 text-xs text-[#6F737D]">
+          <ShieldCheck className="w-4 h-4 text-[#15803D] shrink-0" />
+          <span>Server-enforced tenant isolation loads data strictly for your selected outlet.</span>
         </div>
-      </div>
+      </Card>
     </div>
   );
 };
