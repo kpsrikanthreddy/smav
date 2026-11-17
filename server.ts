@@ -19,10 +19,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = Number.parseInt(process.env.PORT || '3000', 10) || 3000;
 const HOST = '0.0.0.0';
 const isCompiledBundle = __filename.endsWith('.js') || __filename.endsWith('.mjs');
 const isProductionMode = process.env.NODE_ENV === 'production' || isCompiledBundle;
+const DEFAULT_PORT = isProductionMode ? 8080 : 3000;
+const PORT = Number.parseInt(process.env.PORT || String(DEFAULT_PORT), 10) || DEFAULT_PORT;
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));

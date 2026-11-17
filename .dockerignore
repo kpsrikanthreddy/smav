@@ -1,0 +1,38 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.jks
+*.keystore
+
+# Dependencies & build artifacts
+node_modules
+dist
+server.js
+npm-debug.log*
+*.log
+coverage
+
+# Git & CI
+.git
+.gitignore
+.github
+
+# AI Studio & local artifacts
+.aistudio
+*.zip
+
+# Android build outputs & IDE caches
+agents/android/.gradle
+agents/android/build
+agents/android/app/build
+agents/android/.idea
+*.apk
+*.aab
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
