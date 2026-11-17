@@ -21,8 +21,31 @@ android {
             useSupportLibrary = true
         }
 
-        // Default local backend base URL (Overridable in App Settings)
-        buildConfigField("String", "DEFAULT_SERVER_URL", "\"https://api.smav.internal\"")
+        val rawServerUrl = (
+            providers.gradleProperty("SMAV_SERVER_URL").orNull
+                ?: System.getenv("SMAV_SERVER_URL")
+                ?: ""
+        ).trim().trimEnd('/')
+
+        val isInvalidPlaceholder = rawServerUrl.contains("api.smav.internal", ignoreCase = true) ||
+            rawServerUrl.contains("ais-dev-", ignoreCase = true) ||
+            rawServerUrl.contains("localhost", ignoreCase = true) ||
+            rawServerUrl.contains("127.0.0.1") ||
+            rawServerUrl.contains("example.", ignoreCase = true)
+
+        if (rawServerUrl.isBlank() ||
+            !rawServerUrl.startsWith("https://") ||
+            isInvalidPlaceholder ||
+            rawServerUrl.any { it.isWhitespace() || it == '"' || it == '\\' }
+        ) {
+            throw GradleException(
+                "SMAV_SERVER_URL Gradle property is missing or invalid ('$rawServerUrl'). " +
+                    "Provide a valid HTTPS production backend URL via -PSMAV_SERVER_URL=https://<domain>."
+            )
+        }
+
+        // Authoritative production backend base URL injected at build time
+        buildConfigField("String", "DEFAULT_SERVER_URL", "\"$rawServerUrl\"")
     }
 
     buildTypes {

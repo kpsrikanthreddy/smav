@@ -64,18 +64,35 @@ class MainActivity : ComponentActivity() {
                 fun installSession(json: JsonObject) {
                     val raw = json.getAsJsonObject("session") ?: error("Missing server session")
                     val selected = raw.getAsJsonObject("activeOutlet")
-                    val outletId = selected?.str("id") ?: raw.str("business_id")
-                    require(outletId.isNotBlank() && runCatching { java.util.UUID.fromString(outletId) }.isSuccess) { "No valid authorized outlet selected" }
+                    val roleText = raw.str("role").lowercase()
+                    var outletId = selected?.str("id") ?: raw.str("business_id")
+                    var outletCodeVal = selected?.str("code") ?: raw.str("branch_code")
+                    var outletNameVal = selected?.str("name") ?: raw.str("business_name")
+                    var type = (selected?.str("category") ?: raw.str("business_type")).lowercase()
+                    val isUuid = { id: String -> id.isNotBlank() && runCatching { java.util.UUID.fromString(id) }.isSuccess }
+                    if (!isUuid(outletId) && roleText == "superadmin") {
+                        val assigned = raw.getAsJsonArray("assignedOutlets")
+                        val codeFilter = outletCode.trim().lowercase()
+                        val match = assigned?.map { it.asJsonObject }?.firstOrNull { entry ->
+                            val eid = entry.str("outletId")
+                            isUuid(eid) && (codeFilter.isBlank() || entry.str("outletCode").lowercase() == codeFilter)
+                        } ?: assigned?.map { it.asJsonObject }?.firstOrNull { isUuid(it.str("outletId")) }
+                        if (match != null) {
+                            outletId = match.str("outletId")
+                            outletCodeVal = match.str("outletCode").ifBlank { outletCodeVal }
+                            outletNameVal = match.str("outletName").ifBlank { outletNameVal }
+                            type = match.str("outletCategory").lowercase().ifBlank { type }
+                        }
+                    }
+                    require(isUuid(outletId) || roleText == "superadmin") { "No valid authorized outlet selected" }
                     val token = json.str("token").ifBlank { raw.str("token") }
                     require(token.isNotBlank()) { "Missing authentication token" }
-                    val type = (selected?.str("category") ?: raw.str("business_type")).lowercase()
-                    val roleText = raw.str("role").lowercase()
                     val session = StaffSession(token, raw.str("userId").ifBlank { raw.str("user_id") },
-                        raw.str("userName").ifBlank { username }, raw.str("email"), outletId,
+                        raw.str("fullName").ifBlank { raw.str("userName") }.ifBlank { username }, raw.str("email"), outletId,
                         when(type) { "salon" -> BusinessType.SALON; "restaurant" -> BusinessType.RESTAURANT; "retail" -> BusinessType.RETAIL; else -> BusinessType.OTHER },
-                        selected?.str("name") ?: raw.str("business_name"), outletId,
-                        selected?.str("code") ?: raw.str("branch_code"),
-                        selected?.str("name") ?: raw.str("branch_name"),
+                        outletNameVal, outletId,
+                        outletCodeVal,
+                        outletNameVal,
                         when(roleText) { "superadmin" -> UserRole.SUPERADMIN; "admin" -> UserRole.ADMIN; "pos_billing" -> UserRole.CASHIER; else -> UserRole.STAFF },
                         emptyList(), sessions.deviceId)
                     sessions.saveStaffSession(session)
@@ -253,10 +270,11 @@ class MainActivity : ComponentActivity() {
                 } else {
                     Column(Modifier.fillMaxSize().padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         val current = active!!
+                        val hasOutletUuid = runCatching { java.util.UUID.fromString(current.businessId) }.isSuccess
                         Text("SMAV Print Agent", style = MaterialTheme.typography.headlineSmall)
                         Text("${current.businessName} — ${current.businessType.displayName}")
                         Text("Catalog is read-only. Billing is not yet connected.")
-                        Button(enabled = !busy, onClick = {
+                        Button(enabled = !busy && hasOutletUuid, onClick = {
                             busy = true; message = ""
                             scope.launch {
                                 val result = catalog.refresh(current.businessId, current.businessId)
@@ -265,8 +283,10 @@ class MainActivity : ComponentActivity() {
                             }
                         }) { Text("Sync this outlet") }
                         Button(onClick = { sessions.clearSession(); active = null; catalogRows = emptyList(); message = "Signed out" }) { Text("Sign out") }
-                        LaunchedEffect(current.businessId) {
-                            catalog.observe(current.businessId).collect { catalogRows = it }
+                        if (hasOutletUuid) {
+                            LaunchedEffect(current.businessId) {
+                                catalog.observe(current.businessId).collect { catalogRows = it }
+                            }
                         }
                         Text("Offline catalog: ${catalogRows.size} items")
                         LazyColumn { items(catalogRows) { row ->

@@ -30,9 +30,29 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Validate SMAV_SERVER_URL
+        env:
+          SMAV_SERVER_URL: ${{ vars.SMAV_SERVER_URL }}
+        run: |
+          if [ -z "$SMAV_SERVER_URL" ]; then
+            echo "::error::GitHub repository variable SMAV_SERVER_URL is not set."
+            exit 1
+          fi
+          case "$SMAV_SERVER_URL" in
+            https://*) ;;
+            *) echo "::error::SMAV_SERVER_URL must use HTTPS ($SMAV_SERVER_URL)"; exit 1 ;;
+          esac
+          case "$SMAV_SERVER_URL" in
+            *api.smav.internal*|*ais-dev-*|*localhost*|*127.0.0.1*)
+              echo "::error::SMAV_SERVER_URL cannot use a placeholder or dev URL ($SMAV_SERVER_URL)"
+              exit 1 ;;
+          esac
+
       - name: Build debug APK
         working-directory: agents/android
-        run: gradle :app:assembleDebug --stacktrace
+        env:
+          SMAV_SERVER_URL: ${{ vars.SMAV_SERVER_URL }}
+        run: gradle :app:assembleDebug "-PSMAV_SERVER_URL=${SMAV_SERVER_URL}" --stacktrace
 
       - name: Upload APK
         if: success()

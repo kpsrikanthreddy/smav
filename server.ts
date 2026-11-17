@@ -118,6 +118,8 @@ export interface AuthResult {
   message?: string;
   multiBusiness?: boolean;
   tempToken?: string;
+  userId?: string;
+  token?: string;
   availableOutlets?: UserOutletMembership[];
   session?: UserSession;
   redirectTo?: string;
@@ -996,7 +998,9 @@ export class SmavAuthGateway implements IAuthProvider {
 
               return {
                 success: true,
+                multiBusiness: false,
                 session,
+                token: session.token,
                 redirectTo: '/superadmin/outlets'
               };
             } else if (['USER', 'ADMIN', 'STAFF', 'OUTLET_USER'].includes(platformRole)) {
@@ -1085,6 +1089,7 @@ export class SmavAuthGateway implements IAuthProvider {
                   success: true,
                   multiBusiness: true,
                   tempToken,
+                  userId: profile.id,
                   availableOutlets: authorizedMemberships,
                   message: 'Multiple authorized outlets found. Select your destination.'
                 };
@@ -1161,7 +1166,9 @@ export class SmavAuthGateway implements IAuthProvider {
 
               return {
                 success: true,
+                multiBusiness: false,
                 session,
+                token: session.token,
                 redirectTo: membership.role === 'admin' ? '/admin/dashboard' : '/pos'
               };
             } else {
@@ -1207,7 +1214,7 @@ export class SmavAuthGateway implements IAuthProvider {
     loginRateLimiter.recordAttempt(rateLimitKey, false);
     return {
       success: false,
-      message: 'Invalid credentials or inactive Central SMAV account. Verify your email/username and password or contact your outlet administrator.'
+      message: 'Invalid email/username or password'
     };
   }
 
@@ -1801,10 +1808,10 @@ function requireAdmin(req: express.Request, res: express.Response, next: express
 // 1. Central SMAV Authentication Gateway Endpoints
 // -------------------------------------------------------------------------------------------------
 app.post('/api/auth/login', async (req, res) => {
-  const { emailOrId, email, password, outletCode, device_id } = req.body;
-  const targetEmailOrId = emailOrId || email;
+  const { emailOrId, email, password, outletCode, device_id, deviceId } = (req.body || {}) as Record<string, any>;
+  const targetEmailOrId = typeof emailOrId === 'string' && emailOrId.trim() ? emailOrId.trim() : typeof email === 'string' ? email.trim() : '';
 
-  if (!targetEmailOrId || !password) {
+  if (!targetEmailOrId || typeof password !== 'string' || !password) {
     return res.status(400).json({ success: false, message: 'Email / User ID and password are required' });
   }
 
@@ -1814,8 +1821,8 @@ app.post('/api/auth/login', async (req, res) => {
     const result = await smavGateway.authenticate({
       emailOrId: targetEmailOrId,
       password,
-      outletCode,
-      deviceId: device_id,
+      outletCode: typeof outletCode === 'string' ? outletCode : undefined,
+      deviceId: typeof device_id === 'string' ? device_id : typeof deviceId === 'string' ? deviceId : undefined,
       ipAddress
     });
 
@@ -1823,9 +1830,25 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(result.requiresPasswordReset || result.requiresPasswordChange ? 403 : 401).json(result);
     }
 
-    res.json(result);
+    if (result.multiBusiness) {
+      return res.json({
+        success: true,
+        multiBusiness: true,
+        tempToken: result.tempToken,
+        userId: result.userId,
+        availableOutlets: result.availableOutlets || [],
+        message: result.message
+      });
+    }
+
+    return res.json({
+      ...result,
+      multiBusiness: false,
+      token: result.token || result.session?.token
+    });
   } catch (err: any) {
-    res.status(500).json({ success: false, message: 'Authentication error: ' + err.message });
+    console.error('[Auth Login Error]', err?.message || 'Unexpected authentication error');
+    return res.status(500).json({ success: false, message: 'Authentication service unavailable. Please try again.' });
   }
 });
 
@@ -4839,6 +4862,25 @@ async function startServer() {
   const distDir = path.join(__dirname, 'dist');
   const distIndexPath = path.join(distDir, 'index.html');
 
+  // Ensure every /api/* request always receives JSON (never Vite, index.html, or static fallback)
+  app.use('/api', (err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (err) {
+      const status = typeof err.status === 'number' && err.status >= 400 && err.status < 600 ? err.status : 400;
+      return res.status(status).json({
+        success: false,
+        message: err instanceof SyntaxError ? 'Invalid JSON request body' : 'API request failed'
+      });
+    }
+    return next();
+  });
+
+  app.use('/api', (_req, res) => {
+    res.status(404).json({
+      success: false,
+      message: 'API route not found'
+    });
+  });
+
   if (!isProductionMode) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
@@ -4849,7 +4891,7 @@ async function startServer() {
   } else {
     app.use(express.static(distDir));
     app.get('*', (req, res) => {
-      if (req.path.startsWith('/api/')) {
+      if (req.path === '/api' || req.path.startsWith('/api/')) {
         return res.status(404).json({ success: false, message: 'API route not found' });
       }
       if (!fs.existsSync(distIndexPath)) {

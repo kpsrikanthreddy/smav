@@ -6,6 +6,7 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
+import com.smav.printagent.BuildConfig
 import com.smav.printagent.model.BusinessType
 import com.smav.printagent.model.PaperWidth
 import com.smav.printagent.model.PrinterPurpose
@@ -149,12 +150,27 @@ class SessionManager(context: Context) {
     }
 
     fun getServerUrl(): String {
-        return prefs.getString(KEY_SERVER_URL, "https://ais-dev-gnp7ewjrj46ennomdkm5uz-395144053850.asia-southeast1.run.app")
-            ?: "https://ais-dev-gnp7ewjrj46ennomdkm5uz-395144053850.asia-southeast1.run.app"
+        val defaultUrl = BuildConfig.DEFAULT_SERVER_URL.trim().trimEnd('/')
+        val saved = prefs.getString(KEY_SERVER_URL, null)?.trim()?.trimEnd('/')
+        return if (!saved.isNullOrBlank() &&
+            saved.startsWith("https://") &&
+            !saved.contains("ais-dev-", ignoreCase = true) &&
+            !saved.contains("api.smav.internal", ignoreCase = true)
+        ) {
+            saved
+        } else {
+            defaultUrl
+        }
     }
 
     fun setServerUrl(url: String) {
-        prefs.edit().putString(KEY_SERVER_URL, url.trim().trimEnd('/')).apply()
+        val clean = url.trim().trimEnd('/')
+        if (clean.startsWith("https://") &&
+            !clean.contains("ais-dev-", ignoreCase = true) &&
+            !clean.contains("api.smav.internal", ignoreCase = true)
+        ) {
+            prefs.edit().putString(KEY_SERVER_URL, clean).apply()
+        }
     }
 
     companion object {
