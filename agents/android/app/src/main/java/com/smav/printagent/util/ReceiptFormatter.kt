@@ -237,4 +237,73 @@ object ReceiptFormatter {
 
         return b.build()
     }
+
+    /**
+     * Formats a thermal receipt for Retail Stores (58mm and 80mm).
+     */
+    fun formatRetailReceiptBytes(
+        bill: com.smav.printagent.data.local.entities.RetailBillEntity,
+        items: List<com.smav.printagent.data.local.entities.RetailBillItemEntity>,
+        branch: Branch,
+        cashierName: String = "Counter",
+        paperWidth: PaperWidth = PaperWidth.WIDTH_80MM,
+        supportCut: Boolean = true
+    ): ByteArray {
+        val b = EscPosBuilder(paperWidth)
+
+        b.alignCenter()
+        b.setBold(true)
+        b.setDoubleSize(true)
+        b.textLine(branch.receiptHeader.ifBlank { branch.name }.uppercase(Locale.ENGLISH))
+        b.setDoubleSize(false)
+        b.setBold(false)
+        if (branch.address.isNotBlank()) b.textLine(branch.address)
+        if (branch.phone.isNotBlank()) b.textLine("Tel: ${branch.phone}")
+        if (branch.gstin.isNotBlank()) b.textLine("GSTIN: ${branch.gstin}")
+        b.doubleDivider()
+
+        b.alignLeft()
+        b.rowTwoColumns("Bill No: ${bill.billNumber}", "Pay: ${bill.paymentMode.uppercase(Locale.ENGLISH)}")
+        b.rowTwoColumns("Date: ${BillIdGenerator.getFormattedDateTime(bill.createdAtLocal)}", "Staff: $cashierName")
+        if (!bill.customerName.isNullOrBlank() || !bill.customerPhone.isNullOrBlank()) {
+            b.rowTwoColumns(
+                "Cust: ${bill.customerName?.takeIf { it.isNotBlank() } ?: "Guest"}",
+                "Ph: ${bill.customerPhone?.takeIf { it.isNotBlank() } ?: "N/A"}"
+            )
+        }
+        b.divider()
+
+        b.rowItem("PRODUCT", "QTY", "AMOUNT (Rs)")
+        b.divider()
+
+        items.forEach { item ->
+            val amountFormatted = String.format(Locale.ENGLISH, "%.2f", item.totalAmount)
+            b.rowItem(item.productName, "x${item.quantity}", amountFormatted)
+        }
+        b.divider()
+
+        b.alignRight()
+        b.rowTwoColumns("Subtotal:", String.format(Locale.ENGLISH, "Rs. %.2f", bill.subtotal))
+        if (bill.discountAmount > 0) {
+            b.rowTwoColumns("Discount:", String.format(Locale.ENGLISH, "-Rs. %.2f", bill.discountAmount))
+        }
+        if (bill.totalTax > 0) {
+            b.rowTwoColumns("GST:", String.format(Locale.ENGLISH, "Rs. %.2f", bill.totalTax))
+        }
+        b.doubleDivider()
+
+        b.setBold(true)
+        b.setDoubleHeight(true)
+        b.rowTwoColumns("TOTAL PAID:", String.format(Locale.ENGLISH, "Rs. %.2f", bill.grandTotal))
+        b.setDoubleHeight(false)
+        b.setBold(false)
+        b.doubleDivider()
+
+        b.alignCenter()
+        b.textLine(branch.receiptFooter.ifBlank { "Thank you for shopping with us!" })
+        b.newLine()
+        b.cutPaper(supportCut)
+
+        return b.build()
+    }
 }

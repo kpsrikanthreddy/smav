@@ -1,5 +1,6 @@
 package com.smav.printagent.network
 
+import com.google.gson.JsonObject
 import com.google.gson.annotations.SerializedName
 import com.smav.printagent.data.local.entities.PrintJobEntity
 import com.smav.printagent.data.local.entities.RestaurantOrderEntity
@@ -7,7 +8,6 @@ import com.smav.printagent.data.local.entities.RestaurantOrderItemEntity
 import com.smav.printagent.data.local.entities.SalonBillEntity
 import com.smav.printagent.data.local.entities.SalonBillItemEntity
 import com.smav.printagent.model.AvailableBusinessOption
-import com.smav.printagent.model.Branch
 import com.smav.printagent.model.RestaurantMenuItem
 import com.smav.printagent.model.RestaurantTable
 import com.smav.printagent.model.SalonAppointment
@@ -19,9 +19,9 @@ import retrofit2.http.Body
 import retrofit2.http.GET
 import retrofit2.http.Header
 import retrofit2.http.POST
-import retrofit2.http.Query
+import retrofit2.http.PUT
 import retrofit2.http.Path
-import com.google.gson.JsonObject
+import retrofit2.http.Query
 
 data class StaffLoginRequest(
     @SerializedName("email") val email: String,
@@ -82,7 +82,6 @@ data class UserProfileResponse(
     @SerializedName("current_session") val currentSession: StaffSession?,
     @SerializedName("memberships") val memberships: List<Map<String, Any>>?
 )
-
 
 data class CatalogSyncResponse(
     @SerializedName("success") val success: Boolean,
@@ -180,7 +179,7 @@ data class SyncResponse(
 )
 
 interface ApiService {
-    // B2: authoritative catalog, paginated and scoped by central outlet UUID.
+    // Authoritative catalog paginated per central outlet UUID
     @GET("api/pos/outlets/{outletId}/source-catalog")
     suspend fun getOutletSourceCatalog(
         @Header("Authorization") token: String,
@@ -189,32 +188,193 @@ interface ApiService {
         @Query("offset") offset: Int = 0
     ): Response<JsonObject>
 
-    // 1. Staff & Multi-Outlet Enterprise Authentication (SUPERADMIN, ADMIN, STAFF)
-    @POST("api/auth/login")
-    suspend fun loginEnterpriseAuth(@Body request: StaffLoginRequest): Response<StaffLoginResponse>
+    @GET("api/pos/outlets/{outletId}/catalog-preview")
+    suspend fun getOutletCatalogPreview(
+        @Header("Authorization") token: String,
+        @Path("outletId") outletId: String,
+        @Query("limit") limit: Int = 100,
+        @Query("offset") offset: Int = 0
+    ): Response<JsonObject>
 
-    @POST("api/mobile-auth/login")
-    suspend fun loginStaff(@Body request: StaffLoginRequest): Response<StaffLoginResponse>
+    @GET("api/pos/outlets/{outletId}/catalog-changes")
+    suspend fun getOutletCatalogChanges(
+        @Header("Authorization") token: String,
+        @Path("outletId") outletId: String,
+        @Query("sinceRevision") sinceRevision: Long = 0,
+        @Query("limit") limit: Int = 100,
+        @Query("offset") offset: Int = 0
+    ): Response<JsonObject>
+
+    @GET("api/superadmin/outlets/{outletId}/catalog-import-preview")
+    suspend fun getCatalogImportPreflight(
+        @Header("Authorization") token: String,
+        @Path("outletId") outletId: String
+    ): Response<JsonObject>
+
+    // 1. Central Authentication & Session Endpoints
+    @POST("api/auth/login")
+    suspend fun loginRaw(@Body request: JsonObject): Response<JsonObject>
 
     @POST("api/auth/select-outlet")
-    suspend fun selectOutlet(@Body request: SelectBusinessRequest): Response<StaffLoginResponse>
+    suspend fun selectOutletRaw(@Body request: JsonObject): Response<JsonObject>
+
+    @GET("api/auth/session")
+    suspend fun getAuthSession(@Header("Authorization") token: String): Response<JsonObject>
+
+    @GET("api/auth/profile")
+    suspend fun getAuthProfile(@Header("Authorization") token: String): Response<JsonObject>
+
+    @GET("api/auth/outlets")
+    suspend fun getAuthorizedOutlets(@Header("Authorization") token: String): Response<JsonObject>
+
+    @POST("api/auth/switch-outlet")
+    suspend fun switchOutlet(
+        @Header("Authorization") token: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
+
+    @POST("api/auth/logout")
+    suspend fun logout(@Header("Authorization") token: String): Response<JsonObject>
+
+    // Legacy / Mobile compatibility
+    @POST("api/mobile-auth/login")
+    suspend fun loginStaff(@Body request: StaffLoginRequest): Response<StaffLoginResponse>
 
     @POST("api/mobile-auth/select-business")
     suspend fun selectBusiness(@Body request: SelectBusinessRequest): Response<StaffLoginResponse>
 
-    @POST("api/auth/migrate-account")
-    suspend fun migrateAccount(@Body request: AccountMigrationRequest): Response<AccountMigrationResponse>
+    // 2. Superadmin Management Endpoints
+    @GET("api/superadmin/outlets")
+    suspend fun getSuperadminOutlets(@Header("Authorization") token: String): Response<JsonObject>
 
-    @POST("api/auth/request-password-reset")
-    suspend fun requestPasswordReset(@Body request: PasswordResetRequest): Response<PasswordResetResponse>
+    @POST("api/superadmin/outlets")
+    suspend fun createSuperadminOutlet(
+        @Header("Authorization") token: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
 
-    @POST("api/auth/reset-password")
-    suspend fun resetPassword(@Body request: ConfirmResetPasswordRequest): Response<PasswordResetResponse>
+    @PUT("api/superadmin/outlets/{id}")
+    suspend fun updateSuperadminOutlet(
+        @Header("Authorization") token: String,
+        @Path("id") outletId: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
 
-    @GET("api/auth/me")
-    suspend fun getCurrentProfile(@Header("Authorization") token: String): Response<UserProfileResponse>
+    @POST("api/superadmin/outlets/{id}/status")
+    suspend fun setSuperadminOutletStatus(
+        @Header("Authorization") token: String,
+        @Path("id") outletId: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
 
-    // 2. Monotonic Delta Catalog Synchronization
+    @GET("api/superadmin/admins")
+    suspend fun getSuperadminAdmins(@Header("Authorization") token: String): Response<JsonObject>
+
+    @POST("api/superadmin/admins")
+    suspend fun createSuperadminAdmin(
+        @Header("Authorization") token: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
+
+    @POST("api/superadmin/admins/{id}/reset-password")
+    suspend fun resetSuperadminAdminPassword(
+        @Header("Authorization") token: String,
+        @Path("id") adminId: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
+
+    @GET("api/superadmin/reports")
+    suspend fun getSuperadminReports(@Header("Authorization") token: String): Response<JsonObject>
+
+    @GET("api/superadmin/audit-logs")
+    suspend fun getSuperadminAuditLogs(@Header("Authorization") token: String): Response<JsonObject>
+
+    @POST("api/superadmin/launch-pos")
+    suspend fun launchSuperadminPos(
+        @Header("Authorization") token: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
+
+    @GET("api/central-supabase/status")
+    suspend fun getCentralSupabaseStatus(): Response<JsonObject>
+
+    // 3. Outlet Admin & Unified Outlet Users Endpoints
+    @GET("api/admin/outlet-details")
+    suspend fun getAdminOutletDetails(@Header("Authorization") token: String): Response<JsonObject>
+
+    @GET("api/outlet-users")
+    suspend fun getOutletUsers(
+        @Header("Authorization") token: String,
+        @Query("outletCode") outletCode: String? = null
+    ): Response<JsonObject>
+
+    @POST("api/outlet-users")
+    suspend fun createOutletUser(
+        @Header("Authorization") token: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
+
+    @PUT("api/outlet-users/{userId}")
+    suspend fun updateOutletUser(
+        @Header("Authorization") token: String,
+        @Path("userId") userId: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
+
+    @POST("api/outlet-users/{userId}/reset-password")
+    suspend fun resetOutletUserPassword(
+        @Header("Authorization") token: String,
+        @Path("userId") userId: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
+
+    @POST("api/outlet-users/{userId}/status")
+    suspend fun setOutletUserStatus(
+        @Header("Authorization") token: String,
+        @Path("userId") userId: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
+
+    @GET("api/sync/outbox")
+    suspend fun getSyncOutbox(
+        @Header("Authorization") token: String,
+        @Query("outletCode") outletCode: String? = null
+    ): Response<JsonObject>
+
+    @POST("api/sync/outbox/{id}/retry")
+    suspend fun retrySyncOutboxItem(
+        @Header("Authorization") token: String,
+        @Path("id") outboxId: String
+    ): Response<JsonObject>
+
+    @GET("api/admin/reports")
+    suspend fun getAdminReports(@Header("Authorization") token: String): Response<JsonObject>
+
+    @GET("api/admin/sync-status")
+    suspend fun getAdminSyncStatus(@Header("Authorization") token: String): Response<JsonObject>
+
+    @POST("api/admin/catalog/service")
+    suspend fun saveSalonService(
+        @Header("Authorization") token: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
+
+    @POST("api/admin/catalog/menu-item")
+    suspend fun saveRestaurantMenuItem(
+        @Header("Authorization") token: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
+
+    @POST("api/admin/catalog/retail-product")
+    suspend fun saveRetailProduct(
+        @Header("Authorization") token: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
+
+    // 4. POS Init & Monotonic Delta Catalog Synchronization
+    @GET("api/pos/init")
+    suspend fun getPosInit(@Header("Authorization") token: String): Response<JsonObject>
+
     @GET("api/catalog/sync")
     suspend fun getCatalogDeltaSync(
         @Header("Authorization") token: String,
@@ -223,7 +383,7 @@ interface ApiService {
         @Query("branch_id") branchId: String? = null
     ): Response<CatalogSyncResponse>
 
-    // 3. Salon POS APIs
+    // Salon POS APIs
     @GET("api/salon/services")
     suspend fun getSalonServices(@Header("Authorization") token: String): Response<SalonServicesResponse>
 
@@ -233,7 +393,7 @@ interface ApiService {
     @GET("api/salon/appointments")
     suspend fun getSalonAppointments(@Header("Authorization") token: String): Response<SalonAppointmentsResponse>
 
-    // 4. Restaurant POS APIs
+    // Restaurant POS APIs
     @GET("api/restaurant/menu")
     suspend fun getRestaurantMenu(@Header("Authorization") token: String): Response<RestaurantMenuResponse>
 
@@ -243,20 +403,29 @@ interface ApiService {
     @GET("api/restaurant/orders/pending")
     suspend fun getPendingRestaurantOrders(@Header("Authorization") token: String): Response<PendingOrdersResponse>
 
-    // 5. Device Pairing & Transaction Sync
-    @POST("api/devices/pair")
-    suspend fun pairDevice(@Body request: DevicePairRequest): Response<DevicePairResponse>
-
+    // 5. Offline Transaction Sync
     @POST("api/mobile/sync/bills")
     suspend fun syncBills(
         @Header("Authorization") token: String,
         @Body request: SyncBillsRequest
     ): Response<SyncResponse>
 
+    @POST("api/mobile/sync/bills")
+    suspend fun syncBillsJson(
+        @Header("Authorization") token: String,
+        @Body request: JsonObject
+    ): Response<SyncResponse>
+
     @POST("api/mobile/sync/orders")
     suspend fun syncOrders(
         @Header("Authorization") token: String,
         @Body request: SyncOrdersRequest
+    ): Response<SyncResponse>
+
+    @POST("api/mobile/sync/orders")
+    suspend fun syncOrdersJson(
+        @Header("Authorization") token: String,
+        @Body request: JsonObject
     ): Response<SyncResponse>
 
     @POST("api/mobile/sync/print-status")

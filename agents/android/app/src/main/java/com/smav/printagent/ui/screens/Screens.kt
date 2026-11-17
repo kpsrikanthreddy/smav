@@ -268,78 +268,11 @@ fun LoginScreen(
                         .clip(RoundedCornerShape(10.dp))
                         .background(Color(0xFF242938))
                         .clickable {
-                            if (emailOrId.isBlank() || password.isBlank()) {
-                                errorMessage = "Please enter both Email/ID and Password."
-                                return@clickable
-                            }
-                            isLoading = true
-                            errorMessage = null
-
-                            // Multi-business check
-                            if (emailOrId.contains("owner") || emailOrId == "kpsrikanthreddy@gmail.com") {
-                                onMultiBusinessFound(
-                                    listOf(
-                                        AvailableBusinessOption("outlet_glossy_gach", "The Glossy Looks Salon & Spa", "salon", "branch_gl_gach", "glossylooks", "Gachibowli Main", "owner"),
-                                        AvailableBusinessOption("outlet_mozz_gach", "MOZZ / Starters4U Restaurant", "restaurant", "branch_mozz_gach", "mozz", "Gachibowli Diner", "owner")
-                                    ),
-                                    "usr_srikanth_owner"
-                                )
-                            } else if (emailOrId.contains("starters4u") || emailOrId.contains("mozz") || outletCode.contains("mozz")) {
-                                onLoginSuccess(
-                                    StaffSession(
-                                        token = "jwt_mozz_pos",
-                                        userId = "usr_vikram",
-                                        userName = "Vikram Reddy",
-                                        email = emailOrId,
-                                        businessId = "outlet_mozz_gach",
-                                        businessType = BusinessType.RESTAURANT,
-                                        businessName = "MOZZ / Starters4U Restaurant & Diner",
-                                        branchId = "branch_mozz_gach",
-                                        branchCode = "GACH",
-                                        branchName = "Gachibowli Diner",
-                                        role = UserRole.CASHIER,
-                                        permissions = listOf("pos:create_order", "pos:print_kot", "pos:print_bill"),
-                                        deviceId = "DEV-01"
-                                    )
-                                )
-                            } else if (emailOrId.contains("superadmin")) {
-                                onLoginSuccess(
-                                    StaffSession(
-                                        token = "jwt_superadmin",
-                                        userId = "usr_superadmin",
-                                        userName = "SMAV Platform Superadmin",
-                                        email = emailOrId,
-                                        businessId = "central_smav",
-                                        businessType = BusinessType.OTHER,
-                                        businessName = "SMAV Enterprise Central Headquarters",
-                                        branchId = "central_smav",
-                                        branchCode = "SMAV",
-                                        branchName = "Central Headquarters",
-                                        role = UserRole.SUPERADMIN,
-                                        permissions = listOf("*"),
-                                        deviceId = "SUPERADMIN-DEV"
-                                    )
-                                )
+                            errorMessage = if (emailOrId.isBlank() || password.isBlank()) {
+                                "Please enter both Email/ID and Password."
                             } else {
-                                onLoginSuccess(
-                                    StaffSession(
-                                        token = "jwt_salon_pos",
-                                        userId = "usr_ananya",
-                                        userName = "Ananya Rao",
-                                        email = emailOrId,
-                                        businessId = "outlet_glossy_gach",
-                                        businessType = BusinessType.SALON,
-                                        businessName = "The Glossy Looks Salon & Spa",
-                                        branchId = "branch_gl_gach",
-                                        branchCode = "GACH",
-                                        branchName = "Gachibowli Studio",
-                                        role = UserRole.SALON_RECEPTIONIST,
-                                        permissions = listOf("pos:create_bill", "pos:view_services", "pos:print_receipt"),
-                                        deviceId = "DEV-01"
-                                    )
-                                )
+                                "Sign in through the primary SMAV authentication gateway."
                             }
-                            isLoading = false
                         },
                     contentAlignment = Alignment.Center
                 ) {
@@ -373,16 +306,30 @@ fun LoginScreen(
 @Composable
 fun MultiBusinessSelectionScreen(
     availableBusinesses: List<AvailableBusinessOption>,
-    onSelectBusiness: (AvailableBusinessOption) -> Unit
+    onSelectBusiness: (AvailableBusinessOption) -> Unit,
+    onBack: (() -> Unit)? = null,
+    busy: Boolean = false,
+    errorMessage: String? = null
 ) {
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFF0B0E1B))
-            .padding(24.dp),
+            .windowInsetsPadding(WindowInsets.safeDrawing)
+            .padding(20.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Spacer(modifier = Modifier.height(20.dp))
+        if (onBack != null) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+                TextButton(onClick = onBack, enabled = !busy) {
+                    Icon(Icons.Default.ArrowBack, contentDescription = null, tint = Color(0xFF8FA6D7))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Back to Sign In", color = Color(0xFF8FA6D7))
+                }
+            }
+        } else {
+            Spacer(modifier = Modifier.height(16.dp))
+        }
         Text(
             text = "Select Authorized Outlet",
             fontSize = 20.sp,
@@ -390,32 +337,66 @@ fun MultiBusinessSelectionScreen(
             color = Color.White
         )
         Text(
-            text = "Your account has access to multiple ventures. Select active terminal:",
+            text = "Your account has access to multiple outlets. Select active workspace:",
             fontSize = 13.sp,
-            color = Color.Gray,
-            modifier = Modifier.padding(top = 4.dp, bottom = 24.dp)
+            color = Color(0xFF94A3B8),
+            modifier = Modifier.padding(top = 4.dp, bottom = 16.dp)
         )
 
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        if (busy) {
+            LinearProgressIndicator(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp),
+                color = Color(0xFFFF2D82)
+            )
+        }
+        if (!errorMessage.isNullOrBlank()) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0x33E11D48)),
+                shape = RoundedCornerShape(10.dp)
+            ) {
+                Text(errorMessage, color = Color(0xFFFDA4AF), fontSize = 13.sp, modifier = Modifier.padding(12.dp))
+            }
+        }
+
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             items(availableBusinesses) { bus ->
+                val normType = bus.normalizedBusinessType
+                val icon = when (normType) {
+                    BusinessType.SALON -> Icons.Default.ContentCut
+                    BusinessType.RESTAURANT -> Icons.Default.Restaurant
+                    BusinessType.RETAIL -> Icons.Default.ShoppingBag
+                    BusinessType.OTHER -> Icons.Default.Store
+                }
+                val accent = when (normType) {
+                    BusinessType.SALON -> Rose600
+                    BusinessType.RESTAURANT -> Amber500
+                    BusinessType.RETAIL -> Sky400
+                    BusinessType.OTHER -> Color(0xFF94A3B8)
+                }
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clickable { onSelectBusiness(bus) },
+                        .clickable(enabled = !busy) { onSelectBusiness(bus) },
                     colors = CardDefaults.cardColors(containerColor = Color(0xFF161A33)),
-                    shape = RoundedCornerShape(12.dp)
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF2B355F)),
+                    shape = RoundedCornerShape(14.dp)
                 ) {
                     Row(
-                        modifier = Modifier.padding(20.dp),
+                        modifier = Modifier.padding(16.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
-                            if (bus.businessType == "salon") Icons.Default.ContentCut else Icons.Default.Restaurant,
+                            icon,
                             contentDescription = null,
-                            tint = if (bus.businessType == "salon") Rose600 else Amber500,
-                            modifier = Modifier.size(36.dp)
+                            tint = accent,
+                            modifier = Modifier.size(32.dp)
                         )
-                        Spacer(modifier = Modifier.width(16.dp))
+                        Spacer(modifier = Modifier.width(14.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
                                 text = bus.businessName,
@@ -424,12 +405,12 @@ fun MultiBusinessSelectionScreen(
                                 color = Color.White
                             )
                             Text(
-                                text = "${bus.branchName} (${bus.branchCode}) • Role: ${bus.role.uppercase()}",
+                                text = "${normType.displayName} • ${bus.branchCode.ifBlank { "OUTLET" }} • ${bus.displayRole.ifBlank { bus.role.uppercase() }}",
                                 fontSize = 12.sp,
-                                color = Color.Gray
+                                color = Color(0xFF94A3B8)
                             )
                         }
-                        Icon(Icons.Default.ArrowForwardIos, contentDescription = null, tint = Color.Gray, modifier = Modifier.size(16.dp))
+                        Icon(Icons.Default.ArrowForwardIos, contentDescription = null, tint = Color(0xFF94A3B8), modifier = Modifier.size(16.dp))
                     }
                 }
             }

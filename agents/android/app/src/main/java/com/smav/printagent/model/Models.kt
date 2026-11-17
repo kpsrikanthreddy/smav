@@ -1,22 +1,82 @@
 package com.smav.printagent.model
 
 import com.google.gson.annotations.SerializedName
+import java.util.Locale
 
 enum class BusinessType(val id: String, val displayName: String) {
     SALON("salon", "Salon & Spa"),
     RESTAURANT("restaurant", "Restaurant & Cloud Kitchen"),
     RETAIL("retail", "Shopping & Retail Store"),
-    OTHER("other", "Other Enterprise Venture")
+    OTHER("other", "Enterprise Operations");
+
+    companion object {
+        private val salonCategories = setOf(
+            "salon",
+            "beauty_salon",
+            "salon_and_spa",
+            "spa",
+            "beauty",
+            "women_salon"
+        )
+        private val restaurantCategories = setOf(
+            "restaurant",
+            "cloud_kitchen",
+            "pizzeria",
+            "cafe",
+            "food"
+        )
+        private val retailCategories = setOf(
+            "retail",
+            "store",
+            "hardware",
+            "seeds"
+        )
+
+        fun normalizeCategory(raw: String?): String =
+            (raw ?: "")
+                .trim()
+                .lowercase(Locale.ENGLISH)
+                .replace('-', '_')
+                .replace(Regex("\\s+"), "_")
+
+        fun fromRawCategory(raw: String?): BusinessType {
+            val normalized = normalizeCategory(raw)
+            return when {
+                normalized in salonCategories -> SALON
+                normalized in restaurantCategories -> RESTAURANT
+                normalized in retailCategories -> RETAIL
+                else -> OTHER
+            }
+        }
+    }
 }
 
-enum class UserRole(val code: String, val label: String) {
-    SUPERADMIN("superadmin", "Superadministrator"),
-    ADMIN("admin", "Outlet Administrator"),
-    STAFF("staff", "Staff Member"),
-    OWNER("owner", "Business Owner"),
-    MANAGER("manager", "Branch Manager"),
-    CASHIER("cashier", "Cashier"),
-    SALON_RECEPTIONIST("salon_receptionist", "Salon Receptionist")
+enum class UserRole(val code: String, val label: String, val visibleRole: String) {
+    SUPERADMIN("superadmin", "Superadministrator", "SUPERADMIN"),
+    ADMIN("admin", "Outlet Administrator", "ADMIN"),
+    STAFF("staff", "POS Billing Staff", "POS_BILLING"),
+    OWNER("owner", "Outlet Administrator", "ADMIN"),
+    MANAGER("manager", "Branch Manager", "ADMIN"),
+    CASHIER("cashier", "POS Billing Cashier", "POS_BILLING"),
+    SALON_RECEPTIONIST("salon_receptionist", "Salon Receptionist", "POS_BILLING");
+
+    fun isSuperadmin(): Boolean = this == SUPERADMIN
+    fun isAdminOrAbove(): Boolean = this == SUPERADMIN || this == ADMIN || this == OWNER || this == MANAGER
+    fun isAdminOnly(): Boolean = this == ADMIN || this == OWNER || this == MANAGER
+
+    companion object {
+        fun fromBackend(role: String?, displayRole: String? = null): UserRole {
+            val normDisplay = (displayRole ?: "").trim().uppercase(Locale.ENGLISH)
+            val normRole = (role ?: "").trim().lowercase(Locale.ENGLISH)
+            return when {
+                normDisplay == "SUPERADMIN" || normRole == "superadmin" -> SUPERADMIN
+                normDisplay == "ADMIN" || normRole == "admin" || normRole == "owner" || normRole == "manager" -> ADMIN
+                normRole == "cashier" -> CASHIER
+                normRole == "salon_receptionist" -> SALON_RECEPTIONIST
+                else -> STAFF
+            }
+        }
+    }
 }
 
 enum class PrinterPurpose(val code: String, val label: String) {
@@ -66,7 +126,9 @@ data class Outlet(
     val receiptHeader: String,
     val receiptFooter: String,
     val isActive: Boolean = true
-)
+) {
+    val businessType: BusinessType get() = BusinessType.fromRawCategory(category)
+}
 
 data class SalonService(
     val id: String,
@@ -83,7 +145,7 @@ data class Stylist(
     val id: String,
     val name: String,
     val specialty: String = "",
-    val branchId: String,
+    val branchId: String = "",
     val isAvailable: Boolean = true
 )
 
@@ -147,6 +209,31 @@ data class RestaurantCartItem(
     val subtotal: Double get() = unitPrice * quantity
 }
 
+data class RetailProduct(
+    val id: String,
+    val name: String,
+    val category: String,
+    val subcategory: String = "",
+    val sku: String = "",
+    val price: Double,
+    val gstPercent: Double = 12.0,
+    val stockQuantity: Int = 0,
+    val isActive: Boolean = true
+)
+
+data class RetailCartItem(
+    val product: RetailProduct,
+    val quantity: Int = 1,
+    val discountPercent: Double = 0.0
+) {
+    val unitPrice: Double get() = product.price
+    val subtotal: Double get() = unitPrice * quantity
+    val discountAmount: Double get() = subtotal * (discountPercent / 100.0)
+    val taxableAmount: Double get() = subtotal - discountAmount
+    val gstAmount: Double get() = taxableAmount * (product.gstPercent / 100.0)
+    val totalAmount: Double get() = taxableAmount + gstAmount
+}
+
 // Enterprise Unified Staff Session
 data class StaffSession(
     val token: String,
@@ -162,15 +249,150 @@ data class StaffSession(
     val role: UserRole,
     val permissions: List<String>,
     val deviceId: String,
-    val isOnline: Boolean = true
-)
+    val isOnline: Boolean = true,
+    val displayRole: String = role.visibleRole,
+    val assignedOutlets: List<AvailableBusinessOption> = emptyList(),
+    val lastValidatedAt: Long = System.currentTimeMillis()
+) {
+    val visibleRole: String get() = displayRole.ifBlank { role.visibleRole }
+}
 
 data class AvailableBusinessOption(
-    @SerializedName("outlet_id", alternate = ["business_id"]) val businessId: String,
-    @SerializedName("outlet_name", alternate = ["business_name"]) val businessName: String,
-    @SerializedName("outlet_category", alternate = ["business_type"]) val businessType: String,
-    @SerializedName("branch_id") val branchId: String,
-    @SerializedName("outlet_code", alternate = ["branch_code"]) val branchCode: String,
-    @SerializedName("branch_name") val branchName: String,
-    @SerializedName("role") val role: String
+    @SerializedName("outletId", alternate = ["outlet_id", "business_id"]) val businessId: String = "",
+    @SerializedName("outletName", alternate = ["outlet_name", "business_name"]) val businessName: String = "",
+    @SerializedName("outletCategory", alternate = ["outlet_category", "business_type"]) val businessType: String = "other",
+    @SerializedName("branch_id", alternate = ["branchId"]) val branchId: String = "",
+    @SerializedName("outletCode", alternate = ["outlet_code", "branch_code"]) val branchCode: String = "",
+    @SerializedName("branch_name", alternate = ["branchName"]) val branchName: String = "",
+    @SerializedName("role") val role: String = "staff",
+    @SerializedName("displayRole") val displayRole: String = ""
+) {
+    val normalizedBusinessType: BusinessType get() = BusinessType.fromRawCategory(businessType)
+    val resolvedBranchId: String get() = branchId.ifBlank { businessId }
+    val resolvedBranchName: String get() = branchName.ifBlank { businessName }
+}
+
+// Superadmin / Admin Remote View Models
+
+data class AdminOutletItem(
+    val id: String,
+    val code: String,
+    val name: String,
+    val category: String,
+    val address: String,
+    val phone: String,
+    val gstin: String,
+    val receiptHeader: String,
+    val receiptFooter: String,
+    val providerType: String,
+    val supabaseUrl: String,
+    val syncWebhookUrl: String,
+    val isActive: Boolean
+) {
+    val businessType: BusinessType get() = BusinessType.fromRawCategory(category)
+}
+
+data class AdminMembershipItem(
+    val outletId: String,
+    val outletCode: String,
+    val outletName: String,
+    val role: String
+)
+
+data class OutletAdminItem(
+    val userId: String,
+    val fullName: String,
+    val email: String,
+    val username: String,
+    val phone: String,
+    val role: String,
+    val displayRole: String,
+    val isActive: Boolean,
+    val mustChangePassword: Boolean,
+    val syncStatus: String = "synced",
+    val outboxLastError: String? = null,
+    val memberships: List<AdminMembershipItem> = emptyList()
+)
+
+data class NetworkReportData(
+    val totalOutlets: Int = 0,
+    val activeOutlets: Int = 0,
+    val totalRevenue: Double = 0.0,
+    val totalTransactions: Int = 0,
+    val pairedDevicesCount: Int = 0,
+    val breakdown: List<OutletBreakdownItem> = emptyList()
+)
+
+data class OutletBreakdownItem(
+    val id: String,
+    val name: String,
+    val code: String,
+    val category: String,
+    val isActive: Boolean,
+    val revenue: Double,
+    val transactionCount: Int,
+    val supabaseConnected: Boolean
+) {
+    val businessType: BusinessType get() = BusinessType.fromRawCategory(category)
+}
+
+data class AuditLogItem(
+    val id: String,
+    val timestamp: String,
+    val eventType: String,
+    val actorEmail: String,
+    val ipAddress: String,
+    val detailsJson: String
+)
+
+data class CentralSupabaseStatusData(
+    val isConfigured: Boolean = false,
+    val projectUrl: String = "",
+    val publishableKeyPreview: String = "",
+    val connected: Boolean = false,
+    val tableStatus: Map<String, Boolean> = emptyMap(),
+    val profileUserId: String = "",
+    val profileEmail: String = "",
+    val profileFullName: String = "",
+    val profilePlatformRole: String = "",
+    val profileSource: String = ""
+)
+
+data class CatalogDiagnosticItem(
+    val checkType: String,
+    val outletCode: String = "",
+    val source: String = "",
+    val fresh: Boolean = false,
+    val total: Int = 0,
+    val newItems: Int = 0,
+    val changedItems: Int = 0,
+    val unchangedItems: Int = 0,
+    val summary: String = "",
+    val warning: String? = null
+)
+
+data class SyncOutboxItemDto(
+    val id: String,
+    val targetUserId: String,
+    val targetLabel: String,
+    val status: String,
+    val lastError: String?
+)
+
+data class OutletReportSummary(
+    val outletName: String = "",
+    val totalSales: Double = 0.0,
+    val totalTax: Double = 0.0,
+    val totalTransactions: Int = 0,
+    val transactions: List<RemoteTransactionRow> = emptyList()
+)
+
+data class RemoteTransactionRow(
+    val id: String,
+    val referenceNumber: String,
+    val subtitle: String,
+    val paymentMode: String,
+    val grandTotal: Double,
+    val createdAt: String,
+    val status: String
 )

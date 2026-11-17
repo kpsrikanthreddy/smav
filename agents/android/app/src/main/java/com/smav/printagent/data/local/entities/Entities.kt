@@ -249,3 +249,60 @@ data class CatalogSyncStateEntity(
     val totalCachedItems: Int = 0,
     val lastError: String? = null
 )
+
+@Entity(
+    tableName = "retail_bills",
+    indices = [
+        Index(value = ["billNumber"], unique = true),
+        Index(value = ["idempotencyKey"], unique = true),
+        Index(value = ["syncStatus"])
+    ]
+)
+data class RetailBillEntity(
+    @PrimaryKey
+    val id: String = UUID.randomUUID().toString(),
+    val billNumber: String,
+    val outletId: String,
+    val branchCode: String,
+    val deviceId: String,
+    val idempotencyKey: String,
+    val customerName: String?,
+    val customerPhone: String?,
+    val paymentMode: String,
+    val subtotal: Double,
+    val discountAmount: Double,
+    val totalTax: Double,
+    val grandTotal: Double,
+    val roundOff: Double = 0.0,
+    val syncStatus: String = "PENDING",
+    val syncError: String? = null,
+    val createdAtLocal: Long = System.currentTimeMillis(),
+    val createdAtServer: Long? = null
+)
+
+@Entity(
+    tableName = "retail_bill_items",
+    foreignKeys = [
+        ForeignKey(
+            entity = RetailBillEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["billId"],
+            onDelete = ForeignKey.CASCADE
+        )
+    ],
+    indices = [Index(value = ["billId"])]
+)
+data class RetailBillItemEntity(
+    @PrimaryKey
+    val id: String = UUID.randomUUID().toString(),
+    val billId: String,
+    val productId: String,
+    val productName: String,
+    val categoryName: String,
+    val quantity: Int,
+    val unitPrice: Double,
+    val discountAmount: Double,
+    val gstPercent: Double,
+    val gstAmount: Double,
+    val totalAmount: Double
+)

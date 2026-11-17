@@ -1,19 +1,16 @@
 package com.smav.printagent.data.repository
 
 import android.content.Context
+import com.google.gson.JsonArray
+import com.google.gson.JsonObject
 import com.smav.printagent.data.local.AppDatabase
-import com.smav.printagent.network.ApiService
-import com.smav.printagent.network.SyncBillPayload
-import com.smav.printagent.network.SyncBillsRequest
-import com.smav.printagent.network.SyncOrderPayload
-import com.smav.printagent.network.SyncOrdersRequest
+import com.smav.printagent.model.BusinessType
+import com.smav.printagent.network.SmavApiClient
 import com.smav.printagent.network.SyncPrintStatusRequest
+import com.smav.printagent.network.UnauthorizedSessionException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
-import retrofit2.Retrofit
-import retrofit2.converter.gson.GsonConverterFactory
-import java.util.concurrent.TimeUnit
+import java.io.IOException
 
 class SyncRepository(
     private val context: Context,
@@ -21,114 +18,163 @@ class SyncRepository(
     private val sessionManager: SessionManager
 ) {
 
-    private fun getApiService(): ApiService {
-        val okHttpClient = OkHttpClient.Builder()
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(20, TimeUnit.SECONDS)
-            .writeTimeout(20, TimeUnit.SECONDS)
-            .build()
-
-        val baseUrl = sessionManager.getServerUrl().let {
-            if (it.endsWith("/")) it else "$it/"
-        }
-
-        val retrofit = Retrofit.Builder()
-            .baseUrl(baseUrl)
-            .client(okHttpClient)
-            .addConverterFactory(GsonConverterFactory.create())
-            .build()
-
-        return retrofit.create(ApiService::class.java)
-    }
-
     suspend fun syncAllPending(): Result<Int> = withContext(Dispatchers.IO) {
         val session = sessionManager.getStaffSession()
-            ?: return@withContext Result.failure(IllegalStateException("No active staff session"))
+            ?: return@withContext Result.failure(IllegalStateException("Please sign in to sync pending transactions."))
 
-        // B5 safety: fail closed. The legacy Room billing store is shared across
-        // outlets and still uses legacy business IDs. Do not upload another outlet's
-        // offline transactions under the current user's bearer token.
-        val pendingSalon = database.salonBillDao().getUnsyncedBills()
-        val pendingRestaurant = database.restaurantOrderDao().getUnsyncedOrders()
-        val legacyBusinessId = when (session.businessType) {
-            com.smav.printagent.model.BusinessType.SALON -> "the_glossy_looks"
-            com.smav.printagent.model.BusinessType.RESTAURANT -> "mozz_starters4u"
-            else -> null
-        }
-        if (legacyBusinessId == null ||
-            (pendingSalon.isNotEmpty() && (legacyBusinessId != "the_glossy_looks" || pendingSalon.any { it.businessId != legacyBusinessId })) ||
-            (pendingRestaurant.isNotEmpty() && (legacyBusinessId != "mozz_starters4u" || pendingRestaurant.any { it.businessId != legacyBusinessId }))
-        ) {
+        val activeOutletId = session.businessId
+        if (activeOutletId.isBlank() || session.businessType == BusinessType.OTHER) {
             return@withContext Result.failure(
-                IllegalStateException("Offline sync blocked: outlet ownership must be verified before uploading transactions")
-            )
-        }
-        // New UUID-based sessions cannot safely sync legacy business IDs until
-        // backend transaction ownership and idempotency are integrated.
-        if (session.businessId != legacyBusinessId) {
-            return@withContext Result.failure(
-                IllegalStateException("Offline sync blocked: legacy billing store is not bound to selected outlet UUID")
+                IllegalStateException("Select a specific salon or restaurant outlet before syncing bills.")
             )
         }
 
+        val api = SmavApiClient.create(sessionManager)
+        val bearer = SmavApiClient.bearer(session.token)
         var totalSynced = 0
-        val token = "Bearer ${session.token}"
-        val api = getApiService()
 
         try {
-            // 1. Sync pending Salon Bills (Only if session is salon authorized)
-            val pendingBills = database.salonBillDao().getUnsyncedBills()
-            if (pendingBills.isNotEmpty() && session.businessType.id == "the_glossy_looks") {
-                val payloads = pendingBills.mapNotNull { bill ->
-                    val items = database.salonBillDao().getItemsForBill(bill.id)
-                    SyncBillPayload(
-                        bill = bill,
-                        items = items,
-                        idempotencyKey = bill.idempotencyKey
-                    )
+            // 1. Sync Salon Bills strictly belonging to the active outlet
+            if (session.businessType == BusinessType.SALON) {
+                val pendingBills = database.salonBillDao().getUnsyncedBills().filter {
+                    it.branchId == activeOutletId || it.branchId == session.branchId
                 }
+                if (pendingBills.isNotEmpty()) {
+                    val billsJsonArray = JsonArray()
+                    for (bill in pendingBills) {
+                        val items = database.salonBillDao().getItemsForBill(bill.id)
+                        if (items.isEmpty()) continue
 
-                val response = api.syncBills(token, SyncBillsRequest(payloads))
-                if (response.isSuccessful && response.body()?.success == true) {
-                    val body = response.body()!!
-                    body.syncedIds.forEach { id ->
-                        database.salonBillDao().updateSyncStatus(id, "SYNCED", null, body.serverTimestamp)
+                        val billObj = JsonObject().apply {
+                            addProperty("outletId", activeOutletId)
+                            addProperty("billNumber", bill.billNumber)
+                            addProperty("customerName", bill.customerName ?: "Walk-in Guest")
+                            addProperty("customerPhone", bill.customerPhone ?: "")
+                            addProperty("paymentMode", bill.paymentMode)
+                            addProperty("grandTotal", bill.grandTotal)
+                        }
+
+                        val itemsArray = JsonArray()
+                        for (item in items) {
+                            itemsArray.add(JsonObject().apply {
+                                addProperty("serviceId", item.serviceId)
+                                addProperty("name", item.serviceName)
+                                addProperty("stylistId", item.stylistId?.takeIf { it.isNotBlank() } ?: session.userId)
+                                addProperty("stylist", item.stylistName?.takeIf { it.isNotBlank() } ?: session.userName)
+                                addProperty("quantity", item.quantity)
+                                addProperty("price", item.unitPrice)
+                            })
+                        }
+
+                        val entryObj = JsonObject().apply {
+                            add("bill", billObj)
+                            add("items", itemsArray)
+                            addProperty("idempotency_key", bill.idempotencyKey)
+                        }
+                        billsJsonArray.add(entryObj)
                     }
-                    totalSynced += body.syncedIds.size
+
+                    if (billsJsonArray.size() > 0) {
+                        val requestBody = JsonObject().apply { add("bills", billsJsonArray) }
+                        val response = api.syncBillsJson(bearer, requestBody)
+                        if (response.code() == 401) {
+                            throw UnauthorizedSessionException(SmavApiClient.parseErrorMessage(response))
+                        }
+                        val body = response.body()
+                        if (!response.isSuccessful || body == null || !body.success) {
+                            throw IOException(SmavApiClient.parseErrorMessage(response, "Salon bill sync failed."))
+                        }
+                        body.syncedIds.forEach { syncedId ->
+                            database.salonBillDao().updateSyncStatus(syncedId, "SYNCED", null, body.serverTimestamp)
+                        }
+                        totalSynced += body.syncedIds.size
+                    }
                 }
             }
 
-            // 2. Sync pending Restaurant Orders (Only if session is restaurant authorized)
-            val pendingOrders = database.restaurantOrderDao().getUnsyncedOrders()
-            if (pendingOrders.isNotEmpty() && session.businessType.id == "mozz_starters4u") {
-                val payloads = pendingOrders.mapNotNull { order ->
-                    val items = database.restaurantOrderDao().getItemsForOrder(order.id)
-                    SyncOrderPayload(
-                        order = order,
-                        items = items,
-                        idempotencyKey = order.idempotencyKey
-                    )
+            // 2. Sync Restaurant Orders strictly belonging to the active outlet
+            if (session.businessType == BusinessType.RESTAURANT) {
+                val pendingOrders = database.restaurantOrderDao().getUnsyncedOrders().filter {
+                    it.branchId == activeOutletId || it.branchId == session.branchId
                 }
-
-                val response = api.syncOrders(token, SyncOrdersRequest(payloads))
-                if (response.isSuccessful && response.body()?.success == true) {
-                    val body = response.body()!!
-                    body.syncedIds.forEach { id ->
-                        database.restaurantOrderDao().updateSyncStatus(id, "SYNCED", null, body.serverTimestamp)
+                if (pendingOrders.isNotEmpty()) {
+                    val ordersJsonArray = JsonArray()
+                    for (order in pendingOrders) {
+                        val items = database.restaurantOrderDao().getItemsForOrder(order.id)
+                        val orderObj = JsonObject().apply {
+                            addProperty("id", order.id)
+                            addProperty("outletId", activeOutletId)
+                            addProperty("orderNumber", order.orderNumber)
+                            addProperty("tokenNumber", order.tokenNumber)
+                            addProperty("branchCode", order.branchCode)
+                            addProperty("tableOrCounter", order.tableOrCounter)
+                            addProperty("orderType", order.orderType)
+                            addProperty("paymentMode", order.paymentMode)
+                            addProperty("grandTotal", order.grandTotal)
+                            addProperty("catalogRevisionAtSale", order.catalogRevisionAtSale)
+                        }
+                        val itemsArray = JsonArray()
+                        for (item in items) {
+                            itemsArray.add(JsonObject().apply {
+                                addProperty("itemId", item.itemId)
+                                addProperty("name", item.itemName)
+                                addProperty("category", item.categoryName)
+                                addProperty("variantId", item.variantId)
+                                addProperty("variantName", item.variantName)
+                                addProperty("quantity", item.quantity)
+                                addProperty("price", item.unitPrice)
+                                addProperty("totalPrice", item.totalPrice)
+                                addProperty("notes", item.notes)
+                            })
+                        }
+                        ordersJsonArray.add(JsonObject().apply {
+                            add("order", orderObj)
+                            add("items", itemsArray)
+                            addProperty("idempotency_key", order.idempotencyKey)
+                        })
                     }
-                    totalSynced += body.syncedIds.size
+
+                    if (ordersJsonArray.size() > 0) {
+                        val requestBody = JsonObject().apply { add("orders", ordersJsonArray) }
+                        val response = api.syncOrdersJson(bearer, requestBody)
+                        if (response.code() == 401) {
+                            throw UnauthorizedSessionException(SmavApiClient.parseErrorMessage(response))
+                        }
+                        val body = response.body()
+                        if (!response.isSuccessful || body == null || !body.success) {
+                            throw IOException(SmavApiClient.parseErrorMessage(response, "Restaurant order sync failed."))
+                        }
+                        body.syncedIds.forEach { syncedId ->
+                            database.restaurantOrderDao().updateSyncStatus(syncedId, "SYNCED", null, body.serverTimestamp)
+                        }
+                        totalSynced += body.syncedIds.size
+                    }
                 }
             }
 
-            // 3. Sync Print Jobs status
+            // 3. Retail bills are kept safely queued in Room until POST /api/mobile/sync/retail-bills is added
+            if (session.businessType == BusinessType.RETAIL) {
+                val pendingRetail = database.retailBillDao().getUnsyncedBills().filter { it.outletId == activeOutletId }
+                if (pendingRetail.isNotEmpty() && totalSynced == 0) {
+                    return@withContext Result.failure(
+                        IOException("Retail bills are saved safely offline. Server endpoint POST /api/mobile/sync/retail-bills is required for cloud upload.")
+                    )
+                }
+            }
+
+            // 4. Report Print Job statuses opportunistically
             val pendingPrints = database.printJobDao().getPendingJobs()
             if (pendingPrints.isNotEmpty()) {
-                api.syncPrintStatus(token, SyncPrintStatusRequest(pendingPrints))
+                runCatching {
+                    api.syncPrintStatus(bearer, SyncPrintStatusRequest(pendingPrints))
+                }
             }
 
             Result.success(totalSynced)
-        } catch (e: Exception) {
+        } catch (e: UnauthorizedSessionException) {
             Result.failure(e)
+        } catch (e: Exception) {
+            Result.failure(IOException(SmavApiClient.friendlyThrowable(e, "Sync failed. Local records remain safe.")))
         }
     }
 }

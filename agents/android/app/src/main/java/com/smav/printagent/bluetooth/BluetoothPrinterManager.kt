@@ -38,7 +38,8 @@ class BluetoothPrinterManager private constructor(private val context: Context) 
         mapOf(
             PrinterPurpose.SALON_RECEIPT to PrinterConnectionStatus.DISCONNECTED,
             PrinterPurpose.RESTAURANT_BILL to PrinterConnectionStatus.DISCONNECTED,
-            PrinterPurpose.RESTAURANT_KOT to PrinterConnectionStatus.DISCONNECTED
+            PrinterPurpose.RESTAURANT_KOT to PrinterConnectionStatus.DISCONNECTED,
+            PrinterPurpose.RETAIL_RECEIPT to PrinterConnectionStatus.DISCONNECTED
         )
     )
     val connectionStatus: StateFlow<Map<PrinterPurpose, PrinterConnectionStatus>> = _connectionStatus.asStateFlow()

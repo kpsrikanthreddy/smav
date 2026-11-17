@@ -43,6 +43,9 @@ interface SalonBillDao {
     @Query("SELECT * FROM salon_bills ORDER BY createdAtLocal DESC")
     fun getAllBills(): Flow<List<SalonBillEntity>>
 
+    @Query("SELECT * FROM salon_bills WHERE branchId = :branchId ORDER BY createdAtLocal DESC")
+    fun getBillsForBranch(branchId: String): Flow<List<SalonBillEntity>>
+
     @Query("SELECT * FROM salon_bills WHERE id = :id LIMIT 1")
     suspend fun getBillById(id: String): SalonBillEntity?
 
@@ -59,11 +62,14 @@ interface SalonBillDao {
     @Query("SELECT * FROM salon_bills WHERE syncStatus = 'PENDING' OR syncStatus = 'FAILED' ORDER BY createdAtLocal ASC")
     suspend fun getUnsyncedBills(): List<SalonBillEntity>
 
-    @Query("UPDATE salon_bills SET syncStatus = :status, syncError = :error, createdAtServer = :serverTime WHERE id = :id")
+    @Query("UPDATE salon_bills SET syncStatus = :status, syncError = :error, createdAtServer = :serverTime WHERE id = :id OR billNumber = :id")
     suspend fun updateSyncStatus(id: String, status: String, error: String?, serverTime: Long?)
 
     @Query("SELECT COUNT(*) FROM salon_bills WHERE syncStatus != 'SYNCED'")
     fun countPendingBills(): Flow<Int>
+
+    @Query("SELECT COUNT(*) FROM salon_bills WHERE branchId = :branchId AND syncStatus != 'SYNCED'")
+    fun countPendingBillsForBranch(branchId: String): Flow<Int>
 
     @Query("SELECT COUNT(*) FROM salon_bills WHERE branchCode = :branchCode AND billNumber LIKE :prefix")
     suspend fun countBillsMatchingPrefix(branchCode: String, prefix: String): Int
@@ -86,6 +92,9 @@ interface RestaurantOrderDao {
     @Query("SELECT * FROM restaurant_orders ORDER BY createdAtLocal DESC")
     fun getAllOrders(): Flow<List<RestaurantOrderEntity>>
 
+    @Query("SELECT * FROM restaurant_orders WHERE branchId = :branchId ORDER BY createdAtLocal DESC")
+    fun getOrdersForBranch(branchId: String): Flow<List<RestaurantOrderEntity>>
+
     @Query("SELECT * FROM restaurant_orders WHERE id = :id LIMIT 1")
     suspend fun getOrderById(id: String): RestaurantOrderEntity?
 
@@ -102,7 +111,7 @@ interface RestaurantOrderDao {
     @Query("SELECT * FROM restaurant_orders WHERE syncStatus = 'PENDING' OR syncStatus = 'FAILED' ORDER BY createdAtLocal ASC")
     suspend fun getUnsyncedOrders(): List<RestaurantOrderEntity>
 
-    @Query("UPDATE restaurant_orders SET syncStatus = :status, syncError = :error, createdAtServer = :serverTime WHERE id = :id")
+    @Query("UPDATE restaurant_orders SET syncStatus = :status, syncError = :error, createdAtServer = :serverTime WHERE id = :id OR orderNumber = :id")
     suspend fun updateSyncStatus(id: String, status: String, error: String?, serverTime: Long?)
 
     @Query("UPDATE restaurant_orders SET kotPrinted = :printed WHERE id = :id")
@@ -113,6 +122,9 @@ interface RestaurantOrderDao {
 
     @Query("SELECT COUNT(*) FROM restaurant_orders WHERE syncStatus != 'SYNCED'")
     fun countPendingOrders(): Flow<Int>
+
+    @Query("SELECT COUNT(*) FROM restaurant_orders WHERE branchId = :branchId AND syncStatus != 'SYNCED'")
+    fun countPendingOrdersForBranch(branchId: String): Flow<Int>
 
     @Query("SELECT COUNT(*) FROM restaurant_orders WHERE branchCode = :branchCode AND orderNumber LIKE :prefix")
     suspend fun countOrdersMatchingPrefix(branchCode: String, prefix: String): Int
@@ -209,4 +221,51 @@ interface CachedCatalogDao {
 
     @Query("SELECT * FROM catalog_sync_state WHERE businessId = :businessId LIMIT 1")
     fun getSyncStateFlow(businessId: String): Flow<CatalogSyncStateEntity?>
+}
+
+data class RetailBillWithItems(
+    val bill: com.smav.printagent.data.local.entities.RetailBillEntity,
+    val items: List<com.smav.printagent.data.local.entities.RetailBillItemEntity>
+)
+
+@Dao
+interface RetailBillDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertBill(bill: com.smav.printagent.data.local.entities.RetailBillEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertItems(items: List<com.smav.printagent.data.local.entities.RetailBillItemEntity>)
+
+    @Transaction
+    suspend fun insertBillWithItems(
+        bill: com.smav.printagent.data.local.entities.RetailBillEntity,
+        items: List<com.smav.printagent.data.local.entities.RetailBillItemEntity>
+    ) {
+        insertBill(bill)
+        insertItems(items)
+    }
+
+    @Query("SELECT * FROM retail_bills WHERE outletId = :outletId ORDER BY createdAtLocal DESC")
+    fun getBillsForOutlet(outletId: String): Flow<List<com.smav.printagent.data.local.entities.RetailBillEntity>>
+
+    @Query("SELECT * FROM retail_bills WHERE id = :id LIMIT 1")
+    suspend fun getBillById(id: String): com.smav.printagent.data.local.entities.RetailBillEntity?
+
+    @Query("SELECT * FROM retail_bill_items WHERE billId = :billId")
+    suspend fun getItemsForBill(billId: String): List<com.smav.printagent.data.local.entities.RetailBillItemEntity>
+
+    @Transaction
+    suspend fun getBillWithItems(billId: String): RetailBillWithItems? {
+        val bill = getBillById(billId) ?: return null
+        return RetailBillWithItems(bill, getItemsForBill(billId))
+    }
+
+    @Query("SELECT * FROM retail_bills WHERE syncStatus = 'PENDING' OR syncStatus = 'FAILED' ORDER BY createdAtLocal ASC")
+    suspend fun getUnsyncedBills(): List<com.smav.printagent.data.local.entities.RetailBillEntity>
+
+    @Query("SELECT COUNT(*) FROM retail_bills WHERE syncStatus != 'SYNCED'")
+    fun countPendingBills(): Flow<Int>
+
+    @Query("SELECT COUNT(*) FROM retail_bills WHERE branchCode = :branchCode AND billNumber LIKE :prefix")
+    suspend fun countBillsMatchingPrefix(branchCode: String, prefix: String): Int
 }

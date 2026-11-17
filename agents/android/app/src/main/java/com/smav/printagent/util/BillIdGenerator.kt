@@ -58,7 +58,7 @@ object BillIdGenerator {
      * Validates that a bill number conforms to the standard pattern.
      */
     fun isValidBillNumber(billNumber: String): Boolean {
-        val regex = Regex("^(TGL|MOZZ)-[A-Z0-9]{2,8}-\\d{8}-\\d{5}$")
+        val regex = Regex("^(TGL|MOZZ|RTL)-[A-Z0-9]{2,8}-\\d{8}-\\d{5}$")
         return regex.matches(billNumber)
     }
 }

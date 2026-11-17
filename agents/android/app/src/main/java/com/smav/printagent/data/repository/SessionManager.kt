@@ -7,6 +7,7 @@ import androidx.security.crypto.MasterKey
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import com.smav.printagent.BuildConfig
+import com.smav.printagent.model.AvailableBusinessOption
 import com.smav.printagent.model.BusinessType
 import com.smav.printagent.model.PaperWidth
 import com.smav.printagent.model.PrinterPurpose
@@ -49,6 +50,7 @@ class SessionManager(context: Context) {
 
     fun saveStaffSession(session: StaffSession) {
         val permissionsJson = gson.toJson(session.permissions)
+        val assignedJson = gson.toJson(session.assignedOutlets)
         prefs.edit()
             .putString(KEY_USER_ID, session.userId)
             .putString(KEY_USER_NAME, session.userName)
@@ -60,10 +62,12 @@ class SessionManager(context: Context) {
             .putString(KEY_BRANCH_CODE, session.branchCode)
             .putString(KEY_BRANCH_NAME, session.branchName)
             .putString(KEY_ROLE, session.role.code)
+            .putString(KEY_DISPLAY_ROLE, session.visibleRole)
             .putString(KEY_PERMISSIONS, permissionsJson)
+            .putString(KEY_ASSIGNED_OUTLETS, assignedJson)
             .putString(KEY_AUTH_TOKEN, session.token)
             .putBoolean(KEY_IS_LOGGED_IN, true)
-            .putLong(KEY_LAST_LOGIN_TIME, System.currentTimeMillis())
+            .putLong(KEY_LAST_LOGIN_TIME, session.lastValidatedAt)
             .apply()
     }
 
@@ -72,16 +76,22 @@ class SessionManager(context: Context) {
         val userId = prefs.getString(KEY_USER_ID, "") ?: ""
         val userName = prefs.getString(KEY_USER_NAME, "Staff User") ?: "Staff User"
         val email = prefs.getString(KEY_USER_EMAIL, "") ?: ""
-        val busId = prefs.getString(KEY_BUSINESS_ID, "the_glossy_looks") ?: "the_glossy_looks"
-        val busTypeName = prefs.getString(KEY_BUSINESS_TYPE, BusinessType.SALON.name) ?: BusinessType.SALON.name
-        val busType = try { BusinessType.valueOf(busTypeName) } catch (_: Exception) { BusinessType.SALON }
+        val busId = prefs.getString(KEY_BUSINESS_ID, "") ?: ""
+        val busTypeName = prefs.getString(KEY_BUSINESS_TYPE, BusinessType.OTHER.name) ?: BusinessType.OTHER.name
+        val busType = try {
+            BusinessType.valueOf(busTypeName)
+        } catch (_: Exception) {
+            BusinessType.fromRawCategory(busTypeName)
+        }
         val busName = prefs.getString(KEY_BUSINESS_NAME, busType.displayName) ?: busType.displayName
-        val branchId = prefs.getString(KEY_BRANCH_ID, "branch_gl_gach") ?: "branch_gl_gach"
-        val branchCode = prefs.getString(KEY_BRANCH_CODE, "GACH") ?: "GACH"
-        val branchName = prefs.getString(KEY_BRANCH_NAME, "Main Branch") ?: "Main Branch"
-        val roleCode = prefs.getString(KEY_ROLE, "cashier") ?: "cashier"
-        val role = UserRole.values().firstOrNull { it.code == roleCode } ?: UserRole.CASHIER
+        val branchId = prefs.getString(KEY_BRANCH_ID, busId) ?: busId
+        val branchCode = prefs.getString(KEY_BRANCH_CODE, "") ?: ""
+        val branchName = prefs.getString(KEY_BRANCH_NAME, busName) ?: busName
+        val roleCode = prefs.getString(KEY_ROLE, "staff") ?: "staff"
+        val displayRole = prefs.getString(KEY_DISPLAY_ROLE, "") ?: ""
+        val role = UserRole.fromBackend(roleCode, displayRole)
         val token = prefs.getString(KEY_AUTH_TOKEN, "") ?: ""
+        if (token.isBlank()) return null
 
         val permType = object : TypeToken<List<String>>() {}.type
         val permissions: List<String> = try {
@@ -89,6 +99,15 @@ class SessionManager(context: Context) {
         } catch (_: Exception) {
             emptyList()
         }
+
+        val outletType = object : TypeToken<List<AvailableBusinessOption>>() {}.type
+        val assignedOutlets: List<AvailableBusinessOption> = try {
+            gson.fromJson(prefs.getString(KEY_ASSIGNED_OUTLETS, "[]"), outletType) ?: emptyList()
+        } catch (_: Exception) {
+            emptyList()
+        }
+
+        val lastValidatedAt = prefs.getLong(KEY_LAST_LOGIN_TIME, 0L)
 
         return StaffSession(
             token = token,
@@ -103,12 +122,19 @@ class SessionManager(context: Context) {
             branchName = branchName,
             role = role,
             permissions = permissions,
-            deviceId = deviceId
+            deviceId = deviceId,
+            displayRole = displayRole.ifBlank { role.visibleRole },
+            assignedOutlets = assignedOutlets,
+            lastValidatedAt = lastValidatedAt
         )
     }
 
     fun isLoggedIn(): Boolean = prefs.getBoolean(KEY_IS_LOGGED_IN, false)
 
+    /**
+     * Clears authentication tokens and role/outlet session state on sign out.
+     * Intentionally preserves deviceId, printer pairings, and ALL unsynchronized Room bills/orders.
+     */
     fun clearSession() {
         prefs.edit()
             .remove(KEY_AUTH_TOKEN)
@@ -120,8 +146,11 @@ class SessionManager(context: Context) {
             .remove(KEY_BUSINESS_NAME)
             .remove(KEY_BRANCH_ID)
             .remove(KEY_BRANCH_CODE)
+            .remove(KEY_BRANCH_NAME)
             .remove(KEY_ROLE)
+            .remove(KEY_DISPLAY_ROLE)
             .remove(KEY_PERMISSIONS)
+            .remove(KEY_ASSIGNED_OUTLETS)
             .putBoolean(KEY_IS_LOGGED_IN, false)
             .apply()
     }
@@ -145,9 +174,27 @@ class SessionManager(context: Context) {
         prefs.edit().putString("printer_mac_${purpose.code}", mac).apply()
     }
 
+    fun clearPrinterMac(purpose: PrinterPurpose) {
+        prefs.edit().remove("printer_mac_${purpose.code}").apply()
+    }
+
     fun getPrinterMac(purpose: PrinterPurpose): String? {
         return prefs.getString("printer_mac_${purpose.code}", null)
     }
+
+    // Per-outlet receipt header/footer overrides
+    fun saveReceiptConfig(outletId: String, header: String, footer: String) {
+        prefs.edit()
+            .putString("receipt_header_$outletId", header)
+            .putString("receipt_footer_$outletId", footer)
+            .apply()
+    }
+
+    fun getReceiptHeader(outletId: String, fallback: String): String =
+        prefs.getString("receipt_header_$outletId", null)?.takeIf { it.isNotBlank() } ?: fallback
+
+    fun getReceiptFooter(outletId: String, fallback: String): String =
+        prefs.getString("receipt_footer_$outletId", null)?.takeIf { it.isNotBlank() } ?: fallback
 
     fun getServerUrl(): String {
         val defaultUrl = BuildConfig.DEFAULT_SERVER_URL.trim().trimEnd('/')
@@ -185,7 +232,9 @@ class SessionManager(context: Context) {
         private const val KEY_BRANCH_CODE = "branch_code"
         private const val KEY_BRANCH_NAME = "branch_name"
         private const val KEY_ROLE = "role"
+        private const val KEY_DISPLAY_ROLE = "display_role"
         private const val KEY_PERMISSIONS = "permissions"
+        private const val KEY_ASSIGNED_OUTLETS = "assigned_outlets"
         private const val KEY_AUTH_TOKEN = "auth_token"
         private const val KEY_IS_LOGGED_IN = "is_logged_in"
         private const val KEY_LAST_LOGIN_TIME = "last_login_time"
