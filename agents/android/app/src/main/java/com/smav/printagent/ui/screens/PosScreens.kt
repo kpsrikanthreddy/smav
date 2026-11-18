@@ -32,6 +32,40 @@ import com.smav.printagent.util.BillIdGenerator
 import kotlinx.coroutines.launch
 import java.util.Locale
 
+private fun salonSubcategoryLabel(service: SalonService): String {
+    val source = "${service.subcategory} ${service.name}"
+        .lowercase(Locale.ENGLISH)
+        .replace('-', ' ')
+        .replace('_', ' ')
+
+    return when {
+        "wax" in source -> "Waxing"
+        "hair cut" in source || "haircut" in source || "advance cut" in source -> "Hair Cuts"
+        "hair colour" in source || "hair color" in source -> "Hair Colour"
+        "blow dry" in source || "blowdry" in source || "hair styling" in source -> "Blow Dry & Styling"
+        "hair spa" in source -> "Hair Spa"
+        "hair makeover" in source -> "Hair Makeover"
+        "hair wash" in source || "head massage" in source -> "Hair Wash & Massage"
+        "facial" in source || "clean up" in source || "cleanup" in source || "d tan" in source -> "Facials & Clean-up"
+        "thread" in source -> "Threading"
+        "pedicure" in source || "manicure" in source -> "Nails Care"
+        "massage" in source -> "Massage"
+        "mask" in source || "masque" in source -> "Masks"
+        service.subcategory.isNotBlank() -> service.subcategory
+            .replace('-', ' ')
+            .replace('_', ' ')
+            .split(Regex("\\s+"))
+            .joinToString(" ") { word -> word.replaceFirstChar { it.titlecase(Locale.ENGLISH) } }
+        else -> "Other Services"
+    }
+}
+
+private fun staffDisplayName(value: String): String = value
+    .trim()
+    .lowercase(Locale.ENGLISH)
+    .split(Regex("\\s+"))
+    .joinToString(" ") { word -> word.replaceFirstChar { it.titlecase(Locale.ENGLISH) } }
+
 @Composable
 fun PosBillingRouterScreen(
     session: StaffSession,
@@ -191,7 +225,7 @@ private fun SalonPosScreen(
     }
     val subcategories = remember(services, selectedCategory) {
         val base = if (selectedCategory == "All") services else services.filter { it.category == selectedCategory }
-        val subs = base.map { it.subcategory }.filter { it.isNotBlank() }.distinct().sorted()
+        val subs = base.map(::salonSubcategoryLabel).distinct().sorted()
         if (subs.isEmpty()) emptyList() else listOf("All") + subs
     }
 
@@ -199,7 +233,7 @@ private fun SalonPosScreen(
         val q = search.trim().lowercase(Locale.ENGLISH)
         services.filter { s ->
             (selectedCategory == "All" || s.category == selectedCategory) &&
-                (selectedSubcategory == "All" || s.subcategory == selectedSubcategory) &&
+                (selectedSubcategory == "All" || salonSubcategoryLabel(s) == selectedSubcategory) &&
                 (q.isBlank() || s.name.lowercase(Locale.ENGLISH).contains(q) || s.category.lowercase(Locale.ENGLISH).contains(q))
         }
     }
@@ -289,7 +323,7 @@ private fun SalonPosScreen(
                 val assignedStylistNames = stylistsByServiceId[srv.id].orEmpty()
                 SmavItemCard(
                     title = srv.name,
-                    subtitle = "${srv.category}${if (srv.subcategory.isNotBlank()) " • ${srv.subcategory}" else ""}",
+                    subtitle = "${srv.category} • ${salonSubcategoryLabel(srv)}",
                     meta = "+${srv.gstPercent.toInt()}% GST",
                     price = srv.price,
                     quantity = qty,
@@ -363,15 +397,13 @@ private fun SalonPosScreen(
             title = "Select Stylist",
             onDismiss = { pendingServiceToPickStylist = null },
             confirmText = "Cancel",
+            showConfirmButton = false,
             onConfirm = { pendingServiceToPickStylist = null }
         ) {
             Text(srv.name, color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 15.sp)
             Text("Choose required stylist for this service:", color = SmavColors.TextSecondary, fontSize = 12.sp)
             stylists.forEach { stylist ->
-                SmavSecondaryButton(
-                    text = "${stylist.name}${if (stylist.specialty.isNotBlank()) " (${stylist.specialty})" else ""}",
-                    icon = Icons.Default.Person,
-                    modifier = Modifier.fillMaxWidth(),
+                SmavCard(
                     onClick = {
                         val existingIdx = cart.indexOfFirst { it.service.id == srv.id && it.stylist?.id == stylist.id }
                         cart = if (existingIdx >= 0) {
@@ -383,7 +415,30 @@ private fun SalonPosScreen(
                         }
                         pendingServiceToPickStylist = null
                     }
-                )
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Icon(Icons.Default.Person, contentDescription = null, tint = SmavColors.TextPrimary)
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                staffDisplayName(stylist.name),
+                                color = SmavColors.TextPrimary,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 14.sp
+                            )
+                            if (stylist.specialty.isNotBlank()) {
+                                Text(
+                                    stylist.specialty.trim(),
+                                    color = SmavColors.TextSecondary,
+                                    fontSize = 12.sp
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -425,7 +480,11 @@ private fun SalonPosScreen(
             isSaving = busyBilling,
             onConfirm = {
                 if (!busyBilling) {
-                    if (effectiveCart.any { it.stylist == null || it.stylist.id.isBlank() }) {
+                    if (customerName.isBlank()) {
+                        billingError = "Customer name is required."
+                    } else if (customerPhone.isBlank()) {
+                        billingError = "Customer phone is required."
+                    } else if (effectiveCart.any { it.stylist == null || it.stylist.id.isBlank() }) {
                         billingError = "Select a stylist for every salon service before printing."
                     } else {
                         busyBilling = true
@@ -499,7 +558,7 @@ private fun SalonPosScreen(
             OutlinedTextField(
                 value = customerName,
                 onValueChange = { customerName = it },
-                label = { Text("Customer Name (Optional)") },
+                label = { Text("Customer Name *") },
                 singleLine = true,
                 colors = smavOutlinedFieldColors(),
                 shape = RoundedCornerShape(12.dp),
@@ -508,7 +567,7 @@ private fun SalonPosScreen(
             OutlinedTextField(
                 value = customerPhone,
                 onValueChange = { customerPhone = it },
-                label = { Text("Customer Phone (Optional)") },
+                label = { Text("Customer Phone *") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
                 singleLine = true,
                 colors = smavOutlinedFieldColors(),

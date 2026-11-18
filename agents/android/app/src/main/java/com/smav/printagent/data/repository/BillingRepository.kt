@@ -64,6 +64,14 @@ class BillingRepository(
         if (cartItems.isEmpty()) {
             return@withContext Result.failure(IllegalArgumentException("Cart is empty"))
         }
+        val normalizedCustomerName = customerName?.trim().orEmpty()
+        val normalizedCustomerPhone = customerPhone?.trim().orEmpty()
+        if (normalizedCustomerName.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("Customer name is required."))
+        }
+        if (normalizedCustomerPhone.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("Customer phone is required."))
+        }
         if (cartItems.any { it.stylist == null || it.stylist.id.isBlank() }) {
             return@withContext Result.failure(
                 IllegalArgumentException("Please select a stylist for every salon service.")
@@ -72,12 +80,16 @@ class BillingRepository(
 
         val deviceId = sessionManager.deviceId
         val branchCode = branch.code.ifBlank { "GACH" }
+        val billBranchCode = if (
+            branchCode.contains("glossy", ignoreCase = true) ||
+            branch.name.contains("glossy", ignoreCase = true)
+        ) "GL" else branchCode
 
-        val todayPrefix = "%$branchCode-${BillIdGenerator.getTodayDateString()}%"
+        val todayPrefix = "%-$billBranchCode-${BillIdGenerator.getTodayDateString()}-%"
         val existingCount = database.salonBillDao().countBillsMatchingPrefix(branchCode, todayPrefix)
         val nextSeq = existingCount + 1
 
-        val billNumber = BillIdGenerator.generateBillNumber("TGL", branchCode, nextSeq)
+        val billNumber = BillIdGenerator.generateBillNumber("TGL", billBranchCode, nextSeq)
         val idempotencyKey = BillIdGenerator.generateIdempotencyKey(billNumber, deviceId)
 
         var subtotal = 0.0
@@ -126,8 +138,8 @@ class BillingRepository(
             branchCode = branchCode,
             deviceId = deviceId,
             idempotencyKey = idempotencyKey,
-            customerName = customerName?.trim()?.takeIf { it.isNotEmpty() },
-            customerPhone = customerPhone?.trim()?.takeIf { it.isNotEmpty() },
+            customerName = normalizedCustomerName,
+            customerPhone = normalizedCustomerPhone,
             paymentMode = paymentMode,
             subtotal = subtotal,
             discountPercent = if (subtotal > 0) (totalDiscount / subtotal) * 100 else 0.0,

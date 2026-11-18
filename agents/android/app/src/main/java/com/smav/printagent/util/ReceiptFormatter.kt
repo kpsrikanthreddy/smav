@@ -30,7 +30,7 @@ object ReceiptFormatter {
         b.setDoubleSize(true)
         b.textLine("THE GLOSSY LOOKS")
         b.setDoubleSize(false)
-        b.textLine("Luxury Salon & Spa")
+        b.textLine("Professional Womens Salon")
         b.setBold(false)
         b.textLine(branch.name)
         if (branch.address.isNotBlank()) {

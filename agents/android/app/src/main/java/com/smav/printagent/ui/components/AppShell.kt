@@ -628,6 +628,7 @@ fun MobileFormDialog(
     onDismiss: () -> Unit,
     confirmText: String,
     confirmEnabled: Boolean = true,
+    showConfirmButton: Boolean = true,
     isSaving: Boolean = false,
     onConfirm: () -> Unit,
     content: @Composable ColumnScope.() -> Unit
@@ -685,13 +686,15 @@ fun MobileFormDialog(
                         enabled = !isSaving,
                         modifier = Modifier.weight(1f)
                     )
-                    SmavGradientButton(
-                        text = confirmText,
-                        onClick = onConfirm,
-                        enabled = confirmEnabled,
-                        busy = isSaving,
-                        modifier = Modifier.weight(1f)
-                    )
+                    if (showConfirmButton) {
+                        SmavGradientButton(
+                            text = confirmText,
+                            onClick = onConfirm,
+                            enabled = confirmEnabled,
+                            busy = isSaving,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
                 }
             }
         }

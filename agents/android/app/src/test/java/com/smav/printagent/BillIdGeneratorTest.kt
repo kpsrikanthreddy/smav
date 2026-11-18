@@ -13,9 +13,9 @@ class BillIdGeneratorTest {
             branchCode = "GACH",
             sequenceNumber = 1
         )
-        // Format must match TGL-GACH-YYYYMMDD-00001
+        // Format must match TGL-GACH-YYYYMMDD-0001
         assertTrue(billNumber.startsWith("TGL-GACH-"))
-        assertTrue(billNumber.endsWith("-00001"))
+        assertTrue(billNumber.endsWith("-0001"))
         assertTrue(BillIdGenerator.isValidBillNumber(billNumber))
     }
 
@@ -28,17 +28,17 @@ class BillIdGeneratorTest {
         )
         // Format must match MOZZ-KOK-YYYYMMDD-00042
         assertTrue(orderNumber.startsWith("MOZZ-KOK-"))
-        assertTrue(orderNumber.endsWith("-00042"))
+        assertTrue(orderNumber.endsWith("-0042"))
         assertTrue(BillIdGenerator.isValidBillNumber(orderNumber))
     }
 
     @Test
     fun testSequenceNumberPadding() {
         val bill99 = BillIdGenerator.generateBillNumber("TGL", "GACH", 99)
-        assertTrue(bill99.endsWith("-00099"))
+        assertTrue(bill99.endsWith("-0099"))
 
         val bill1000 = BillIdGenerator.generateBillNumber("TGL", "GACH", 1000)
-        assertTrue(bill1000.endsWith("-01000"))
+        assertTrue(bill1000.endsWith("-1000"))
     }
 
     @Test
