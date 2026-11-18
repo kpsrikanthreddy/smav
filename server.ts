@@ -1,3 +1,4 @@
+import { dispatchDueSaleNotifications } from './services/saleNotificationDispatcher.ts';
 import { registerCatalogSource, resolveCatalogSource, glossyLooksSource } from './services/catalogSources';
 import { previewCatalogImport, importMissingCatalogItems, type SourceCatalogItem } from './services/catalogImport';
 import { fetchGlossyLooksStaff, isGlossyLooksOutlet, type NormalizedStylist, type SalonStaffFetchResult } from './services/salonStaff';
@@ -4693,6 +4694,20 @@ app.post('/api/pos/salon/next-bill-number', requireAuth, async (req, res) => {
   }
 });
 
+// Trusted scheduler endpoint. Never call this from Android or a browser.
+app.post('/api/internal/notifications/dispatch', async (req, res) => {
+  const configured = process.env.SMAV_DISPATCH_CRON_SECRET || '';
+  const supplied = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  if (configured.length < 32 || supplied.length !== configured.length ||
+      !crypto.timingSafeEqual(Buffer.from(supplied),Buffer.from(configured))) {
+    return res.status(401).json({success:false,message:'Unauthorized'});
+  }
+  const db = getCentralSupabaseServiceClient();
+  if (!db) return res.status(503).json({success:false,message:'Service database unavailable'});
+  try { return res.json({success:true,...await dispatchDueSaleNotifications(db)}); }
+  catch (error:any) { return res.status(503).json({success:false,message:error.message}); }
+});
+
 app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
   try {
     const session: UserSession = (req as any).userSession;
@@ -4726,6 +4741,32 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
         }))
       }, { onConflict: 'idempotency_key', ignoreDuplicates: true });
       if (error) throw new Error(error.message);
+      // Register the receipt only after the bill has been persisted. Unique constraints
+      // prevent repeated sync requests from creating duplicate notification jobs.
+      const saleTime = bill.createdAt && !Number.isNaN(Date.parse(bill.createdAt))
+        ? new Date(bill.createdAt).toISOString() : new Date().toISOString();
+      const { error: notificationError } = await db.from('smav_sale_notification_jobs').upsert({
+        outlet_id: session.activeOutlet.id,
+        source_type: 'salon', source_key: String(idempotency_key),
+        event_type: 'receipt', status: 'pending',
+        scheduled_at: new Date().toISOString(),
+        payload: { bill_number: bill.billNumber, customer_name: bill.customerName,
+          customer_phone: bill.customerPhone, payment_mode: bill.paymentMode,
+          grand_total: bill.grandTotal, items, billed_at: saleTime }
+      }, { onConflict: 'outlet_id,source_type,source_key,event_type', ignoreDuplicates: true });
+      if (notificationError) console.error('[SMAV notification queue]', notificationError.message);
+      // Feedback is only queued if the original sale is still within its 2-minute window.
+      const feedbackDue = Date.parse(saleTime) + 2 * 60_000;
+      if (feedbackDue > Date.now()) {
+        const { error: feedbackError } = await db.from('smav_sale_notification_jobs').upsert({
+          outlet_id: session.activeOutlet.id, source_type: 'salon',
+          source_key: String(idempotency_key), event_type: 'feedback',
+          status: 'pending', scheduled_at: new Date(feedbackDue).toISOString(),
+          payload: { bill_number: bill.billNumber, customer_name: bill.customerName,
+            customer_phone: bill.customerPhone, billed_at: saleTime }
+        }, { onConflict: 'outlet_id,source_type,source_key,event_type', ignoreDuplicates: true });
+        if (feedbackError) console.error('[SMAV feedback queue]', feedbackError.message);
+      }
       syncedIds.push(bill.billNumber);
     }
     res.json({ success: true, synced_ids: syncedIds, server_timestamp: Date.now() });
@@ -4734,49 +4775,66 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/mobile/sync/orders', requireAuth, (req, res) => {
-  const session: UserSession = (req as any).userSession;
-  const { orders } = req.body;
-  if (!Array.isArray(orders) || orders.length === 0) {
-    return res.json({ success: true, synced_ids: [], server_timestamp: Date.now() });
-  }
-
-  const syncedIds: string[] = [];
-
-  for (const item of orders) {
-    const { order, items, idempotency_key } = item;
-    if (!order || !idempotency_key) continue;
-    if (order.outletId && order.outletId !== session.activeOutlet.id && session.role !== 'superadmin') {
-      return res.status(403).json({ success: false, message: 'Forbidden: Order outlet does not match active outlet session.' });
+app.post('/api/mobile/sync/orders', requireAuth, async (req, res) => {
+  try {
+    const session: UserSession = (req as any).userSession;
+    if (session.activeOutlet.category !== 'restaurant') {
+      return res.status(403).json({ success: false, message: 'Restaurant outlet required' });
     }
-
-    const existing = syncedOrders.find(o => o.idempotency_key === idempotency_key || o.order_number === order.orderNumber);
-    if (existing) {
-      syncedIds.push(order.id);
-      continue;
+    if (!session.supabaseToken) return res.status(401).json({ success: false, message: 'Supabase session required' });
+    const db = getCentralSupabaseClient(session.supabaseToken);
+    if (!db) return res.status(503).json({ success: false, message: 'Central database unavailable' });
+    const { orders } = req.body;
+    if (!Array.isArray(orders)) return res.status(400).json({ success: false, message: 'orders must be an array' });
+    const syncedIds: string[] = [];
+    for (const entry of orders) {
+      const { order, items, idempotency_key } = entry || {};
+      if (!order || !idempotency_key || !Array.isArray(items) || !items.length ||
+          !order.orderNumber || !Number.isFinite(Number(order.grandTotal)) || Number(order.grandTotal) < 0) {
+        return res.status(400).json({ success: false, message: 'Invalid restaurant order' });
+      }
+      if (order.outletId && order.outletId !== session.activeOutlet.id) {
+        return res.status(403).json({ success: false, message: 'Order outlet mismatch' });
+      }
+      const billedAt = order.createdAt && !Number.isNaN(Date.parse(order.createdAt))
+        ? new Date(order.createdAt).toISOString() : new Date().toISOString();
+      const { error } = await db.from('smav_central_sales').upsert({
+        outlet_id: session.activeOutlet.id, created_by: session.userId,
+        sale_kind: 'restaurant', idempotency_key: String(idempotency_key),
+        bill_number: String(order.orderNumber), customer_name: order.customerName || null,
+        customer_phone: order.customerPhone || null, payment_mode: order.paymentMode || null,
+        grand_total: Number(order.grandTotal), items,
+        billed_at: billedAt,
+        details: { token_number: order.tokenNumber || null, branch_code: order.branchCode || null,
+          order_type: order.orderType || null, table_or_counter: order.tableOrCounter || null }
+      }, { onConflict: 'outlet_id,idempotency_key', ignoreDuplicates: true });
+      if (error) throw new Error(error.message);
+      // The outlet-specific backend decides which approved WhatsApp template to use.
+      // Never block billing if customer phone is absent; no notification is then queued.
+      if (String(order.customerPhone || '').trim()) {
+        const payload = {bill_number:order.orderNumber,customer_name:order.customerName || '',
+          customer_phone:order.customerPhone,payment_mode:order.paymentMode || '',
+          grand_total:Number(order.grandTotal),items,billed_at:billedAt,order_type:order.orderType || null};
+        const {error: receiptError} = await db.from('smav_sale_notification_jobs').upsert({
+          outlet_id:session.activeOutlet.id,source_type:'restaurant',source_key:String(idempotency_key),
+          event_type:'receipt',status:'pending',scheduled_at:new Date().toISOString(),payload
+        },{onConflict:'outlet_id,source_type,source_key,event_type',ignoreDuplicates:true});
+        if (receiptError) console.error('[SMAV restaurant receipt queue]',receiptError.message);
+        const due = Date.parse(billedAt) + 2*60_000;
+        if (due > Date.now()) {
+          const {error: feedbackError} = await db.from('smav_sale_notification_jobs').upsert({
+            outlet_id:session.activeOutlet.id,source_type:'restaurant',source_key:String(idempotency_key),
+            event_type:'feedback',status:'pending',scheduled_at:new Date(due).toISOString(),payload
+          },{onConflict:'outlet_id,source_type,source_key,event_type',ignoreDuplicates:true});
+          if (feedbackError) console.error('[SMAV restaurant feedback queue]',feedbackError.message);
+        }
+      }
+      syncedIds.push(order.id || order.orderNumber);
     }
-
-    const record = {
-      id: order.id,
-      order_number: order.orderNumber,
-      token_number: order.tokenNumber,
-      outlet_id: session.activeOutlet.id,
-      business_id: session.activeOutlet.code || 'mozz_starters4u',
-      branch_code: order.branchCode || session.activeOutlet.code || 'GACH',
-      table_or_counter: order.tableOrCounter,
-      order_type: order.orderType,
-      grand_total: order.grandTotal,
-      catalog_revision_at_sale: order.catalogRevisionAtSale || restaurantCatalogRevision,
-      idempotency_key,
-      items: items || [],
-      created_at_server: new Date().toISOString()
-    };
-
-    syncedOrders.unshift(record);
-    syncedIds.push(order.id);
+    res.json({ success: true, synced_ids: syncedIds, server_timestamp: Date.now() });
+  } catch (error: any) {
+    res.status(503).json({ success: false, message: `Central order persistence failed: ${error.message}` });
   }
-
-  res.json({ success: true, synced_ids: syncedIds, server_timestamp: Date.now() });
 });
 
 app.get('/api/salon/services', requireAuth, (req, res) => {
