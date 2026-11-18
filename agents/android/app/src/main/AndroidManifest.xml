@@ -29,9 +29,9 @@
     <application
         android:name=".SMAVApplication"
         android:allowBackup="false"
-        android:icon="@android:drawable/stat_sys_data_bluetooth"
+        android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
-        android:roundIcon="@android:drawable/stat_sys_data_bluetooth"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.SMAVPrintAgent"
         tools:targetApi="34">

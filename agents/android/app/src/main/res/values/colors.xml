@@ -12,4 +12,5 @@
     <color name="smav_success">#15803D</color>
     <color name="smav_warning">#B45309</color>
     <color name="smav_error">#B91C1C</color>
+    <color name="smav_launcher_background">#FFFFFF</color>
 </resources>
