@@ -1620,6 +1620,22 @@ const syncedOrders: any[] = [
   { id: 'ord_seed_01', order_number: 'MOZZ-GACH-20261110-00088', token_number: '088', business_id: 'mozz_starters4u', outlet_id: 'outlet_mozz_gach', branch_id: 'outlet_mozz_gach', branch_code: 'GACH', table_or_counter: 'Table 2', grand_total: 680, payment_mode: 'cash', created_at_server: new Date(Date.now() - 3600000 * 2).toISOString() }
 ];
 const whatsappQueue: any[] = [];
+const salonBillSequenceReservations = new Map<string, number>();
+
+function salonReceiptBranchCode(outlet: Pick<Outlet, 'code' | 'name' | 'address'>): string {
+  const source = `${outlet.code} ${outlet.name} ${outlet.address}`.trim().toLowerCase();
+  if (source.includes('kondapur') || /(^|\W)konda?(\W|$)/.test(source)) return 'KONDA';
+  if (source.includes('gachibowli') || /(^|\W)gachi?(\W|$)/.test(source)) return 'GACHI';
+  return outlet.code.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 5) || 'GACHI';
+}
+
+function indiaDatePart(now = new Date()): string {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(now);
+  const value = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return `${value.year}${value.month}${value.day}`;
+}
 
 export async function syncLiveSupabaseCatalogs() {
   try {
@@ -4627,6 +4643,56 @@ app.post('/api/admin/catalog/retail-product', requireAuth, requireAdmin, async (
 // -------------------------------------------------------------------------------------------------
 // 5. Offline Sync APIs (Bills & Orders)
 // -------------------------------------------------------------------------------------------------
+app.post('/api/pos/salon/next-bill-number', requireAuth, async (req, res) => {
+  try {
+    const session: UserSession = (req as any).userSession;
+    if (session.activeOutlet.category !== 'salon') {
+      return res.status(400).json({ success: false, message: 'A salon outlet must be selected.' });
+    }
+    if (req.body?.outletId && req.body.outletId !== session.activeOutlet.id) {
+      return res.status(403).json({ success: false, message: 'Outlet assignment mismatch.' });
+    }
+
+    const branchCode = salonReceiptBranchCode(session.activeOutlet);
+    const datePart = indiaDatePart();
+    const prefix = `TGL-${branchCode}-${datePart}-`;
+    const reservationKey = `${session.activeOutlet.id}:${datePart}`;
+    let lastSequence = salonBillSequenceReservations.get(reservationKey) || 0;
+
+    if (session.supabaseToken && centralSupabaseConfig.isConfigured) {
+      const db = getCentralSupabaseClient(session.supabaseToken);
+      if (db) {
+        const { data, error } = await db
+          .from('smav_salon_bills')
+          .select('bill_number')
+          .eq('outlet_id', session.activeOutlet.id)
+          .like('bill_number', `TGL-%-${datePart}-%`)
+          .limit(1000);
+        if (error) throw new Error(error.message);
+        const dbSequence = Array.isArray(data)
+          ? data.reduce((highest: number, row: any) => {
+              const sequence = Number.parseInt(String(row?.bill_number || '').split('-').pop() || '0', 10);
+              return Number.isFinite(sequence) ? Math.max(highest, sequence) : highest;
+            }, 0)
+          : 0;
+        if (Number.isFinite(dbSequence)) lastSequence = Math.max(lastSequence, dbSequence);
+      }
+    }
+
+    const nextSequence = lastSequence + 1;
+    salonBillSequenceReservations.set(reservationKey, nextSequence);
+    return res.json({
+      success: true,
+      billNumber: `${prefix}${String(nextSequence).padStart(4, '0')}`,
+      branchCode,
+      sequence: nextSequence,
+      date: datePart
+    });
+  } catch (error: any) {
+    return res.status(503).json({ success: false, message: `Unable to reserve bill number: ${error.message}` });
+  }
+});
+
 app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
   try {
     const session: UserSession = (req as any).userSession;
@@ -4640,6 +4706,8 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
       const { bill, items, idempotency_key } = entry || {};
       if (!bill || !Array.isArray(items) || !items.length || !idempotency_key || bill.outletId !== session.activeOutlet.id)
         return res.status(400).json({ success: false, message: 'Invalid bill or outlet assignment' });
+      if (!String(bill.customerName || '').trim() || !String(bill.customerPhone || '').trim())
+        return res.status(400).json({ success: false, message: 'Customer name and phone are required' });
       if (items.some((item: any) => !item.stylistId || !item.serviceId))
         return res.status(400).json({ success: false, message: 'Every salon service must have a selected stylist and service ID' });
       const { error } = await db.from('smav_salon_bills').upsert({

@@ -42,6 +42,12 @@ class BillIdGeneratorTest {
     }
 
     @Test
+    fun testSalonBranchCodeUsesSelectedBranchDetails() {
+        assertEquals("GACHI", BillIdGenerator.salonBranchCode("glossylooks", "The Glossy Looks", "Gachibowli, Hyderabad"))
+        assertEquals("KONDA", BillIdGenerator.salonBranchCode("glossylooks", "The Glossy Looks Kondapur", "Kondapur, Hyderabad"))
+    }
+
+    @Test
     fun testIdempotencyKeyDeterministic() {
         val billNo = "TGL-GACH-20261106-00001"
         val deviceId = "SMAV-DEV-AABBCCDDEEFF"

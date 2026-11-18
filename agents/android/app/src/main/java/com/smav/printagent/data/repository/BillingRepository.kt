@@ -80,12 +80,11 @@ class BillingRepository(
 
         val deviceId = sessionManager.deviceId
         val branchCode = branch.code.ifBlank { "GACH" }
-        val billBranchCode = if (
-            branchCode.contains("glossy", ignoreCase = true) ||
-            branch.name.contains("glossy", ignoreCase = true)
-        ) "GL" else branchCode
+        val billBranchCode = BillIdGenerator.salonBranchCode(branchCode, branch.name, branch.address)
 
-        val todayPrefix = "%-$billBranchCode-${BillIdGenerator.getTodayDateString()}-%"
+        // Count every salon bill for this physical branch/date, including legacy GL bill numbers,
+        // so changing the display branch token does not restart today's sequence at 0001.
+        val todayPrefix = "%-${BillIdGenerator.getTodayDateString()}-%"
         val existingCount = database.salonBillDao().countBillsMatchingPrefix(branchCode, todayPrefix)
         val nextSeq = existingCount + 1
 

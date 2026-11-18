@@ -8,7 +8,7 @@ import java.util.TimeZone
 /**
  * Deterministic offline unique bill ID generator.
  * Format examples:
- * - The Glossy Looks Salon: TGL-GL-20261106-0001
+ * - The Glossy Looks Salon: TGL-GACHI-20261106-0001
  * - MOZZ / Starters4U:       MOZZ-GACH-20261106-0001
  */
 object BillIdGenerator {
@@ -25,6 +25,19 @@ object BillIdGenerator {
         val sdf = SimpleDateFormat("dd-MMM-yyyy hh:mm a", Locale.ENGLISH)
         sdf.timeZone = kolkataTimeZone
         return sdf.format(Date(timestamp))
+    }
+
+    fun salonBranchCode(code: String, name: String, address: String): String {
+        val source = "$code $name $address".trim().lowercase(Locale.ENGLISH)
+        return when {
+            "kondapur" in source || Regex("(^|[^a-z])konda?([^a-z]|$)").containsMatchIn(source) -> "KONDA"
+            "gachibowli" in source || Regex("(^|[^a-z])gachi?([^a-z]|$)").containsMatchIn(source) -> "GACHI"
+            else -> code.trim()
+                .uppercase(Locale.ENGLISH)
+                .replace(Regex("[^A-Z0-9]"), "")
+                .take(5)
+                .ifBlank { "GACHI" }
+        }
     }
 
     /**

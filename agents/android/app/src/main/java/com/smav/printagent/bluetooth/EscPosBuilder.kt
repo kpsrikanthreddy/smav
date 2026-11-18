@@ -69,6 +69,40 @@ class EscPosBuilder(val paperWidth: PaperWidth = PaperWidth.WIDTH_80MM) {
         return this
     }
 
+    /** Prints a monochrome bitmap using the widely supported GS v 0 raster command. */
+    fun rasterImage(bitmap: Bitmap): EscPosBuilder {
+        val width = bitmap.width
+        val height = bitmap.height
+        val widthBytes = (width + 7) / 8
+        output.write(byteArrayOf(
+            0x1D, 0x76, 0x30, 0x00,
+            (widthBytes and 0xFF).toByte(), ((widthBytes shr 8) and 0xFF).toByte(),
+            (height and 0xFF).toByte(), ((height shr 8) and 0xFF).toByte()
+        ))
+        for (y in 0 until height) {
+            for (byteX in 0 until widthBytes) {
+                var value = 0
+                for (bit in 0 until 8) {
+                    val x = byteX * 8 + bit
+                    if (x < width) {
+                        val pixel = bitmap.getPixel(x, y)
+                        val luminance = (
+                            android.graphics.Color.red(pixel) * 299 +
+                            android.graphics.Color.green(pixel) * 587 +
+                            android.graphics.Color.blue(pixel) * 114
+                        ) / 1000
+                        if (android.graphics.Color.alpha(pixel) > 0 && luminance < 128) {
+                            value = value or (0x80 shr bit)
+                        }
+                    }
+                }
+                output.write(value)
+            }
+        }
+        newLine()
+        return this
+    }
+
     fun newLine(): EscPosBuilder {
         output.write(byteArrayOf(0x0A)) // LF
         return this

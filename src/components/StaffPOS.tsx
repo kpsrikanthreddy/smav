@@ -58,6 +58,52 @@ interface StaffPOSProps {
 
 const normalizeGroup = (value?: string | null) => (value || '').trim() || 'General';
 
+const salonSubcategoryLabel = (item: Pick<SalonService, 'name' | 'subcategory'>) => {
+  const source = `${item.subcategory || ''} ${item.name || ''}`
+    .toLowerCase()
+    .replace(/[-_]+/g, ' ');
+  if (source.includes('wax')) return 'Waxing';
+  if (/hair\s*cut|advance cut/.test(source)) return 'Hair Cuts';
+  if (/hair\s*colou?r/.test(source)) return 'Hair Colour';
+  if (/blow\s*dry|hair styling/.test(source)) return 'Blow Dry & Styling';
+  if (source.includes('hair spa')) return 'Hair Spa';
+  if (source.includes('hair makeover')) return 'Hair Makeover';
+  if (/hair\s*wash|head massage/.test(source)) return 'Hair Wash & Massage';
+  if (/facial|clean\s*up|d\s*tan/.test(source)) return 'Facials & Clean-up';
+  if (source.includes('thread')) return 'Threading';
+  if (/pedicure|manicure/.test(source)) return 'Nails Care';
+  if (source.includes('massage')) return 'Massage';
+  if (/mask|masque/.test(source)) return 'Masks';
+  return normalizeGroup(item.subcategory)
+    .replace(/[-_]+/g, ' ')
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+};
+
+const salonBranchCode = (outlet: UserSession['activeOutlet']) => {
+  const source = `${outlet.code} ${outlet.name} ${outlet.address}`.toLowerCase();
+  if (source.includes('kondapur') || /(^|\W)konda?(\W|$)/.test(source)) return 'KONDA';
+  if (source.includes('gachibowli') || /(^|\W)gachi?(\W|$)/.test(source)) return 'GACHI';
+  return outlet.code.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 5) || 'GACHI';
+};
+
+const indiaDatePart = () => {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}${values.month}${values.day}`;
+};
+
+const nextOfflineSalonBillNumber = (outlet: UserSession['activeOutlet']) => {
+  const branch = salonBranchCode(outlet);
+  const datePart = indiaDatePart();
+  const key = `smav:salon-sequence:${outlet.id}:${datePart}`;
+  const previous = Number.parseInt(window.localStorage.getItem(key) || '0', 10);
+  const next = (Number.isFinite(previous) ? previous : 0) + 1;
+  window.localStorage.setItem(key, String(next));
+  return `TGL-${branch}-${datePart}-${String(next).padStart(4, '0')}`;
+};
+
 export const StaffPOS: React.FC<StaffPOSProps> = ({
   session,
   isOnline,
@@ -150,10 +196,12 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
 
   const catalogSubcategories = useMemo(
     () =>
-      Array.from(new Set(categoryItems.map((item) => normalizeGroup(item.subcategory)))).sort(
+      Array.from(new Set(categoryItems.map((item) =>
+        category === 'salon' ? salonSubcategoryLabel(item as SalonService) : normalizeGroup(item.subcategory)
+      ))).sort(
         (a, b) => a.localeCompare(b)
       ),
-    [categoryItems]
+    [categoryItems, category]
   );
 
   const visibleCatalogItems = useMemo(() => {
@@ -161,13 +209,15 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
     return categoryItems.filter(
       (item) =>
         (selectedSubcategoryFilter === 'All' ||
-          normalizeGroup(item.subcategory) === selectedSubcategoryFilter) &&
+          (category === 'salon'
+            ? salonSubcategoryLabel(item as SalonService)
+            : normalizeGroup(item.subcategory)) === selectedSubcategoryFilter) &&
         (!q ||
           item.name.toLowerCase().includes(q) ||
           normalizeGroup(item.category).toLowerCase().includes(q) ||
           normalizeGroup(item.subcategory).toLowerCase().includes(q))
     );
-  }, [categoryItems, selectedSubcategoryFilter, searchQuery]);
+  }, [categoryItems, selectedSubcategoryFilter, searchQuery, category]);
 
   useEffect(() => {
     setSelectedCategoryFilter('All');
@@ -514,6 +564,17 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
     if (isSubmittingBillRef.current || isProcessingBill) return;
     if (salonCart.length === 0) return;
 
+    if (!customerName.trim()) {
+      setBillSaveError('Customer name is required.');
+      document.getElementById('pos-customer-name')?.focus();
+      return;
+    }
+    if (!customerPhone.trim()) {
+      setBillSaveError('Customer phone is required.');
+      document.getElementById('pos-customer-phone')?.focus();
+      return;
+    }
+
     if (isLoadingStylists) {
       setBillSaveError('Stylist data is still loading. Please wait.');
       return;
@@ -560,7 +621,24 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       });
 
       if (!pendingCheckoutRef.current || pendingCheckoutRef.current.fingerprint !== fingerprint) {
-        const billNumber = `TGL-${session.activeOutlet.code.toUpperCase()}-${Date.now().toString().slice(-6)}`;
+        let billNumber: string;
+        if (isOnline) {
+          const numberResponse = await fetch('/api/pos/salon/next-bill-number', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${session.token}`,
+            },
+            body: JSON.stringify({ outletId: session.activeOutlet.id }),
+          });
+          const numberResult = await numberResponse.json().catch(() => null);
+          if (!numberResponse.ok || !numberResult?.billNumber) {
+            throw new Error(numberResult?.message || 'Could not reserve the next bill number.');
+          }
+          billNumber = numberResult.billNumber;
+        } else {
+          billNumber = nextOfflineSalonBillNumber(session.activeOutlet);
+        }
         pendingCheckoutRef.current = {
           fingerprint,
           billNumber,
@@ -577,6 +655,8 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
         outletGstin: session.activeOutlet.gstin,
         receiptHeader: session.activeOutlet.receiptHeader,
         receiptFooter: session.activeOutlet.receiptFooter,
+        branchCode: salonBranchCode(session.activeOutlet),
+        businessType: 'salon',
         customerName: customerName.trim() || 'Walk-in Customer',
         customerPhone: customerPhone.trim(),
         paymentMode,
@@ -924,7 +1004,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                         <ItemCard
                           key={`${item.service.id}-${idx}`}
                           title={item.service.name}
-                          subtitle={`${normalizeGroup(item.service.category)} · ${normalizeGroup(item.service.subcategory)}`}
+                          subtitle={`${normalizeGroup(item.service.category)} · ${salonSubcategoryLabel(item.service)}`}
                           meta={
                             item.service.durationMinutes
                               ? `${item.service.durationMinutes} min`
@@ -1017,23 +1097,25 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                   )}
 
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                    <FormField label="Customer Name" htmlFor="pos-customer-name">
+                    <FormField label="Customer Name *" htmlFor="pos-customer-name">
                       <input
                         id="pos-customer-name"
                         type="text"
                         value={customerName}
                         onChange={(e) => setCustomerName(e.target.value)}
-                        placeholder="Walk-in Customer"
+                        placeholder="Enter customer name"
+                        required
                         className={BASE_INPUT_CLASS}
                       />
                     </FormField>
-                    <FormField label="Phone (WhatsApp)" htmlFor="pos-customer-phone">
+                    <FormField label="Phone (WhatsApp) *" htmlFor="pos-customer-phone">
                       <input
                         id="pos-customer-phone"
                         type="tel"
                         value={customerPhone}
                         onChange={(e) => setCustomerPhone(e.target.value)}
-                        placeholder="Optional mobile"
+                        placeholder="Enter mobile number"
+                        required
                         className={BASE_INPUT_CLASS}
                       />
                     </FormField>
@@ -1372,7 +1454,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                       <ItemCard
                         key={srv.id}
                         title={srv.name}
-                        subtitle={`${normalizeGroup(srv.category)} · ${normalizeGroup(srv.subcategory)}`}
+                        subtitle={`${normalizeGroup(srv.category)} · ${salonSubcategoryLabel(srv)}`}
                         meta={srv.durationMinutes ? `${srv.durationMinutes} min` : undefined}
                         price={srv.price}
                         quantity={salonQtyById[srv.id] || 0}
@@ -1623,6 +1705,13 @@ interface ThermalReceiptSlipProps {
   printOnly?: boolean;
 }
 
+const WhatsAppMark = () => (
+  <svg viewBox="0 0 24 24" aria-label="WhatsApp" className="w-3 h-3 shrink-0" fill="none">
+    <path d="M20 11.7a8 8 0 0 1-11.8 7L4 20l1.3-4.1A8 8 0 1 1 20 11.7Z" stroke="currentColor" strokeWidth="1.8" />
+    <path d="M8.3 7.7c.4 3.8 2.4 5.8 6.1 6.4l1.4-1.5-2.1-1-1 1c-1.5-.6-2.5-1.6-3.1-3.1l1-1-1-2.1-1.3 1.3Z" fill="currentColor" />
+  </svg>
+);
+
 const ThermalReceiptSlip: React.FC<ThermalReceiptSlipProps> = ({
   receipt,
   paperWidthMm,
@@ -1638,10 +1727,24 @@ const ThermalReceiptSlip: React.FC<ThermalReceiptSlipProps> = ({
     }`}
   >
     <div className="text-center pb-2 border-b border-dashed border-[#9CA3AF] space-y-0.5">
-      <p className="font-bold text-xs uppercase leading-tight">{receipt.outletName}</p>
-      {receipt.receiptHeader && <p className="text-[10px] text-[#374151]">{receipt.receiptHeader}</p>}
+      <p className="font-bold text-xs uppercase leading-tight">
+        {receipt.businessType === 'salon' ? 'THE GLOSSY LOOKS' : receipt.outletName}
+      </p>
+      {receipt.businessType === 'salon' ? (
+        <>
+          <p className="text-[10px] text-[#374151]">Professional Womens Salon</p>
+          <p className="text-[9px] text-[#111827] inline-flex items-center justify-center gap-1">
+            <WhatsAppMark />
+            <span>9966970003 (G) · 9154744608 (K)</span>
+          </p>
+        </>
+      ) : receipt.receiptHeader ? (
+        <p className="text-[10px] text-[#374151]">{receipt.receiptHeader}</p>
+      ) : null}
       {receipt.outletAddress && <p className="text-[10px] text-[#4B5563]">{receipt.outletAddress}</p>}
-      {receipt.outletPhone && <p className="text-[10px] text-[#4B5563]">Tel: {receipt.outletPhone}</p>}
+      {receipt.businessType !== 'salon' && receipt.outletPhone && (
+        <p className="text-[10px] text-[#4B5563]">Tel: {receipt.outletPhone}</p>
+      )}
       {receipt.outletGstin && <p className="text-[10px] text-[#4B5563]">GSTIN: {receipt.outletGstin}</p>}
       <p className="text-[10px] text-[#4B5563] pt-1">Date: {receipt.timestamp}</p>
       <p className="font-bold text-[10px]">Bill No: {receipt.billNumber || receipt.orderNumber}</p>

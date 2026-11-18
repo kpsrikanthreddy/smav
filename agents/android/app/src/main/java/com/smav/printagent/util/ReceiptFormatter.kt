@@ -1,5 +1,10 @@
 package com.smav.printagent.util
 
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
 import com.smav.printagent.bluetooth.EscPosBuilder
 import com.smav.printagent.data.local.entities.RestaurantOrderEntity
 import com.smav.printagent.data.local.entities.RestaurantOrderItemEntity
@@ -10,6 +15,37 @@ import com.smav.printagent.model.PaperWidth
 import java.util.Locale
 
 object ReceiptFormatter {
+
+    private fun whatsappContactLine(paperWidth: PaperWidth): Bitmap {
+        val width = if (paperWidth == PaperWidth.WIDTH_80MM) 560 else 360
+        val height = 34
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        canvas.drawColor(Color.WHITE)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.BLACK
+            style = Paint.Style.STROKE
+            strokeWidth = 2.2f
+        }
+        val iconLeft = if (paperWidth == PaperWidth.WIDTH_80MM) 38f else 5f
+        canvas.drawCircle(iconLeft + 13f, 15f, 11f, paint)
+        val tail = Path().apply {
+            moveTo(iconLeft + 7f, 24f)
+            lineTo(iconLeft + 4f, 31f)
+            lineTo(iconLeft + 13f, 26f)
+        }
+        canvas.drawPath(tail, paint)
+        val phone = Path().apply {
+            moveTo(iconLeft + 8f, 9f)
+            cubicTo(iconLeft + 10f, 18f, iconLeft + 16f, 21f, iconLeft + 20f, 21f)
+        }
+        canvas.drawPath(phone, paint)
+        paint.style = Paint.Style.FILL
+        paint.textSize = if (paperWidth == PaperWidth.WIDTH_80MM) 21f else 17f
+        paint.typeface = android.graphics.Typeface.create(android.graphics.Typeface.MONOSPACE, android.graphics.Typeface.BOLD)
+        canvas.drawText("9966970003 (G)  9154744608 (K)", iconLeft + 31f, 23f, paint)
+        return bitmap
+    }
 
     /**
      * Formats a thermal receipt for The Glossy Looks Salon (supports 80mm and 58mm).
@@ -32,12 +68,9 @@ object ReceiptFormatter {
         b.setDoubleSize(false)
         b.textLine("Professional Womens Salon")
         b.setBold(false)
-        b.textLine(branch.name)
+        b.rasterImage(whatsappContactLine(paperWidth))
         if (branch.address.isNotBlank()) {
             b.textLine(branch.address)
-        }
-        if (branch.phone.isNotBlank()) {
-            b.textLine("Tel: ${branch.phone}")
         }
         if (branch.gstin.isNotBlank()) {
             b.textLine("GSTIN: ${branch.gstin}")
