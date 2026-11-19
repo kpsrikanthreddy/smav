@@ -1,9 +1,8 @@
 import {
+  enqueueSaleNotificationJobs,
   dispatchDueSaleNotifications,
   runSafeIntegrationDiagnostics,
   runConfirmedE2EIntegrationTest,
-  recordNotificationStepLog,
-  maskPhone,
   sanitizeErrorMessage,
   type InternalDispatcherRuntimeState
 } from './services/saleNotificationDispatcher.ts';
@@ -1640,15 +1639,16 @@ const internalDispatcherState: InternalDispatcherRuntimeState = {
   lastProcessed: 0
 };
 let internalDispatcherTimer: NodeJS.Timeout | null = null;
+let activeDispatchPromise: Promise<void> | null = null;
 
-function triggerBackgroundSaleNotificationDispatch() {
-  if (internalDispatcherState.running) return;
+function runSaleNotificationDispatchTick(): Promise<void> {
+  if (activeDispatchPromise) return activeDispatchPromise;
   const serviceDb = getCentralSupabaseServiceClient();
   const secret = (process.env.SMAV_DISPATCH_SECRET || '').trim();
-  if (!serviceDb || secret.length < 32) return;
+  if (!serviceDb || secret.length < 32) return Promise.resolve();
 
   internalDispatcherState.running = true;
-  void dispatchDueSaleNotifications(serviceDb, 20)
+  const p = dispatchDueSaleNotifications(serviceDb, 20)
     .then((res) => {
       internalDispatcherState.lastRunAt = new Date().toISOString();
       internalDispatcherState.lastRunError = null;
@@ -1660,7 +1660,51 @@ function triggerBackgroundSaleNotificationDispatch() {
     })
     .finally(() => {
       internalDispatcherState.running = false;
+      activeDispatchPromise = null;
     });
+  activeDispatchPromise = p;
+  return p;
+}
+
+function triggerBackgroundSaleNotificationDispatch() {
+  void runSaleNotificationDispatchTick();
+}
+
+/**
+ * Runs the dispatcher before the sync HTTP response flushes so Cloud Run keeps
+ * request CPU active for immediate WhatsApp receipt delivery without blocking POS
+ * checkout beyond maxWaitMs.
+ */
+async function dispatchDueSaleNotificationsAfterSync(maxWaitMs = 8000): Promise<void> {
+  const serviceDb = getCentralSupabaseServiceClient();
+  const secret = (process.env.SMAV_DISPATCH_SECRET || '').trim();
+  if (!serviceDb || secret.length < 32) return;
+
+  const deadline = Date.now() + maxWaitMs;
+  const raceTimeout = (promise: Promise<void>) => {
+    const remaining = Math.max(0, deadline - Date.now());
+    if (remaining === 0) return Promise.resolve();
+    let timer: NodeJS.Timeout | null = null;
+    return Promise.race([
+      promise,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, remaining);
+        if (typeof timer.unref === 'function') timer.unref();
+      })
+    ]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+  };
+
+  try {
+    if (activeDispatchPromise) {
+      await raceTimeout(activeDispatchPromise);
+      if (Date.now() >= deadline) return;
+    }
+    await raceTimeout(runSaleNotificationDispatchTick());
+  } catch {
+    // Non-fatal: bill is already persisted and due jobs remain safely queued
+  }
 }
 
 function startInternalSaleNotificationDispatcher() {
@@ -1691,55 +1735,6 @@ function parseSaleTimestampIso(raw: unknown): string {
     if (!Number.isNaN(parsed)) return new Date(parsed).toISOString();
   }
   return new Date().toISOString();
-}
-
-async function upsertNotificationJobSafe(
-  db: ReturnType<typeof getCentralSupabaseClient>,
-  row: {
-    outlet_id: string;
-    source_type: string;
-    source_key: string;
-    event_type: 'receipt' | 'feedback';
-    status: 'pending';
-    scheduled_at: string;
-    payload: Record<string, any>;
-    bill_id?: string | null;
-    bill_number?: string | null;
-  }
-) {
-  if (!db) return { error: { message: 'Database unavailable' } };
-  const with016 = {
-    outlet_id: row.outlet_id,
-    source_type: row.source_type,
-    source_key: row.source_key,
-    event_type: row.event_type,
-    status: row.status,
-    scheduled_at: row.scheduled_at,
-    payload: row.payload,
-    ...(row.bill_id ? { bill_id: row.bill_id } : {}),
-    ...(row.bill_number ? { bill_number: row.bill_number } : {})
-  };
-  const first = await db
-    .from('smav_sale_notification_jobs')
-    .upsert(with016, { onConflict: 'outlet_id,source_type,source_key,event_type', ignoreDuplicates: true });
-
-  if (first.error && /column .* does not exist|schema cache/i.test(first.error.message)) {
-    return db
-      .from('smav_sale_notification_jobs')
-      .upsert(
-        {
-          outlet_id: row.outlet_id,
-          source_type: row.source_type,
-          source_key: row.source_key,
-          event_type: row.event_type,
-          status: row.status,
-          scheduled_at: row.scheduled_at,
-          payload: row.payload
-        },
-        { onConflict: 'outlet_id,source_type,source_key,event_type', ignoreDuplicates: true }
-      );
-  }
-  return first;
 }
 
 function salonReceiptBranchCode(outlet: Pick<Outlet, 'code' | 'name' | 'address'>): string {
@@ -5194,67 +5189,36 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
         }
       }
 
-      // Register notification jobs only after the bill is durably persisted.
+      // Register notification jobs via serviceDb (post-authorization) so RLS never blocks queueing.
       const saleTime = parseSaleTimestampIso(bill.createdAt);
       const sendReceipts = outletRoute ? Boolean(outletRoute.send_receipts) : true;
       const sendFeedback = outletRoute ? Boolean(outletRoute.send_feedback) : true;
-      const basePayload = {
-        bill_id: persistedBillId,
-        bill_number: canonicalBillNumber,
-        customer_name: bill.customerName,
-        customer_phone: bill.customerPhone,
-        payment_mode: bill.paymentMode,
-        grand_total: bill.grandTotal,
+      const resolvedBranchCode = String(bill.branchCode || salonReceiptBranchCode(session.activeOutlet)).trim();
+
+      await enqueueSaleNotificationJobs({
+        db: serviceDb || db,
+        logDb: serviceDb,
+        outlet: {
+          id: session.activeOutlet.id,
+          code: session.activeOutlet.code,
+          name: session.activeOutlet.name,
+          branchCode: resolvedBranchCode
+        },
+        sourceType: 'salon',
+        sourceKey: cleanIdempotencyKey,
+        billId: persistedBillId,
+        billNumber: canonicalBillNumber,
+        customerName: bill.customerName,
+        customerPhone: bill.customerPhone,
+        paymentMode: bill.paymentMode,
+        grandTotal: Number(bill.grandTotal),
+        subtotal: typeof bill.subtotal === 'number' ? bill.subtotal : null,
+        discount: typeof bill.discount === 'number' ? bill.discount : null,
+        tax: typeof bill.tax === 'number' ? bill.tax : null,
         items,
-        billed_at: saleTime
-      };
-
-      if (sendReceipts) {
-        const { error: notificationError } = await upsertNotificationJobSafe(db, {
-          outlet_id: session.activeOutlet.id,
-          source_type: 'salon',
-          source_key: cleanIdempotencyKey,
-          event_type: 'receipt',
-          status: 'pending',
-          scheduled_at: new Date().toISOString(),
-          payload: basePayload,
-          bill_id: persistedBillId,
-          bill_number: canonicalBillNumber
-        });
-        if (notificationError) console.error('[SMAV notification queue]', notificationError.message);
-      }
-
-      // Feedback is only queued if the original sale is still within its 2-minute window.
-      const feedbackDue = Date.parse(saleTime) + 2 * 60_000;
-      if (sendFeedback && feedbackDue > Date.now()) {
-        const { error: feedbackError } = await upsertNotificationJobSafe(db, {
-          outlet_id: session.activeOutlet.id,
-          source_type: 'salon',
-          source_key: cleanIdempotencyKey,
-          event_type: 'feedback',
-          status: 'pending',
-          scheduled_at: new Date(feedbackDue).toISOString(),
-          payload: {
-            bill_id: persistedBillId,
-            bill_number: canonicalBillNumber,
-            customer_name: bill.customerName,
-            customer_phone: bill.customerPhone,
-            billed_at: saleTime
-          },
-          bill_id: persistedBillId,
-          bill_number: canonicalBillNumber
-        });
-        if (feedbackError) console.error('[SMAV feedback queue]', feedbackError.message);
-      }
-
-      await recordNotificationStepLog(serviceDb, {
-        bill_id: persistedBillId,
-        outlet_id: session.activeOutlet.id,
-        bill_number: canonicalBillNumber,
-        event_type: sendReceipts ? 'receipt' : 'feedback',
-        step: 'stage1_bill_persisted_and_enqueued',
-        status: 'pending',
-        masked_phone: maskPhone(bill.customerPhone)
+        billedAtIso: saleTime,
+        sendReceipts,
+        sendFeedback
       });
 
       // Preserve local Room billNumber in synced_ids so Android DAO marks the local bill SYNCED.
@@ -5266,7 +5230,7 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
       });
     }
 
-    triggerBackgroundSaleNotificationDispatch();
+    await dispatchDueSaleNotificationsAfterSync(8000);
     res.json({
       success: true,
       synced_ids: syncedIds,
@@ -5353,65 +5317,38 @@ app.post('/api/mobile/sync/orders', requireAuth, async (req, res) => {
       // For MOZZ, send_receipts is false so no unapproved receipt template is queued or sent.
       // Feedback is queued when customer phone is supplied, send_feedback is enabled, and within 2 min.
       if (String(order.customerPhone || '').trim()) {
-        const payload = {
-          bill_id: persistedSaleId,
-          bill_number: order.orderNumber,
-          customer_name: order.customerName || '',
-          customer_phone: order.customerPhone,
-          payment_mode: order.paymentMode || '',
-          grand_total: Number(order.grandTotal),
-          items,
-          billed_at: billedAt,
-          order_type: order.orderType || null
-        };
         const sendReceipts = outletRoute?.send_receipts === true;
         const sendFeedback = outletRoute ? Boolean(outletRoute.send_feedback) : true;
-
-        if (sendReceipts) {
-          const { error: receiptError } = await upsertNotificationJobSafe(db, {
-            outlet_id: session.activeOutlet.id,
-            source_type: 'restaurant',
-            source_key: cleanIdempotencyKey,
-            event_type: 'receipt',
-            status: 'pending',
-            scheduled_at: new Date().toISOString(),
-            payload,
-            bill_id: persistedSaleId,
-            bill_number: String(order.orderNumber)
-          });
-          if (receiptError) console.error('[SMAV restaurant receipt queue]', receiptError.message);
-        }
-
-        const due = Date.parse(billedAt) + 2 * 60_000;
-        if (sendFeedback && due > Date.now()) {
-          const { error: feedbackError } = await upsertNotificationJobSafe(db, {
-            outlet_id: session.activeOutlet.id,
-            source_type: 'restaurant',
-            source_key: cleanIdempotencyKey,
-            event_type: 'feedback',
-            status: 'pending',
-            scheduled_at: new Date(due).toISOString(),
-            payload,
-            bill_id: persistedSaleId,
-            bill_number: String(order.orderNumber)
-          });
-          if (feedbackError) console.error('[SMAV restaurant feedback queue]', feedbackError.message);
-        }
-
-        await recordNotificationStepLog(serviceDb, {
-          bill_id: persistedSaleId,
-          outlet_id: session.activeOutlet.id,
-          bill_number: String(order.orderNumber),
-          event_type: sendReceipts ? 'receipt' : 'feedback',
-          step: 'stage1_order_persisted_and_enqueued',
-          status: 'pending',
-          masked_phone: maskPhone(order.customerPhone)
+        await enqueueSaleNotificationJobs({
+          db: serviceDb || db,
+          logDb: serviceDb,
+          outlet: {
+            id: session.activeOutlet.id,
+            code: session.activeOutlet.code,
+            name: session.activeOutlet.name,
+            branchCode: order.branchCode || session.activeOutlet.code
+          },
+          sourceType: 'restaurant',
+          sourceKey: cleanIdempotencyKey,
+          billId: persistedSaleId,
+          billNumber: String(order.orderNumber),
+          customerName: order.customerName || '',
+          customerPhone: order.customerPhone,
+          paymentMode: order.paymentMode || '',
+          grandTotal: Number(order.grandTotal),
+          subtotal: typeof order.subtotal === 'number' ? order.subtotal : null,
+          tax: typeof order.tax === 'number' ? order.tax : null,
+          items,
+          billedAtIso: billedAt,
+          orderType: order.orderType || null,
+          sendReceipts,
+          sendFeedback
         });
       }
       syncedIds.push(order.id || order.orderNumber);
     }
 
-    triggerBackgroundSaleNotificationDispatch();
+    await dispatchDueSaleNotificationsAfterSync(8000);
     res.json({ success: true, synced_ids: syncedIds, server_timestamp: Date.now() });
   } catch (error: any) {
     res.status(503).json({ success: false, message: `Central order persistence failed: ${error.message}` });

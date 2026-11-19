@@ -584,6 +584,304 @@ export function isFeedbackWithinDeadline(billedAtIso: string | null | undefined,
   return true;
 }
 
+export function normalizeNotificationPhone(phone?: string | null): string {
+  const trimmed = String(phone || '').trim();
+  const digits = trimmed.replace(/\D+/g, '');
+  if (digits.length >= 10 && digits.length <= 15) return digits;
+  return trimmed;
+}
+
+async function upsertNotificationJobRow(
+  db: SupabaseClient,
+  row: {
+    outlet_id: string;
+    source_type: string;
+    source_key: string;
+    event_type: NotificationEventType;
+    status: 'pending';
+    scheduled_at: string;
+    payload: Record<string, unknown>;
+    bill_id?: string | null;
+    bill_number?: string | null;
+  }
+): Promise<{ error: { code?: string; message: string } | null }> {
+  const with016 = {
+    outlet_id: row.outlet_id,
+    source_type: row.source_type,
+    source_key: row.source_key,
+    event_type: row.event_type,
+    status: row.status,
+    attempts: 0,
+    scheduled_at: row.scheduled_at,
+    payload: row.payload,
+    ...(row.bill_id ? { bill_id: row.bill_id } : {}),
+    ...(row.bill_number ? { bill_number: row.bill_number } : {})
+  };
+
+  const first = await db
+    .from('smav_sale_notification_jobs')
+    .upsert(with016, { onConflict: 'outlet_id,source_type,source_key,event_type', ignoreDuplicates: true });
+
+  if (first.error && isMissingColumnError(first.error)) {
+    const fallback = await db
+      .from('smav_sale_notification_jobs')
+      .upsert(
+        {
+          outlet_id: row.outlet_id,
+          source_type: row.source_type,
+          source_key: row.source_key,
+          event_type: row.event_type,
+          status: row.status,
+          attempts: 0,
+          scheduled_at: row.scheduled_at,
+          payload: row.payload
+        },
+        { onConflict: 'outlet_id,source_type,source_key,event_type', ignoreDuplicates: true }
+      );
+    return { error: fallback.error ? { code: fallback.error.code, message: fallback.error.message } : null };
+  }
+
+  return { error: first.error ? { code: first.error.code, message: first.error.message } : null };
+}
+
+/**
+ * Unified central notification queueing for Web POS, Android POS, and offline sync.
+ * Idempotently queues one immediate 'receipt' job and one 2-minute delayed 'feedback' job
+ * using UNIQUE(outlet_id, source_type, source_key, event_type).
+ */
+export async function enqueueSaleNotificationJobs(params: {
+  db: SupabaseClient;
+  logDb?: SupabaseClient | null;
+  outlet: { id: string; code: string; name: string; branchCode?: string | null };
+  sourceType: 'salon' | 'restaurant' | 'retail';
+  sourceKey: string;
+  billId: string | null;
+  billNumber: string;
+  customerName?: string | null;
+  customerPhone?: string | null;
+  paymentMode?: string | null;
+  grandTotal: number;
+  subtotal?: number | null;
+  discount?: number | null;
+  tax?: number | null;
+  items: Array<Record<string, unknown>>;
+  billedAtIso: string;
+  orderType?: string | null;
+  sendReceipts: boolean;
+  sendFeedback: boolean;
+}): Promise<{
+  receiptQueued: boolean;
+  receiptError: string | null;
+  feedbackQueued: boolean;
+  feedbackScheduledAt: string | null;
+  feedbackSkippedOverdue: boolean;
+  feedbackError: string | null;
+}> {
+  const {
+    db,
+    logDb = db,
+    outlet,
+    sourceType,
+    sourceKey,
+    billId,
+    billNumber,
+    customerName,
+    customerPhone,
+    paymentMode,
+    grandTotal,
+    subtotal,
+    discount,
+    tax,
+    items,
+    billedAtIso,
+    orderType,
+    sendReceipts,
+    sendFeedback
+  } = params;
+
+  const cleanPhone = normalizeNotificationPhone(customerPhone);
+  const cleanName = String(customerName || '').trim();
+  const cleanPaymentMode = String(paymentMode || '').trim().toLowerCase() || null;
+  const branchCode = String(outlet.branchCode || outlet.code || '').trim() || null;
+  const maskedPhone = maskPhone(cleanPhone);
+
+  if (!cleanPhone) {
+    return {
+      receiptQueued: false,
+      receiptError: null,
+      feedbackQueued: false,
+      feedbackScheduledAt: null,
+      feedbackSkippedOverdue: false,
+      feedbackError: null
+    };
+  }
+
+  const normalizedItems = items.map((item) => {
+    const name = String(item.service_name ?? item.name ?? '').trim();
+    const qty = Number(item.quantity ?? 1);
+    const price = Number(item.unit_price ?? item.price ?? 0);
+    const stylistName = item.stylist_name ?? item.stylist ?? null;
+    const serviceId = item.service_id ?? item.serviceId ?? item.itemId ?? null;
+    const stylistId = item.stylist_id ?? item.stylistId ?? null;
+    const discountPercent = item.discount_percent ?? item.discountPercent ?? null;
+    return {
+      ...item,
+      name,
+      service_name: name,
+      quantity: Number.isFinite(qty) ? qty : 1,
+      price: Number.isFinite(price) ? price : 0,
+      unit_price: Number.isFinite(price) ? price : 0,
+      ...(serviceId ? { service_id: serviceId } : {}),
+      ...(stylistId ? { stylist_id: stylistId } : {}),
+      ...(stylistName ? { stylist: stylistName, stylist_name: stylistName } : {}),
+      ...(discountPercent !== null && discountPercent !== undefined ? { discount_percent: Number(discountPercent) } : {})
+    };
+  });
+
+  const basePayload: Record<string, unknown> = {
+    bill_id: billId,
+    bill_number: billNumber,
+    outlet_id: outlet.id,
+    outlet_code: outlet.code,
+    outlet_name: outlet.name,
+    ...(branchCode ? { branch_code: branchCode } : {}),
+    customer_name: cleanName,
+    customer_phone: cleanPhone,
+    payment_mode: cleanPaymentMode,
+    grand_total: Number(grandTotal),
+    ...(typeof subtotal === 'number' && Number.isFinite(subtotal) ? { subtotal } : {}),
+    ...(typeof discount === 'number' && Number.isFinite(discount) ? { discount } : {}),
+    ...(typeof tax === 'number' && Number.isFinite(tax) ? { tax } : {}),
+    items: normalizedItems,
+    billed_at: billedAtIso,
+    ...(orderType ? { order_type: orderType } : {})
+  };
+
+  let receiptQueued = false;
+  let receiptError: string | null = null;
+  if (sendReceipts) {
+    const { error } = await upsertNotificationJobRow(db, {
+      outlet_id: outlet.id,
+      source_type: sourceType,
+      source_key: sourceKey,
+      event_type: 'receipt',
+      status: 'pending',
+      scheduled_at: new Date().toISOString(),
+      payload: basePayload,
+      bill_id: billId,
+      bill_number: billNumber
+    });
+    if (error) {
+      receiptError = sanitizeErrorMessage(error.message);
+      console.error('[SMAV notification queue][receipt]', receiptError);
+      await recordNotificationStepLog(logDb, {
+        bill_id: billId,
+        outlet_id: outlet.id,
+        bill_number: billNumber,
+        event_type: 'receipt',
+        step: 'stage2_receipt_enqueue_failed',
+        status: 'failed',
+        masked_phone: maskedPhone,
+        sanitized_error: receiptError
+      });
+    } else {
+      receiptQueued = true;
+    }
+  }
+
+  let feedbackQueued = false;
+  let feedbackScheduledAt: string | null = null;
+  let feedbackSkippedOverdue = false;
+  let feedbackError: string | null = null;
+
+  if (sendFeedback) {
+    const billedMs = Date.parse(billedAtIso);
+    const feedbackDueMs = (Number.isNaN(billedMs) ? Date.now() : billedMs) + FEEDBACK_DELAY_MS;
+    if (feedbackDueMs > Date.now()) {
+      feedbackScheduledAt = new Date(feedbackDueMs).toISOString();
+      const feedbackPayload: Record<string, unknown> = {
+        bill_id: billId,
+        bill_number: billNumber,
+        outlet_id: outlet.id,
+        outlet_code: outlet.code,
+        outlet_name: outlet.name,
+        ...(branchCode ? { branch_code: branchCode } : {}),
+        customer_name: cleanName,
+        customer_phone: cleanPhone,
+        payment_mode: cleanPaymentMode,
+        grand_total: Number(grandTotal),
+        billed_at: billedAtIso
+      };
+
+      const { error } = await upsertNotificationJobRow(db, {
+        outlet_id: outlet.id,
+        source_type: sourceType,
+        source_key: sourceKey,
+        event_type: 'feedback',
+        status: 'pending',
+        scheduled_at: feedbackScheduledAt,
+        payload: feedbackPayload,
+        bill_id: billId,
+        bill_number: billNumber
+      });
+      if (error) {
+        feedbackError = sanitizeErrorMessage(error.message);
+        console.error('[SMAV notification queue][feedback]', feedbackError);
+        await recordNotificationStepLog(logDb, {
+          bill_id: billId,
+          outlet_id: outlet.id,
+          bill_number: billNumber,
+          event_type: 'feedback',
+          step: 'stage2_feedback_enqueue_failed',
+          status: 'failed',
+          masked_phone: maskedPhone,
+          sanitized_error: feedbackError
+        });
+      } else {
+        feedbackQueued = true;
+      }
+    } else {
+      feedbackSkippedOverdue = true;
+      await recordNotificationStepLog(logDb, {
+        bill_id: billId,
+        outlet_id: outlet.id,
+        bill_number: billNumber,
+        event_type: 'feedback',
+        step: 'stage2_feedback_skipped_overdue',
+        status: 'skipped',
+        whatsapp_status: 'skipped',
+        masked_phone: maskedPhone,
+        sanitized_error: 'Offline bill synced after 2-minute feedback window expired'
+      });
+    }
+  }
+
+  await recordNotificationStepLog(logDb, {
+    bill_id: billId,
+    outlet_id: outlet.id,
+    bill_number: billNumber,
+    event_type: receiptQueued ? 'receipt' : feedbackQueued ? 'feedback' : sendReceipts ? 'receipt' : 'feedback',
+    step: sourceType === 'salon' ? 'stage1_bill_persisted_and_enqueued' : 'stage1_order_persisted_and_enqueued',
+    status: receiptQueued || feedbackQueued ? 'pending' : receiptError || feedbackError ? 'failed' : 'skipped',
+    masked_phone: maskedPhone,
+    sanitized_error: receiptError || feedbackError || null,
+    response_summary: {
+      receipt_queued: receiptQueued,
+      feedback_queued: feedbackQueued,
+      feedback_skipped_overdue: feedbackSkippedOverdue
+    }
+  });
+
+  return {
+    receiptQueued,
+    receiptError,
+    feedbackQueued,
+    feedbackScheduledAt,
+    feedbackSkippedOverdue,
+    feedbackError
+  };
+}
+
 /** Service-role only. Downstream endpoint must verify HMAC and deduplicate event_id. */
 export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 20) {
   const secret = (process.env.SMAV_DISPATCH_SECRET || '').trim();
