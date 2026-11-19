@@ -11,12 +11,21 @@ import com.smav.printagent.network.UnauthorizedSessionException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.IOException
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 
 class SyncRepository(
     private val context: Context,
     private val database: AppDatabase,
     private val sessionManager: SessionManager
 ) {
+    private fun formatIsoUtc(epochMs: Long): String {
+        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
+        sdf.timeZone = TimeZone.getTimeZone("UTC")
+        return sdf.format(Date(epochMs))
+    }
 
     suspend fun syncAllPending(): Result<Int> = withContext(Dispatchers.IO) {
         val session = sessionManager.getStaffSession()
@@ -52,6 +61,7 @@ class SyncRepository(
                             addProperty("customerPhone", bill.customerPhone ?: "")
                             addProperty("paymentMode", bill.paymentMode)
                             addProperty("grandTotal", bill.grandTotal)
+                            addProperty("createdAt", formatIsoUtc(bill.createdAtLocal))
                         }
 
                         val itemsArray = JsonArray()
@@ -109,9 +119,12 @@ class SyncRepository(
                             addProperty("branchCode", order.branchCode)
                             addProperty("tableOrCounter", order.tableOrCounter)
                             addProperty("orderType", order.orderType)
+                            addProperty("customerName", order.customerName ?: "")
+                            addProperty("customerPhone", order.customerPhone ?: "")
                             addProperty("paymentMode", order.paymentMode)
                             addProperty("grandTotal", order.grandTotal)
                             addProperty("catalogRevisionAtSale", order.catalogRevisionAtSale)
+                            addProperty("createdAt", formatIsoUtc(order.createdAtLocal))
                         }
                         val itemsArray = JsonArray()
                         for (item in items) {

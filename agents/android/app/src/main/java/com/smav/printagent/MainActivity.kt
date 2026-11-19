@@ -630,6 +630,14 @@ private fun SmavAuthenticatedApp(
                     sessionManager = sessions,
                     printerManager = printerManager
                 )
+
+                SmavRoute.INTEGRATION_DIAGNOSTICS -> if (session.role.isAdminOrAbove()) {
+                    IntegrationDiagnosticsScreen(
+                        session = session,
+                        adminRepo = adminRepo,
+                        onUnauthorized = { msg -> onSignedOut(msg) }
+                    )
+                }
             }
         }
     }

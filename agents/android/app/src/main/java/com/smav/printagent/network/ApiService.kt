@@ -371,6 +371,24 @@ interface ApiService {
         @Body body: JsonObject
     ): Response<JsonObject>
 
+    // Central Billing & WhatsApp Integration Diagnostics
+    @POST("api/admin/integration-diagnostics/run")
+    suspend fun runIntegrationDiagnostics(
+        @Header("Authorization") token: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
+
+    @POST("api/admin/integration-diagnostics/dispatch-now")
+    suspend fun dispatchIntegrationNotificationsNow(
+        @Header("Authorization") token: String
+    ): Response<JsonObject>
+
+    @POST("api/admin/integration-diagnostics/test-e2e")
+    suspend fun runConfirmedIntegrationE2ETest(
+        @Header("Authorization") token: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
+
     // 4. POS Init & Monotonic Delta Catalog Synchronization
     @GET("api/pos/init")
     suspend fun getPosInit(@Header("Authorization") token: String): Response<JsonObject>

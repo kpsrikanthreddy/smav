@@ -396,3 +396,96 @@ data class RemoteTransactionRow(
     val createdAt: String,
     val status: String
 )
+
+data class IntegrationRouteDto(
+    val outletId: String,
+    val outletCode: String,
+    val outletName: String,
+    val category: String,
+    val configured: Boolean,
+    val endpointUrl: String,
+    val enabled: Boolean,
+    val sendReceipts: Boolean,
+    val sendFeedback: Boolean,
+    val receiptTemplateName: String,
+    val feedbackTemplateName: String,
+    val lastHttpStatus: Int? = null,
+    val lastError: String? = null,
+    val reachabilityReachable: Boolean? = null,
+    val reachabilityMessage: String? = null
+)
+
+data class IntegrationJobDto(
+    val id: String,
+    val outletId: String,
+    val sourceType: String,
+    val eventType: String,
+    val status: String,
+    val billNumber: String,
+    val maskedPhone: String,
+    val attempts: Int,
+    val lastHttpStatus: Int? = null,
+    val downstreamStatus: String = "",
+    val whatsappStatus: String = "",
+    val whatsappMessageId: String = "",
+    val lastError: String? = null,
+    val updatedAt: String = ""
+)
+
+data class IntegrationLogDto(
+    val id: String,
+    val eventId: String,
+    val billId: String,
+    val outletId: String,
+    val billNumber: String,
+    val eventType: String,
+    val step: String,
+    val status: String,
+    val httpStatus: Int? = null,
+    val whatsappStatus: String = "",
+    val maskedPhone: String = "",
+    val sanitizedError: String? = null,
+    val createdAt: String = ""
+)
+
+data class IntegrationDiagnosticReport(
+    val checkedAt: String = "",
+    val serviceRoleConfigured: Boolean = false,
+    val dispatchSecretConfigured: Boolean = false,
+    val cronSecretConfigured: Boolean = false,
+    val internalDispatcherEnabled: Boolean = false,
+    val internalDispatcherIntervalSec: Int = 25,
+    val internalDispatcherLastRunAt: String = "",
+    val supabaseConnected: Boolean = false,
+    val supabaseError: String? = null,
+    val salonBillsCount: Int = 0,
+    val centralSalesCount: Int = 0,
+    val totalSyncedRecords: Int = 0,
+    val pendingJobs: Int = 0,
+    val sentJobs: Int = 0,
+    val failedJobs: Int = 0,
+    val skippedJobs: Int = 0,
+    val totalJobs: Int = 0,
+    val routes: List<IntegrationRouteDto> = emptyList(),
+    val recentJobs: List<IntegrationJobDto> = emptyList(),
+    val recentLogs: List<IntegrationLogDto> = emptyList()
+)
+
+data class IntegrationE2EStepDto(
+    val step: String,
+    val status: String,
+    val detail: String
+)
+
+data class IntegrationE2EResult(
+    val success: Boolean,
+    val outletName: String = "",
+    val billNumber: String = "",
+    val eventId: String = "",
+    val eventType: String = "",
+    val httpStatus: Int? = null,
+    val whatsappStatus: String = "",
+    val sanitizedError: String? = null,
+    val steps: List<IntegrationE2EStepDto> = emptyList()
+)
+

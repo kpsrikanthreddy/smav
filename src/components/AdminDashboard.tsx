@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import {
+  Activity,
   AlertTriangle,
   CheckCircle2,
   Edit2,
@@ -15,6 +16,7 @@ import {
 } from 'lucide-react';
 import { OutletUserRecord, SyncOutboxItem, UserSession, getVisibleRole } from '../types';
 import { identityAdminService } from '../services/identityAdminService';
+import { IntegrationDiagnostics } from './IntegrationDiagnostics';
 import {
   BASE_INPUT_CLASS,
   Button,
@@ -38,7 +40,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
     session.role === 'superadmin' ||
     getVisibleRole(session.displayRole || session.role) === 'SUPERADMIN';
 
-  const [activeTab, setActiveTab] = useState<'overview' | 'staff' | 'catalog' | 'orders' | 'printer'>(
+  const [activeTab, setActiveTab] = useState<'overview' | 'staff' | 'catalog' | 'orders' | 'integrations' | 'printer'>(
     'overview'
   );
   const [staffList, setStaffList] = useState<OutletUserRecord[]>([]);
@@ -326,6 +328,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
           { id: 'staff', label: `Outlet Users (${staffList.length})`, icon: Users },
           { id: 'catalog', label: `Catalog (${catalogItems.length})`, icon: Sparkles },
           { id: 'orders', label: 'Transaction Ledger', icon: Receipt },
+          { id: 'integrations', label: 'Integration Diagnostics', icon: Activity },
           { id: 'printer', label: 'Printer Setup', icon: Printer },
         ].map((tab) => {
           const active = activeTab === tab.id;
@@ -993,6 +996,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
           </div>
         </Card>
       )}
+
+      {/* TAB 6: INTEGRATION DIAGNOSTICS */}
+      {activeTab === 'integrations' && <IntegrationDiagnostics session={session} />}
 
       {/* Modal: Add User */}
       {isAddUserOpen && (

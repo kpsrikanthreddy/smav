@@ -162,6 +162,7 @@ fun AdminDashboardScreen(
                     SmavSecondaryButton("Catalog & Prices", onClick = { onNavigate(SmavRoute.ADMIN_CATALOG) })
                     SmavSecondaryButton("Reports", onClick = { onNavigate(SmavRoute.ADMIN_REPORTS) })
                     SmavSecondaryButton("Sync & Outbox", onClick = { onNavigate(SmavRoute.ADMIN_SYNC) })
+                    SmavSecondaryButton("Integration Health", onClick = { onNavigate(SmavRoute.INTEGRATION_DIAGNOSTICS) })
                     SmavSecondaryButton("Printers", onClick = { onNavigate(SmavRoute.PRINTER_SETTINGS) })
                     SmavSecondaryButton("Outlet Settings", onClick = { onNavigate(SmavRoute.ADMIN_SETTINGS) })
                 }

@@ -51,7 +51,8 @@ enum class SmavRoute(val title: String, val group: String) {
     POS_BILLING("POS Billing", "Operations"),
     POS_RECENT_BILLS("Recent Bills & Reprint", "Operations"),
     OFFLINE_SYNC("Offline Bills & Sync", "Operations"),
-    PRINTER_SETTINGS("Printer Settings", "Device")
+    PRINTER_SETTINGS("Printer Settings", "Device"),
+    INTEGRATION_DIAGNOSTICS("Integration Diagnostics", "Administration")
 }
 
 data class DrawerRouteItem(
@@ -72,6 +73,7 @@ fun drawerItemsForSession(session: StaffSession): List<DrawerRouteItem> {
             add(DrawerRouteItem(SmavRoute.SUPERADMIN_OUTLETS, "Registered Outlets", Icons.Default.Store))
             add(DrawerRouteItem(SmavRoute.SUPERADMIN_ADMINS, "Outlet Administrators", Icons.Default.SupervisorAccount))
             add(DrawerRouteItem(SmavRoute.SUPERADMIN_DIAGNOSTICS, "Catalog Sync Diagnostics", Icons.Default.SyncProblem))
+            add(DrawerRouteItem(SmavRoute.INTEGRATION_DIAGNOSTICS, "Integration Diagnostics", Icons.Default.SettingsInputComponent))
             add(DrawerRouteItem(SmavRoute.SUPERADMIN_REPORTS, "Authorized Network Reports", Icons.Default.BarChart))
             add(DrawerRouteItem(SmavRoute.SUPERADMIN_AUDIT, "Security Audit Logs", Icons.Default.Security))
             add(DrawerRouteItem(SmavRoute.SUPERADMIN_SUPABASE, "Central Supabase & RLS", Icons.Default.Storage))
@@ -89,6 +91,7 @@ fun drawerItemsForSession(session: StaffSession): List<DrawerRouteItem> {
             DrawerRouteItem(SmavRoute.POS_RECENT_BILLS, "Recent Bills & Reprint", Icons.Default.ReceiptLong),
             DrawerRouteItem(SmavRoute.ADMIN_REPORTS, "Outlet Reports", Icons.Default.BarChart),
             DrawerRouteItem(SmavRoute.ADMIN_SYNC, "Sync Status & Outbox", Icons.Default.CloudSync),
+            DrawerRouteItem(SmavRoute.INTEGRATION_DIAGNOSTICS, "Integration Diagnostics", Icons.Default.SettingsInputComponent),
             DrawerRouteItem(SmavRoute.PRINTER_SETTINGS, "Printer Settings", Icons.Default.Print),
             DrawerRouteItem(SmavRoute.ADMIN_SETTINGS, "Outlet Settings", Icons.Default.Settings)
         )

@@ -127,6 +127,11 @@ fun SuperadminOutletsScreen(
                         icon = Icons.Default.PersonAdd,
                         onClick = { onOpenRoute(SmavRoute.SUPERADMIN_ADMINS) }
                     )
+                    SmavSecondaryButton(
+                        text = "Integrations",
+                        icon = Icons.Default.SettingsInputComponent,
+                        onClick = { onOpenRoute(SmavRoute.INTEGRATION_DIAGNOSTICS) }
+                    )
                 }
             }
         }

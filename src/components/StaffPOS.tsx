@@ -164,7 +164,18 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
   const [activeReceiptPreview, setActiveReceiptPreview] = useState<any | null>(null);
   const [activeKotPreview, setActiveKotPreview] = useState<any | null>(null);
   const [isPrinterBusy, setIsPrinterBusy] = useState(false);
-  const [offlineQueue, setOfflineQueue] = useState<any[]>([]);
+  const [offlineQueue, setOfflineQueue] = useState<
+    Array<{ kind: 'bills' | 'orders'; outletId: string; payload: any }>
+  >(() => {
+    try {
+      const raw = window.localStorage.getItem(`smav:offline-queue:${session.activeOutlet.id}`);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  });
+  const [isFlushingOffline, setIsFlushingOffline] = useState(false);
 
   // Catalog derived filters (memoized)
   const catalogItems = useMemo(
@@ -234,8 +245,72 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       setBillSuccessMessage(null);
       setMissingStylistIdx(null);
       pendingCheckoutRef.current = null;
+      try {
+        const raw = window.localStorage.getItem(`smav:offline-queue:${session.activeOutlet.id}`);
+        const parsed = raw ? JSON.parse(raw) : [];
+        setOfflineQueue(Array.isArray(parsed) ? parsed : []);
+      } catch {
+        setOfflineQueue([]);
+      }
     }
   }, [session.activeOutlet.id]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        `smav:offline-queue:${session.activeOutlet.id}`,
+        JSON.stringify(offlineQueue)
+      );
+    } catch {}
+  }, [offlineQueue, session.activeOutlet.id]);
+
+  const flushOfflineQueue = useCallback(async () => {
+    if (!isOnline || isFlushingOffline || offlineQueue.length === 0) return;
+    setIsFlushingOffline(true);
+    const remaining: Array<{ kind: 'bills' | 'orders'; outletId: string; payload: any }> = [];
+    let syncedCount = 0;
+
+    for (const entry of offlineQueue) {
+      if (entry.outletId !== session.activeOutlet.id) {
+        remaining.push(entry);
+        continue;
+      }
+      const endpoint =
+        entry.kind === 'bills' ? '/api/mobile/sync/bills' : '/api/mobile/sync/orders';
+      try {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${session.token}`,
+          },
+          body: JSON.stringify(entry.payload),
+        });
+        const data = await res.json().catch(() => null);
+        if (res.ok && data?.success) {
+          syncedCount += 1;
+        } else {
+          remaining.push(entry);
+        }
+      } catch {
+        remaining.push(entry);
+      }
+    }
+
+    setOfflineQueue(remaining);
+    if (syncedCount > 0) {
+      setBillSuccessMessage(
+        `Synced ${syncedCount} offline transaction(s) to central SMAV database.`
+      );
+    }
+    setIsFlushingOffline(false);
+  }, [isOnline, isFlushingOffline, offlineQueue, session.activeOutlet.id, session.token]);
+
+  useEffect(() => {
+    if (isOnline && offlineQueue.length > 0 && !isFlushingOffline) {
+      void flushOfflineQueue();
+    }
+  }, [isOnline, offlineQueue.length, isFlushingOffline, flushOfflineQueue]);
 
   useEffect(() => {
     if (selectedCategoryFilter !== 'All' && !catalogCategories.includes(selectedCategoryFilter)) {
@@ -647,6 +722,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       }
 
       const { billNumber, idempotencyKey } = pendingCheckoutRef.current;
+      const createdAtIso = new Date().toISOString();
       const bill = {
         billNumber,
         outletName: session.activeOutlet.name,
@@ -674,13 +750,19 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
         tax: salonTax,
         grandTotal: salonGrandTotal,
         paperWidth: paperWidthMm,
-        timestamp: new Date().toLocaleString(),
+        createdAt: createdAtIso,
+        timestamp: new Date(createdAtIso).toLocaleString(),
       };
 
       const payload = {
         bills: [
           {
-            bill: { ...bill, id: billNumber, outletId: session.activeOutlet.id },
+            bill: {
+              ...bill,
+              id: billNumber,
+              outletId: session.activeOutlet.id,
+              createdAt: createdAtIso,
+            },
             items: bill.items,
             idempotency_key: idempotencyKey,
           },
@@ -701,7 +783,10 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
           throw new Error(result?.message || `Bill could not be saved (HTTP ${response.status})`);
         }
       } else {
-        setOfflineQueue((prev) => [...prev, payload]);
+        setOfflineQueue((prev) => [
+          ...prev,
+          { kind: 'bills', outletId: session.activeOutlet.id, payload },
+        ]);
       }
 
       pendingCheckoutRef.current = null;
@@ -727,9 +812,14 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
     }
   };
 
-  // Print Restaurant Order (preserved)
-  const handlePrintRestaurantOrder = () => {
-    if (restaurantCart.length === 0) return;
+  // Print Restaurant Order
+  const handlePrintRestaurantOrder = async () => {
+    if (restaurantCart.length === 0 || isProcessingBill) return;
+    setIsProcessingBill(true);
+    setBillSaveError(null);
+    setBillSuccessMessage(null);
+
+    const createdAtIso = new Date().toISOString();
     const orderNumber = `MOZZ-${session.activeOutlet.code.toUpperCase()}-${Date.now().toString().slice(-6)}`;
     const tokenNumber = String(Math.floor(Math.random() * 90) + 10);
 
@@ -741,6 +831,9 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       receiptFooter: session.activeOutlet.receiptFooter,
       tableOrCounter: selectedTable,
       orderType,
+      customerName: customerName.trim(),
+      customerPhone: customerPhone.trim(),
+      paymentMode,
       items: restaurantCart.map((c) => ({
         name: c.item.name,
         variant: c.variantName,
@@ -752,36 +845,65 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       tax: restTax,
       grandTotal: restGrandTotal,
       paperWidth: paperWidthMm,
-      timestamp: new Date().toLocaleString(),
+      createdAt: createdAtIso,
+      timestamp: new Date(createdAtIso).toLocaleString(),
     };
 
-    if (isPrinterConnected) {
-      setIsPrinterBusy(true);
-      setTimeout(() => setIsPrinterBusy(false), 1200);
-    }
-
-    setActiveReceiptPreview(order);
-    setActiveKotPreview(order);
-
-    if (isOnline) {
-      fetch('/api/mobile/sync/orders', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session.token}`,
+    const payload = {
+      orders: [
+        {
+          order: {
+            ...order,
+            orderNumber,
+            tokenNumber,
+            outletId: session.activeOutlet.id,
+            createdAt: createdAtIso,
+          },
+          items: order.items,
+          idempotency_key: `IDEM_${orderNumber}`,
         },
-        body: JSON.stringify({
-          orders: [
-            {
-              order: { ...order, orderNumber, tokenNumber, outletId: session.activeOutlet.id },
-              items: order.items,
-              idempotency_key: `IDEM_${orderNumber}`,
-            },
-          ],
-        }),
-      });
-    } else {
-      setOfflineQueue((prev) => [...prev, order]);
+      ],
+    };
+
+    try {
+      if (isOnline) {
+        const response = await fetch('/api/mobile/sync/orders', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${session.token}`,
+          },
+          body: JSON.stringify(payload),
+        });
+        const result = await response.json().catch(() => null);
+        if (!response.ok || !result?.success) {
+          throw new Error(result?.message || `Order could not be saved (HTTP ${response.status})`);
+        }
+        setBillSuccessMessage(`Order ${orderNumber} saved to central SMAV database.`);
+      } else {
+        setOfflineQueue((prev) => [
+          ...prev,
+          { kind: 'orders', outletId: session.activeOutlet.id, payload },
+        ]);
+        setBillSuccessMessage(`Order ${orderNumber} queued locally offline.`);
+      }
+
+      if (isPrinterConnected) {
+        setIsPrinterBusy(true);
+        setTimeout(() => setIsPrinterBusy(false), 1200);
+      }
+
+      setActiveReceiptPreview(order);
+      setActiveKotPreview(order);
+      setRestaurantCart([]);
+      setCustomerName('');
+      setCustomerPhone('');
+    } catch (error) {
+      setBillSaveError(
+        `Order sync error: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    } finally {
+      setIsProcessingBill(false);
     }
   };
 
@@ -1259,6 +1381,59 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                     </div>
                   )}
 
+                  {billSaveError && (
+                    <div
+                      role="alert"
+                      className="rounded-xl border border-[#FECACA] bg-[#FEF2F2] px-3.5 py-2.5 text-xs text-[#B91C1C] font-medium"
+                    >
+                      {billSaveError}
+                    </div>
+                  )}
+                  {billSuccessMessage && (
+                    <div
+                      role="status"
+                      className="rounded-xl border border-[#BBF7D0] bg-[#ECFDF5] px-3.5 py-2.5 text-xs text-[#15803D] font-medium flex items-center gap-2"
+                    >
+                      <CheckCircle2 className="w-4 h-4 shrink-0" />
+                      <span>{billSuccessMessage}</span>
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <FormField label="Customer Name (optional)" htmlFor="rest-customer-name">
+                      <input
+                        id="rest-customer-name"
+                        type="text"
+                        value={customerName}
+                        onChange={(e) => setCustomerName(e.target.value)}
+                        placeholder="Optional guest name"
+                        className={BASE_INPUT_CLASS}
+                      />
+                    </FormField>
+                    <FormField label="Phone (WhatsApp, optional)" htmlFor="rest-customer-phone">
+                      <input
+                        id="rest-customer-phone"
+                        type="tel"
+                        value={customerPhone}
+                        onChange={(e) => setCustomerPhone(e.target.value)}
+                        placeholder="Optional mobile number"
+                        className={BASE_INPUT_CLASS}
+                      />
+                    </FormField>
+                    <FormField label="Payment Mode" htmlFor="rest-payment-mode">
+                      <select
+                        id="rest-payment-mode"
+                        value={paymentMode}
+                        onChange={(e) => setPaymentMode(e.target.value)}
+                        className={BASE_INPUT_CLASS}
+                      >
+                        <option value="upi">UPI</option>
+                        <option value="cash">Cash</option>
+                        <option value="card">Card</option>
+                      </select>
+                    </FormField>
+                  </div>
+
                   <CartSummary
                     lines={[
                       { label: 'Food Subtotal', value: `₹${restSubtotal}` },
@@ -1271,15 +1446,17 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                         <Button
                           variant="outline"
-                          onClick={handlePrintRestaurantOrder}
-                          disabled={restaurantCart.length === 0}
+                          onClick={() => void handlePrintRestaurantOrder()}
+                          disabled={restaurantCart.length === 0 || isProcessingBill}
+                          loading={isProcessingBill}
                           leftIcon={<ChefHat className="w-4 h-4 text-[#D97706]" />}
                         >
                           Print KOT (No Price)
                         </Button>
                         <Button
-                          onClick={handlePrintRestaurantOrder}
-                          disabled={restaurantCart.length === 0}
+                          onClick={() => void handlePrintRestaurantOrder()}
+                          disabled={restaurantCart.length === 0 || isProcessingBill}
+                          loading={isProcessingBill}
                           leftIcon={<Printer className="w-4 h-4" />}
                         >
                           Print Dine Bill

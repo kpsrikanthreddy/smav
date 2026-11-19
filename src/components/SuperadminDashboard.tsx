@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
+  Activity,
   Building2,
   CheckCircle2,
   Database,
@@ -27,6 +28,7 @@ import {
   getVisibleRole,
 } from '../types';
 import { PortalAuthDashboard } from './PortalAuthDashboard';
+import { IntegrationDiagnostics } from './IntegrationDiagnostics';
 import { identityAdminService } from '../services/identityAdminService';
 import {
   BASE_INPUT_CLASS,
@@ -53,7 +55,7 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
   onLaunchOutletPos,
 }) => {
   const [activeTab, setActiveTab] = useState<
-    'outlets' | 'admins' | 'reports' | 'audit' | 'supabase' | 'portal_auth'
+    'outlets' | 'admins' | 'reports' | 'audit' | 'supabase' | 'portal_auth' | 'integrations'
   >('outlets');
   const [outlets, setOutlets] = useState<Outlet[]>([]);
   const [reportsSummary, setReportsSummary] = useState<any>(null);
@@ -398,6 +400,7 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
         {[
           { id: 'outlets', label: `Registered Outlets (${outlets.length})`, icon: Building2 },
           { id: 'portal_auth', label: 'Shared Auth & Sync', icon: Sparkles },
+          { id: 'integrations', label: 'Integration Diagnostics', icon: Activity },
           { id: 'admins', label: `Outlet Admins (${adminsList.length})`, icon: KeyRound },
           { id: 'reports', label: 'Network Reports', icon: TrendingUp },
           { id: 'audit', label: `Audit Logs (${auditLogs.length})`, icon: History },
@@ -1138,6 +1141,11 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
       {/* TAB 6: SHARED AUTH & SYNC */}
       {activeTab === 'portal_auth' && (
         <PortalAuthDashboard session={session} onLaunchOutletPos={onLaunchOutletPos} />
+      )}
+
+      {/* TAB 7: INTEGRATION DIAGNOSTICS */}
+      {activeTab === 'integrations' && (
+        <IntegrationDiagnostics session={session} outlets={outlets} />
       )}
 
       {/* MODAL: ADD OUTLET */}

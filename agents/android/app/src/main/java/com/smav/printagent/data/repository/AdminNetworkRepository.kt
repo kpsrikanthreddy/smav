@@ -706,6 +706,165 @@ class AdminNetworkRepository(
     }
 
     // ---------------------------------------------------------------------------------------------
+    // CENTRAL BILLING & WHATSAPP INTEGRATION DIAGNOSTICS
+    // ---------------------------------------------------------------------------------------------
+
+    suspend fun runIntegrationDiagnostics(
+        outletId: String? = null,
+        probeEndpoints: Boolean = false
+    ): Result<IntegrationDiagnosticReport> = withContext(Dispatchers.IO) {
+        runCatching {
+            val req = JsonObject().apply {
+                if (!outletId.isNullOrBlank()) addProperty("outletId", outletId)
+                addProperty("probeEndpoints", probeEndpoints)
+            }
+            val resp = api.runIntegrationDiagnostics(currentBearer(), req)
+            val body = SmavApiClient.unwrapOrThrow(resp) { it }
+            val backend = body.get("backend").asJsonObjectOrNull()
+            val dispatcher = backend?.get("internalDispatcher").asJsonObjectOrNull()
+            val supa = body.get("supabase").asJsonObjectOrNull()
+            val sales = body.get("salesSummary").asJsonObjectOrNull()
+            val queue = body.get("queueSummary").asJsonObjectOrNull()
+
+            val routes = body.getAsJsonArray("routes")?.mapNotNull { el ->
+                val obj = el.asJsonObjectOrNull() ?: return@mapNotNull null
+                val reach = obj.get("reachability").asJsonObjectOrNull()
+                IntegrationRouteDto(
+                    outletId = obj.optString("outlet_id"),
+                    outletCode = obj.optString("outlet_code"),
+                    outletName = obj.optString("outlet_name"),
+                    category = obj.optString("category"),
+                    configured = obj.optBool("configured", false),
+                    endpointUrl = obj.optString("endpoint_url"),
+                    enabled = obj.optBool("enabled", false),
+                    sendReceipts = obj.optBool("send_receipts", false),
+                    sendFeedback = obj.optBool("send_feedback", false),
+                    receiptTemplateName = obj.optString("receipt_template_name"),
+                    feedbackTemplateName = obj.optString("feedback_template_name"),
+                    lastHttpStatus = if (obj.has("last_http_status") && !obj.get("last_http_status").isJsonNull) {
+                        obj.optInt("last_http_status")
+                    } else null,
+                    lastError = obj.optString("last_error").takeIf { it.isNotBlank() },
+                    reachabilityReachable = reach?.optBool("reachable", false),
+                    reachabilityMessage = reach?.optString("message")?.takeIf { it.isNotBlank() }
+                )
+            } ?: emptyList()
+
+            val recentJobs = body.getAsJsonArray("recentJobs")?.mapNotNull { el ->
+                val obj = el.asJsonObjectOrNull() ?: return@mapNotNull null
+                IntegrationJobDto(
+                    id = obj.optString("id"),
+                    outletId = obj.optString("outlet_id"),
+                    sourceType = obj.optString("source_type"),
+                    eventType = obj.optString("event_type"),
+                    status = obj.optString("status"),
+                    billNumber = obj.optString("bill_number").ifBlank { obj.optString("id").take(8) },
+                    maskedPhone = obj.optString("masked_phone"),
+                    attempts = obj.optInt("attempts", default = 0),
+                    lastHttpStatus = if (obj.has("last_http_status") && !obj.get("last_http_status").isJsonNull) {
+                        obj.optInt("last_http_status")
+                    } else null,
+                    downstreamStatus = obj.optString("downstream_status"),
+                    whatsappStatus = obj.optString("whatsapp_status"),
+                    whatsappMessageId = obj.optString("whatsapp_message_id"),
+                    lastError = obj.optString("last_error").takeIf { it.isNotBlank() },
+                    updatedAt = obj.optString("updated_at")
+                )
+            } ?: emptyList()
+
+            val recentLogs = body.getAsJsonArray("recentLogs")?.mapNotNull { el ->
+                val obj = el.asJsonObjectOrNull() ?: return@mapNotNull null
+                IntegrationLogDto(
+                    id = obj.optString("id").ifBlank { "${obj.optString("created_at")}-${obj.optString("step")}" },
+                    eventId = obj.optString("event_id"),
+                    billId = obj.optString("bill_id"),
+                    outletId = obj.optString("outlet_id"),
+                    billNumber = obj.optString("bill_number"),
+                    eventType = obj.optString("event_type"),
+                    step = obj.optString("step"),
+                    status = obj.optString("status"),
+                    httpStatus = if (obj.has("http_status") && !obj.get("http_status").isJsonNull) {
+                        obj.optInt("http_status")
+                    } else null,
+                    whatsappStatus = obj.optString("whatsapp_status"),
+                    maskedPhone = obj.optString("masked_phone"),
+                    sanitizedError = obj.optString("sanitized_error").takeIf { it.isNotBlank() },
+                    createdAt = obj.optString("created_at")
+                )
+            } ?: emptyList()
+
+            IntegrationDiagnosticReport(
+                checkedAt = body.optString("checkedAt"),
+                serviceRoleConfigured = backend?.optBool("serviceRoleConfigured", false) ?: false,
+                dispatchSecretConfigured = backend?.optBool("dispatchSecretConfigured", false) ?: false,
+                cronSecretConfigured = backend?.optBool("cronSecretConfigured", false) ?: false,
+                internalDispatcherEnabled = dispatcher?.optBool("enabled", false) ?: false,
+                internalDispatcherIntervalSec = dispatcher?.optInt("intervalSec", default = 25) ?: 25,
+                internalDispatcherLastRunAt = dispatcher?.optString("lastRunAt").orEmpty(),
+                supabaseConnected = supa?.optBool("connected", false) ?: false,
+                supabaseError = supa?.optString("error")?.takeIf { it.isNotBlank() },
+                salonBillsCount = sales?.optInt("salonBillsCount", default = 0) ?: 0,
+                centralSalesCount = sales?.optInt("centralSalesCount", default = 0) ?: 0,
+                totalSyncedRecords = sales?.optInt("totalSyncedRecords", default = 0) ?: 0,
+                pendingJobs = queue?.optInt("pending", default = 0) ?: 0,
+                sentJobs = queue?.optInt("sent", default = 0) ?: 0,
+                failedJobs = queue?.optInt("failed", default = 0) ?: 0,
+                skippedJobs = queue?.optInt("skipped", default = 0) ?: 0,
+                totalJobs = queue?.optInt("total", default = 0) ?: 0,
+                routes = routes,
+                recentJobs = recentJobs,
+                recentLogs = recentLogs
+            )
+        }
+    }
+
+    suspend fun dispatchIntegrationQueueNow(): Result<Int> = withContext(Dispatchers.IO) {
+        runCatching {
+            val resp = api.dispatchIntegrationNotificationsNow(currentBearer())
+            val body = SmavApiClient.unwrapOrThrow(resp) { it }
+            body.optInt("processed", default = 0)
+        }
+    }
+
+    suspend fun runConfirmedE2ETest(
+        outletId: String?,
+        testPhone: String,
+        confirmed: Boolean
+    ): Result<IntegrationE2EResult> = withContext(Dispatchers.IO) {
+        runCatching {
+            val req = JsonObject().apply {
+                addProperty("confirmed", confirmed)
+                addProperty("testPhone", testPhone.trim())
+                if (!outletId.isNullOrBlank()) addProperty("outletId", outletId)
+            }
+            val resp = api.runConfirmedIntegrationE2ETest(currentBearer(), req)
+            val body = SmavApiClient.unwrapOrThrow(resp) { it }
+            val steps = body.getAsJsonArray("steps")?.mapNotNull { el ->
+                val s = el.asJsonObjectOrNull() ?: return@mapNotNull null
+                IntegrationE2EStepDto(
+                    step = s.optString("step"),
+                    status = s.optString("status"),
+                    detail = s.optString("detail")
+                )
+            } ?: emptyList()
+
+            IntegrationE2EResult(
+                success = body.optBool("success", false),
+                outletName = body.optString("outlet_name"),
+                billNumber = body.optString("bill_number"),
+                eventId = body.optString("event_id"),
+                eventType = body.optString("event_type"),
+                httpStatus = if (body.has("http_status") && !body.get("http_status").isJsonNull) {
+                    body.optInt("http_status")
+                } else null,
+                whatsappStatus = body.optString("whatsapp_status"),
+                sanitizedError = body.optString("sanitized_error").takeIf { it.isNotBlank() },
+                steps = steps
+            )
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // JSON Mappers
     // ---------------------------------------------------------------------------------------------
 
