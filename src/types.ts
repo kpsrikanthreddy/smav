@@ -65,6 +65,9 @@ export interface OutletUserRecord {
   outboxStatus?: string | null;
   outboxLastError?: string | null;
   outboxId?: string | null;
+  managedByOutlet?: boolean;
+  authoritativeSource?: string | null;
+  managedByLabel?: string | null;
 }
 
 export interface SyncOutboxItem {

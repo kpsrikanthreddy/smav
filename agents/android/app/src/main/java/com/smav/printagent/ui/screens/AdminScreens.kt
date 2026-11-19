@@ -194,6 +194,8 @@ fun AdminStaffScreen(
     var confirmToggleUser by remember { mutableStateOf<OutletAdminItem?>(null) }
 
     val outletCode = session.branchCode.ifBlank { session.assignedOutlets.firstOrNull { it.businessId == session.businessId }?.branchCode ?: "" }
+    val isExternallyManaged = outletCode.equals("glossylooks", ignoreCase = true)
+    val canMutateStaff = !isExternallyManaged || session.role.isSuperadmin()
 
     fun load() {
         scope.launch {
@@ -229,17 +231,44 @@ fun AdminStaffScreen(
     ) {
         item {
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                SmavGradientButton(
-                    text = "Add POS Staff",
-                    icon = Icons.Default.PersonAdd,
-                    onClick = { showCreate = true }
-                )
+                if (canMutateStaff) {
+                    SmavGradientButton(
+                        text = if (isExternallyManaged) "Emergency Add Staff" else "Add POS Staff",
+                        icon = Icons.Default.PersonAdd,
+                        onClick = { showCreate = true }
+                    )
+                }
                 SmavSecondaryButton(
                     text = "Refresh",
                     icon = Icons.Default.Refresh,
                     enabled = !loading,
                     onClick = { load() }
                 )
+            }
+        }
+
+        if (isExternallyManaged) {
+            item {
+                SmavCard {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        StatusBadgeChip(text = "Managed by Glossy Looks", color = SmavColors.InfoText)
+                        if (session.role.isSuperadmin()) {
+                            StatusBadgeChip(text = "Emergency Override", color = SmavColors.WarningText)
+                        }
+                    }
+                    Text(
+                        text = if (session.role.isSuperadmin()) {
+                            "Glossy Looks Admin Portal is the authoritative directory for these staff accounts. SUPERADMIN changes here are audited emergency overrides."
+                        } else {
+                            "User creation, email updates, role changes, deactivation, and password resets are managed in the Glossy Looks Admin Portal and sync automatically to SMAV. This list is read-only."
+                        },
+                        color = SmavColors.TextSecondary,
+                        fontSize = 12.sp
+                    )
+                }
             }
         }
 
@@ -252,7 +281,13 @@ fun AdminStaffScreen(
         if (loading || busy) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = SmavColors.AccentPink) }
 
         if (!loading && filtered.isEmpty()) {
-            item { EmptyStateCard("No Staff Found", "Add POS billing users for this outlet.", Icons.Default.Group) }
+            item {
+                EmptyStateCard(
+                    "No Staff Found",
+                    if (isExternallyManaged) "Staff synced from Glossy Looks Admin Portal will appear here." else "Add POS billing users for this outlet.",
+                    Icons.Default.Group
+                )
+            }
         }
 
         items(filtered, key = { it.userId }) { u ->
@@ -273,26 +308,30 @@ fun AdminStaffScreen(
                     )
                 }
 
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    SmavSecondaryButton("Edit", onClick = { editUser = u })
-                    SmavSecondaryButton("Reset Password", onClick = { resetUser = u })
-                    SmavSecondaryButton(
-                        text = if (u.isActive) "Disable" else "Enable",
-                        textColor = if (u.isActive) SmavColors.DangerText else SmavColors.StepperGreen,
-                        onClick = {
-                            if (u.isActive) {
-                                confirmToggleUser = u
-                            } else {
-                                busy = true
-                                scope.launch {
-                                    adminRepo.setOutletUserStatus(u.userId, u.email, outletCode, true)
-                                        .onSuccess { msg -> banner = msg; load() }
-                                        .onFailure { err -> errorMsg = SmavApiClient.friendlyThrowable(err) }
-                                    busy = false
+                if (canMutateStaff) {
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        SmavSecondaryButton("Edit", onClick = { editUser = u })
+                        SmavSecondaryButton("Reset Password", onClick = { resetUser = u })
+                        SmavSecondaryButton(
+                            text = if (u.isActive) "Disable" else "Enable",
+                            textColor = if (u.isActive) SmavColors.DangerText else SmavColors.StepperGreen,
+                            onClick = {
+                                if (u.isActive) {
+                                    confirmToggleUser = u
+                                } else {
+                                    busy = true
+                                    scope.launch {
+                                        adminRepo.setOutletUserStatus(u.userId, u.email, outletCode, true)
+                                            .onSuccess { msg -> banner = msg; load() }
+                                            .onFailure { err -> errorMsg = SmavApiClient.friendlyThrowable(err) }
+                                        busy = false
+                                    }
                                 }
                             }
-                        }
-                    )
+                        )
+                    }
+                } else {
+                    StatusBadgeChip(text = "Managed by Glossy Looks", color = SmavColors.InfoText)
                 }
             }
         }

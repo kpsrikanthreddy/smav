@@ -117,6 +117,14 @@ export interface SyncCoordinatorDeps {
     outletId?: string;
     details: Record<string, any>;
   }) => void;
+  getCentralDbClient?: () => any | null;
+  onCentralConfirmed?: (event: {
+    action: SyncAction;
+    outletCode: string;
+    outletId?: string | null;
+    userId?: string | null;
+    isActive?: boolean;
+  }) => void | Promise<void>;
 }
 
 function normalizeEnvPrefix(code: string): string {
@@ -237,15 +245,51 @@ export class OutletUserSyncCoordinator {
     };
   }
 
-  private async persistOutboxToCentralDb(record: OutboxRecord) {
+  private getCentralServiceDb(): any | null {
+    if (this.deps.getCentralDbClient) {
+      return this.deps.getCentralDbClient();
+    }
     const centralUrl = this.deps.getCentralUrl();
     const serviceKey = process.env.SMAV_SERVICE_ROLE_KEY?.trim();
-    if (!centralUrl || !serviceKey) return;
+    if (!centralUrl || !serviceKey) return null;
+    return createClient(centralUrl, serviceKey, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+  }
+
+  private rowToOutboxRecord(row: any): OutboxRecord {
+    const rawPayload = (row?.payload && typeof row.payload === 'object') ? row.payload : {};
+    return {
+      id: String(row.id),
+      idempotencyKey: String(row.idempotency_key || row.id),
+      operationId: String(row.operation_id || row.id),
+      syncOrigin: row.sync_origin || 'smav_portal',
+      action: row.action || 'upsert_user',
+      outletId: row.outlet_id || null,
+      outletCode: String(row.outlet_code || '').toLowerCase(),
+      targetUserId: row.target_user_id || null,
+      externalStaffId: row.external_staff_id || null,
+      payload: this.sanitizePayload(rawPayload),
+      centralConfirmed: Boolean(row.central_confirmed),
+      outletConfirmed: Boolean(row.outlet_confirmed),
+      status: row.status || 'PENDING',
+      attempts: Number(row.attempts || 0),
+      maxAttempts: Number(row.max_attempts || 5),
+      nextRetryAt: row.next_retry_at || null,
+      lastError: row.last_error || null,
+      conflictDetails: row.conflict_details || null,
+      syncVersion: Number(row.sync_version || 1),
+      createdBy: row.created_by || null,
+      createdAt: row.created_at || new Date().toISOString(),
+      updatedAt: row.updated_at || row.created_at || new Date().toISOString(),
+    };
+  }
+
+  private async persistOutboxToCentralDb(record: OutboxRecord) {
+    const client = this.getCentralServiceDb();
+    if (!client) return;
 
     try {
-      const client = createClient(centralUrl, serviceKey, {
-        auth: { autoRefreshToken: false, persistSession: false },
-      });
       await client.from('smav_sync_outbox').upsert(
         {
           id: record.id,
@@ -257,7 +301,7 @@ export class OutletUserSyncCoordinator {
           outlet_code: record.outletCode,
           target_user_id: record.targetUserId,
           external_staff_id: record.externalStaffId,
-          payload: record.payload,
+          payload: this.sanitizePayload(record.payload),
           central_confirmed: record.centralConfirmed,
           outlet_confirmed: record.outletConfirmed,
           status: record.status,
@@ -277,6 +321,141 @@ export class OutletUserSyncCoordinator {
     }
   }
 
+  private async hydrateOutboxItemFromDb(
+    outboxId: string,
+    callerSupabaseJwt?: string
+  ): Promise<OutboxRecord | null> {
+    const cached = this.outbox.get(outboxId);
+    if (cached) return cached;
+
+    let client = this.getCentralServiceDb();
+    if (!client && callerSupabaseJwt) {
+      const centralUrl = this.deps.getCentralUrl();
+      const anonKey = process.env.SMAV_SUPABASE_ANON_KEY || process.env.VITE_SMAV_SUPABASE_ANON_KEY || '';
+      if (centralUrl && anonKey) {
+        client = createClient(centralUrl, anonKey, {
+          auth: { autoRefreshToken: false, persistSession: false },
+          global: { headers: { Authorization: `Bearer ${callerSupabaseJwt}` } },
+        });
+      }
+    }
+    if (!client) return null;
+
+    try {
+      const { data, error } = await client
+        .from('smav_sync_outbox')
+        .select('*')
+        .eq('id', outboxId)
+        .maybeSingle();
+      if (!error && data) {
+        const hydrated = this.rowToOutboxRecord(data);
+        this.outbox.set(hydrated.id, hydrated);
+        this.idempotencyIndex.set(hydrated.idempotencyKey, hydrated.id);
+        return hydrated;
+      }
+    } catch (_e) {
+      // Non-fatal
+    }
+    return null;
+  }
+
+  private async findByIdempotencyKeyInDb(idempotencyKey: string): Promise<OutboxRecord | null> {
+    const existingId = this.idempotencyIndex.get(idempotencyKey);
+    if (existingId && this.outbox.has(existingId)) {
+      return this.outbox.get(existingId)!;
+    }
+
+    const client = this.getCentralServiceDb();
+    if (!client) return null;
+
+    try {
+      const { data, error } = await client
+        .from('smav_sync_outbox')
+        .select('*')
+        .eq('idempotency_key', idempotencyKey)
+        .maybeSingle();
+      if (!error && data) {
+        const hydrated = this.rowToOutboxRecord(data);
+        this.outbox.set(hydrated.id, hydrated);
+        this.idempotencyIndex.set(hydrated.idempotencyKey, hydrated.id);
+        return hydrated;
+      }
+    } catch (_e) {
+      // Non-fatal
+    }
+    return null;
+  }
+
+  /**
+   * When an authoritative outlet_admin sync succeeds for a user, automatically resolve older
+   * stale PENDING / PARTIAL_CENTRAL_ONLY / FAILED outbox items for the same (outlet, user)
+   * so the user does not stay stuck showing PENDING OUTLET / OUTBOX PENDING.
+   */
+  private async supersedeStaleOutboxForUser(params: {
+    outletCode: string;
+    targetUserId?: string | null;
+    externalStaffId?: string | null;
+    excludeOutboxId: string;
+  }) {
+    const cleanOutlet = params.outletCode.trim().toLowerCase();
+    const nowIso = new Date().toISOString();
+    const staleStatuses: OutboxStatus[] = ['PENDING', 'PARTIAL_CENTRAL_ONLY', 'PARTIAL_OUTLET_ONLY', 'FAILED'];
+
+    // 1. Update in-memory outbox entries
+    for (const item of this.outbox.values()) {
+      if (item.id === params.excludeOutboxId) continue;
+      if (item.outletCode.toLowerCase() !== cleanOutlet) continue;
+      if (!staleStatuses.includes(item.status)) continue;
+
+      const matchesUser = Boolean(params.targetUserId && item.targetUserId === params.targetUserId);
+      const matchesExternal = Boolean(params.externalStaffId && item.externalStaffId === params.externalStaffId);
+      if (matchesUser || matchesExternal) {
+        item.centralConfirmed = true;
+        item.outletConfirmed = true;
+        item.status = 'SYNCED';
+        item.lastError = null;
+        item.nextRetryAt = null;
+        item.updatedAt = nowIso;
+      }
+    }
+
+    // 2. Update Central DB smav_sync_outbox entries durably
+    const client = this.getCentralServiceDb();
+    if (!client) return;
+
+    const patch = {
+      central_confirmed: true,
+      outlet_confirmed: true,
+      status: 'SYNCED',
+      last_error: null,
+      next_retry_at: null,
+      updated_at: nowIso,
+    };
+
+    try {
+      if (params.targetUserId) {
+        await client
+          .from('smav_sync_outbox')
+          .update(patch)
+          .eq('outlet_code', cleanOutlet)
+          .eq('target_user_id', params.targetUserId)
+          .neq('id', params.excludeOutboxId)
+          .in('status', staleStatuses);
+      }
+      if (params.externalStaffId) {
+        await client
+          .from('smav_sync_outbox')
+          .update(patch)
+          .eq('outlet_code', cleanOutlet)
+          .eq('external_staff_id', params.externalStaffId)
+          .neq('id', params.excludeOutboxId)
+          .in('status', staleStatuses);
+      }
+    } catch (_e) {
+      // Non-fatal
+    }
+  }
+
   public async listOutbox(params?: {
     outletCode?: string;
     allowedOutletCodes?: string[];
@@ -289,19 +468,20 @@ export class OutletUserSyncCoordinator {
       merged.set(item.id, item);
     }
 
-    const centralUrl = this.deps.getCentralUrl();
-    const anonKey = process.env.SMAV_SUPABASE_ANON_KEY || process.env.VITE_SMAV_SUPABASE_ANON_KEY || '';
-    const serviceKey = process.env.SMAV_SERVICE_ROLE_KEY?.trim();
-    const keyToUse = serviceKey || anonKey;
-
-    if (centralUrl && keyToUse && (serviceKey || params?.callerSupabaseJwt)) {
-      try {
-        const client = createClient(centralUrl, keyToUse, {
+    let client = this.getCentralServiceDb();
+    if (!client && params?.callerSupabaseJwt) {
+      const centralUrl = this.deps.getCentralUrl();
+      const anonKey = process.env.SMAV_SUPABASE_ANON_KEY || process.env.VITE_SMAV_SUPABASE_ANON_KEY || '';
+      if (centralUrl && anonKey) {
+        client = createClient(centralUrl, anonKey, {
           auth: { autoRefreshToken: false, persistSession: false },
-          ...(params?.callerSupabaseJwt && !serviceKey
-            ? { global: { headers: { Authorization: `Bearer ${params.callerSupabaseJwt}` } } }
-            : {}),
+          global: { headers: { Authorization: `Bearer ${params.callerSupabaseJwt}` } },
         });
+      }
+    }
+
+    if (client) {
+      try {
         let q = client
           .from('smav_sync_outbox')
           .select('*')
@@ -313,30 +493,11 @@ export class OutletUserSyncCoordinator {
         const { data, error } = await q;
         if (!error && Array.isArray(data)) {
           for (const row of data) {
-            merged.set(row.id, {
-              id: row.id,
-              idempotencyKey: row.idempotency_key,
-              operationId: row.operation_id,
-              syncOrigin: row.sync_origin,
-              action: row.action,
-              outletId: row.outlet_id,
-              outletCode: row.outlet_code,
-              targetUserId: row.target_user_id,
-              externalStaffId: row.external_staff_id,
-              payload: row.payload || {},
-              centralConfirmed: Boolean(row.central_confirmed),
-              outletConfirmed: Boolean(row.outlet_confirmed),
-              status: row.status,
-              attempts: Number(row.attempts || 0),
-              maxAttempts: Number(row.max_attempts || 5),
-              nextRetryAt: row.next_retry_at || null,
-              lastError: row.last_error || null,
-              conflictDetails: row.conflict_details || null,
-              syncVersion: Number(row.sync_version || 1),
-              createdBy: row.created_by || null,
-              createdAt: row.created_at,
-              updatedAt: row.updated_at,
-            });
+            const mapped = this.rowToOutboxRecord(row);
+            merged.set(mapped.id, mapped);
+            // Hydrate DB rows into memory so retryOutboxItem() always finds active DB items after restarts
+            this.outbox.set(mapped.id, mapped);
+            this.idempotencyIndex.set(mapped.idempotencyKey, mapped.id);
           }
         }
       } catch (_e) {
@@ -365,26 +526,24 @@ export class OutletUserSyncCoordinator {
       `smav_${input.action}_${cleanOutletCode}_${crypto.randomUUID()}`;
     const operationId = input.operationId?.trim() || crypto.randomUUID();
 
-    // Return cached idempotent result if already processed cleanly (prevent duplicate work / sync loops)
-    const existingId = this.idempotencyIndex.get(idempotencyKey);
-    if (existingId && this.outbox.has(existingId)) {
-      const existing = this.outbox.get(existingId)!;
-      if (existing.status === 'SYNCED') {
-        return {
-          success: true,
-          httpStatus: 200,
-          message: 'Idempotent replay: already synchronized across Central SMAV and outlet.',
-          userId: existing.targetUserId || undefined,
-          email: existing.payload.email,
-          username: existing.payload.username,
-          role: existing.payload.role,
-          mustChangePassword: existing.payload.mustChangePassword,
-          centralConfirmed: existing.centralConfirmed,
-          outletConfirmed: existing.outletConfirmed,
-          syncStatus: existing.status,
-          outboxItem: existing,
-        };
-      }
+    // Return cached/DB idempotent result if already processed cleanly (prevent duplicate work / sync loops)
+    const existing = await this.findByIdempotencyKeyInDb(idempotencyKey);
+    const existingId = existing?.id;
+    if (existing && existing.status === 'SYNCED') {
+      return {
+        success: true,
+        httpStatus: 200,
+        message: 'Idempotent replay: already synchronized across Central SMAV and outlet.',
+        userId: existing.targetUserId || undefined,
+        email: existing.payload.email,
+        username: existing.payload.username,
+        role: existing.payload.role,
+        mustChangePassword: existing.payload.mustChangePassword,
+        centralConfirmed: existing.centralConfirmed,
+        outletConfirmed: existing.outletConfirmed,
+        syncStatus: existing.status,
+        outboxItem: existing,
+      };
     }
 
     const nowIso = new Date().toISOString();
@@ -479,9 +638,13 @@ export class OutletUserSyncCoordinator {
     // Central confirmed! Capture authoritative UUID & metadata
     record.centralConfirmed = true;
     record.targetUserId = edgeRes.userId || record.targetUserId;
+    if (edgeRes.externalStaffId && !record.externalStaffId) {
+      record.externalStaffId = String(edgeRes.externalStaffId);
+    }
     record.payload = this.sanitizePayload({
       ...record.payload,
       userId: record.targetUserId || undefined,
+      externalStaffId: record.externalStaffId || undefined,
       email: edgeRes.email || record.payload.email,
       username: edgeRes.username || record.payload.username,
       fullName: edgeRes.fullName || record.payload.fullName,
@@ -493,6 +656,20 @@ export class OutletUserSyncCoordinator {
           : record.payload.mustChangePassword,
     });
 
+    if (this.deps.onCentralConfirmed) {
+      try {
+        await this.deps.onCentralConfirmed({
+          action: input.action,
+          outletCode: cleanOutletCode,
+          outletId: input.outlet.id || null,
+          userId: record.targetUserId,
+          isActive: record.payload.isActive,
+        });
+      } catch (_e) {
+        // Non-fatal
+      }
+    }
+
     // -------------------------------------------------------------------------
     // STEP 2: Push to Target Outlet DB ONLY if sync did NOT originate from that outlet
     // Loop prevention: outlet_admin -> Central does NOT echo back to outlet_admin
@@ -501,8 +678,17 @@ export class OutletUserSyncCoordinator {
       record.outletConfirmed = true;
       record.status = 'SYNCED';
       record.lastError = null;
+      record.nextRetryAt = null;
       record.updatedAt = new Date().toISOString();
       await this.persistOutboxToCentralDb(record);
+
+      // Automatically clear any older stale PARTIAL_CENTRAL_ONLY / PENDING outbox items for this user
+      await this.supersedeStaleOutboxForUser({
+        outletCode: cleanOutletCode,
+        targetUserId: record.targetUserId,
+        externalStaffId: record.externalStaffId,
+        excludeOutboxId: record.id,
+      });
 
       return {
         success: true,
@@ -598,14 +784,20 @@ export class OutletUserSyncCoordinator {
     };
   }
 
-  public async retryOutboxItem(outboxId: string): Promise<{
+  public async retryOutboxItem(
+    outboxId: string,
+    callerSupabaseJwt?: string
+  ): Promise<{
     success: boolean;
     message: string;
     item?: OutboxRecord;
   }> {
-    const item = this.outbox.get(outboxId);
+    const item = await this.hydrateOutboxItemFromDb(outboxId, callerSupabaseJwt);
     if (!item) {
-      return { success: false, message: 'Outbox item not found in active queue.' };
+      return {
+        success: false,
+        message: `Outbox item "${outboxId}" was not found in memory or smav_sync_outbox.`,
+      };
     }
     if (item.status === 'SYNCED') {
       return { success: true, message: 'Already synchronized across both systems.', item };
@@ -666,8 +858,80 @@ export class OutletUserSyncCoordinator {
     };
   }
 
-  private async processDueRetries() {
+  /**
+   * SUPERADMIN emergency recovery helper: marks a stale/orphaned outbox item as SYNCED
+   * after administrator verification (e.g. when the authoritative outlet portal already holds
+   * the latest record and a legacy smav_portal outbox row remained stuck in PARTIAL_CENTRAL_ONLY).
+   */
+  public async resolveOutboxItem(params: {
+    outboxId: string;
+    actorUserId: string;
+    reason?: string;
+    callerSupabaseJwt?: string;
+  }): Promise<{ success: boolean; message: string; item?: OutboxRecord }> {
+    const item = await this.hydrateOutboxItemFromDb(params.outboxId, params.callerSupabaseJwt);
+    if (!item) {
+      return {
+        success: false,
+        message: `Outbox item "${params.outboxId}" was not found in memory or smav_sync_outbox.`,
+      };
+    }
+
+    const nowIso = new Date().toISOString();
+    item.centralConfirmed = true;
+    item.outletConfirmed = true;
+    item.status = 'SYNCED';
+    item.lastError = null;
+    item.nextRetryAt = null;
+    item.conflictDetails = null;
+    item.updatedAt = nowIso;
+    await this.persistOutboxToCentralDb(item);
+
+    this.deps.logAudit({
+      eventType: 'SUPERADMIN_OUTBOX_ITEM_RESOLVED',
+      actorId: params.actorUserId,
+      outletId: item.outletId || undefined,
+      details: {
+        outboxId: item.id,
+        outletCode: item.outletCode,
+        targetUserId: item.targetUserId,
+        reason: params.reason || 'Manually verified and resolved by SUPERADMIN',
+      },
+    });
+
+    return {
+      success: true,
+      message: `Outbox item ${item.id} marked SYNCED by SUPERADMIN.`,
+      item,
+    };
+  }
+
+  public async processDueRetries() {
     const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+
+    // Hydrate due DB-persisted PARTIAL_CENTRAL_ONLY rows so container restarts never orphan retries
+    const client = this.getCentralServiceDb();
+    if (client) {
+      try {
+        const { data, error } = await client
+          .from('smav_sync_outbox')
+          .select('*')
+          .eq('status', 'PARTIAL_CENTRAL_ONLY')
+          .lte('next_retry_at', nowIso)
+          .limit(25);
+        if (!error && Array.isArray(data)) {
+          for (const row of data) {
+            const hydrated = this.rowToOutboxRecord(row);
+            this.outbox.set(hydrated.id, hydrated);
+            this.idempotencyIndex.set(hydrated.idempotencyKey, hydrated.id);
+          }
+        }
+      } catch (_e) {
+        // Non-fatal
+      }
+    }
+
     for (const item of this.outbox.values()) {
       if (
         item.status === 'PARTIAL_CENTRAL_ONLY' &&

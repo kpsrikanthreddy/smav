@@ -43,6 +43,23 @@ class SyncRepository(
         var totalSynced = 0
 
         try {
+            // 0. Revalidate active status against Central Auth on reconnect before uploading.
+            //    If the user was deactivated or password-reset while offline, revoke local session
+            //    immediately while preserving unsynchronized Room bills for an active operator.
+            val authCheck = api.getAuthSession(bearer)
+            if (authCheck.code() == 401 || authCheck.code() == 403) {
+                sessionManager.clearSession()
+                throw UnauthorizedSessionException(
+                    SmavApiClient.parseErrorMessage(
+                        authCheck,
+                        "Your account is inactive or your session expired. Please sign in again."
+                    )
+                )
+            }
+            if (authCheck.isSuccessful) {
+                sessionManager.touchSessionValidatedAt()
+            }
+
             // 1. Sync Salon Bills strictly belonging to the active outlet
             if (session.businessType == BusinessType.SALON) {
                 val pendingBills = database.salonBillDao().getUnsyncedBills().filter {

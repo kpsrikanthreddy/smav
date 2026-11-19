@@ -120,7 +120,7 @@ export class SmavOutletUserAdapter {
         success: Boolean(res.ok && data?.success !== false),
         status: res.status,
         message: data?.message || data?.error || (res.ok ? 'Synchronized' : `HTTP ${res.status}`),
-        userId: data?.userId,
+        userId: data?.centralUserId || data?.userId,
         email: data?.email,
         username: data?.username,
         role: data?.role,
@@ -140,21 +140,45 @@ export class SmavOutletUserAdapter {
   /**
    * Create or update a staff/admin user from the Outlet Admin page.
    * For new users, supply `initialPassword` (>= 8 chars). Passwords are never saved locally in plaintext.
+   * When updating an existing user without specifying `role`, the user's current SMAV role is preserved.
    */
   public upsertUser(user: OutletUserSyncPayload, idempotencyKey?: string): Promise<SmavSyncAdapterResponse> {
+    const isUpdate = Boolean(user.userId);
     return this.postSync(
-      'upsert-user',
-      user.userId ? 'update_user' : 'upsert_user',
+      isUpdate ? 'update-user' : 'upsert-user',
+      isUpdate ? 'update_user' : 'upsert_user',
       {
-        userId: user.userId,
-        externalStaffId: user.externalStaffId,
-        email: user.email?.trim().toLowerCase(),
-        fullName: user.fullName?.trim(),
-        username: user.username?.trim().toLowerCase(),
-        phone: user.phone?.trim() || '',
-        role: user.role || 'STAFF',
-        isActive: user.isActive !== false,
+        ...(user.userId ? { userId: user.userId, centralUserId: user.userId } : {}),
+        ...(user.externalStaffId ? { externalStaffId: user.externalStaffId } : {}),
+        ...(user.email ? { email: user.email.trim().toLowerCase() } : {}),
+        ...(user.fullName ? { fullName: user.fullName.trim() } : {}),
+        ...(user.username ? { username: user.username.trim().toLowerCase() } : {}),
+        ...(typeof user.phone === 'string' ? { phone: user.phone.trim() } : {}),
+        ...(user.role ? { role: user.role } : !isUpdate ? { role: 'STAFF' } : {}),
+        ...(typeof user.isActive === 'boolean' ? { isActive: user.isActive } : !isUpdate ? { isActive: true } : {}),
         ...(user.initialPassword ? { initialPassword: user.initialPassword } : {}),
+      },
+      idempotencyKey
+    );
+  }
+
+  /**
+   * Update a user's email address on their existing Central Auth UUID (resolved by userId or externalStaffId)
+   * without creating a duplicate Auth account or downgrading their role.
+   */
+  public updateEmail(params: {
+    userId?: string;
+    externalStaffId?: string;
+    newEmail: string;
+  }, idempotencyKey?: string): Promise<SmavSyncAdapterResponse> {
+    return this.postSync(
+      'update-email',
+      'update_user',
+      {
+        ...(params.userId ? { userId: params.userId, centralUserId: params.userId } : {}),
+        ...(params.externalStaffId ? { externalStaffId: params.externalStaffId } : {}),
+        email: params.newEmail.trim().toLowerCase(),
+        newEmail: params.newEmail.trim().toLowerCase(),
       },
       idempotencyKey
     );
@@ -171,9 +195,9 @@ export class SmavOutletUserAdapter {
     newPassword: string;
   }): Promise<SmavSyncAdapterResponse> {
     return this.postSync('reset-password', 'reset_password', {
-      userId: params.userId,
-      externalStaffId: params.externalStaffId,
-      email: params.email?.trim().toLowerCase(),
+      ...(params.userId ? { userId: params.userId, centralUserId: params.userId } : {}),
+      ...(params.externalStaffId ? { externalStaffId: params.externalStaffId } : {}),
+      ...(params.email ? { email: params.email.trim().toLowerCase() } : {}),
       newPassword: params.newPassword,
     });
   }

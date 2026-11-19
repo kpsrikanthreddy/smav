@@ -293,6 +293,90 @@ Deno.serve(async (req: Request) => {
     return callerContext.adminOutletIds.includes(outletId);
   }
 
+  // Authoritative outlet backend (e.g. Glossy Looks Admin Portal server-to-server integration)
+  // is allowed to manage both ADMIN (OWNER/MANAGER) and STAFF (STYLIST/RECEPTIONIST) for its own outlet,
+  // while SUPERADMIN accounts remain strictly protected.
+  function isAuthoritativeOutletBackend(outletCode?: string): boolean {
+    if (!callerContext.isServiceOrBackend || !callerContext.businessSource) return false;
+    const code = String(outletCode || '').trim().toLowerCase();
+    return Boolean(code && code === callerContext.businessSource);
+  }
+
+  async function resolveAuthUserByAnyIdentifier(params: {
+    userId?: string;
+    email?: string;
+    externalStaffId?: string;
+    outletCode?: string;
+  }) {
+    if (params.userId && /^[0-9a-f-]{36}$/i.test(params.userId.trim())) {
+      const byId = await findAuthUser({ id: params.userId.trim() });
+      if (byId) return byId;
+    }
+    if (params.externalStaffId && params.outletCode) {
+      const { data: extRow } = await supabaseAdmin
+        .from('smav_external_identities')
+        .select('auth_user_id')
+        .eq('source', params.outletCode.trim().toLowerCase())
+        .eq('external_id', params.externalStaffId.trim())
+        .maybeSingle();
+      if (extRow?.auth_user_id) {
+        const byExt = await findAuthUser({ id: String(extRow.auth_user_id) });
+        if (byExt) return byExt;
+      }
+    }
+    if (params.email) {
+      const byEmail = await findAuthUser({ email: params.email.trim().toLowerCase() });
+      if (byEmail) return byEmail;
+    }
+    return null;
+  }
+
+  // Synchronize global profile active flag & Supabase Auth ban status cleanly when an outlet
+  // deactivates or reactivates a user (never disabling a user who still has active roles in other outlets).
+  async function syncEffectiveAccountStatus(userId: string, desiredActive: boolean, outletId?: string) {
+    if (desiredActive) {
+      await supabaseAdmin
+        .from('smav_profiles')
+        .update({ is_active: true })
+        .eq('id', userId);
+      const { error: unbanErr } = await supabaseAdmin.auth.admin.updateUserById(userId, {
+        ban_duration: 'none',
+      });
+      if (unbanErr) {
+        console.warn('[smav-identity-admin] Auth unban warning:', unbanErr.message);
+      }
+      return { globallyActive: true };
+    }
+
+    // Check if the user still has any other active outlet membership before globally disabling
+    let remainingQuery = supabaseAdmin
+      .from('smav_user_outlet_roles')
+      .select('id, outlet_id')
+      .eq('user_id', userId)
+      .eq('is_active', true);
+    if (outletId) {
+      remainingQuery = remainingQuery.neq('outlet_id', outletId);
+    }
+    const { data: remainingActiveRoles } = await remainingQuery;
+    const hasOtherActiveOutlets = Array.isArray(remainingActiveRoles) && remainingActiveRoles.length > 0;
+
+    if (!hasOtherActiveOutlets) {
+      await supabaseAdmin
+        .from('smav_profiles')
+        .update({ is_active: false })
+        .eq('id', userId);
+      const { error: banErr } = await supabaseAdmin.auth.admin.updateUserById(userId, {
+        ban_duration: '876000h',
+      });
+      if (banErr) {
+        console.warn('[smav-identity-admin] Auth ban warning:', banErr.message);
+      }
+      return { globallyActive: false };
+    }
+
+    return { globallyActive: true };
+  }
+
   // Requirement 5 & Duplicate-Account Prevention:
   // Paginated Auth lookup that fails closed on errors or ambiguous multi-account email matches.
   async function findAuthUsersByEmailFailClosed(
@@ -473,14 +557,17 @@ Deno.serve(async (req: Request) => {
   // Actual deployed schema: profiles(id, full_name, platform_role, is_active),
   // outlet roles(user_id, outlet_id, role, is_active), external identities
   // (source, external_id, auth_user_id, username, email, created_at).
-  async function saveProfile(userId: string, name: string, active = true) {
+  async function saveProfile(userId: string, name: string, active = true, allowStatusUpdate = false) {
     const { data: existing, error } = await supabaseAdmin.from('smav_profiles')
       .select('platform_role, is_active').eq('id', userId).maybeSingle();
     if (error) return error;
-    // Never reactivate/deactivate an existing account during an outlet sync.
     if (existing) {
+      const updatePatch: Record<string, unknown> = { full_name: name };
+      if (allowStatusUpdate && String(existing.platform_role || '').toUpperCase() !== 'SUPERADMIN') {
+        updatePatch.is_active = active;
+      }
       const { error: updateError } = await supabaseAdmin.from('smav_profiles')
-        .update({ full_name: name }).eq('id', userId);
+        .update(updatePatch).eq('id', userId);
       return updateError;
     }
     const { error: insertError } = await supabaseAdmin.from('smav_profiles')
@@ -488,23 +575,31 @@ Deno.serve(async (req: Request) => {
     return insertError;
   }
 
-  async function saveOutletRole(userId: string, outletId: string, role: 'ADMIN' | 'STAFF', active: boolean, allowAdminChange: boolean) {
-    if (!allowAdminChange && role === 'ADMIN') {
-      return new Error('Only SUPERADMIN can assign ADMIN permissions');
+  async function saveOutletRole(
+    userId: string,
+    outletId: string,
+    role: 'ADMIN' | 'STAFF' | null,
+    active: boolean,
+    allowAdminChange: boolean
+  ) {
+    if (role === 'ADMIN' && !allowAdminChange) {
+      return new Error('Only SUPERADMIN or the authoritative outlet backend can assign ADMIN permissions');
     }
     const { data: existing, error } = await supabaseAdmin.from('smav_user_outlet_roles')
       .select('id, role').eq('user_id', userId).eq('outlet_id', outletId).maybeSingle();
     if (error) return error;
     if (existing) {
-      // Outlet admins and integration callers cannot downgrade/replace existing ADMIN assignments.
-      if (!allowAdminChange && String(existing.role).toUpperCase() !== 'STAFF')
-        return new Error('Only SUPERADMIN can change an existing ADMIN assignment');
+      const resolvedRole: 'ADMIN' | 'STAFF' = role || (String(existing.role || 'STAFF').toUpperCase() === 'ADMIN' ? 'ADMIN' : 'STAFF');
+      if (!allowAdminChange && String(existing.role).toUpperCase() !== 'STAFF') {
+        return new Error('Only SUPERADMIN or the authoritative outlet backend can change an existing ADMIN assignment');
+      }
       const { error: updateError } = await supabaseAdmin.from('smav_user_outlet_roles')
-        .update({ role, is_active: active }).eq('id', existing.id);
+        .update({ role: resolvedRole, is_active: active }).eq('id', existing.id);
       return updateError;
     }
+    const insertRole: 'ADMIN' | 'STAFF' = role || 'STAFF';
     const { error: insertError } = await supabaseAdmin.from('smav_user_outlet_roles')
-      .insert({ user_id: userId, outlet_id: outletId, role, is_active: active });
+      .insert({ user_id: userId, outlet_id: outletId, role: insertRole, is_active: active });
     return insertError;
   }
 
@@ -607,8 +702,10 @@ Deno.serve(async (req: Request) => {
     ) {
       return { valid: false, reason: 'Placeholder or local-only email domains are not allowed' };
     }
-    if (['staff', 'owner', 'admin', 'user', 'test', 'demo', 'dummy', 'noemail', 'noreply', 'temp'].includes(localPart)) {
-      return { valid: false, reason: 'Generic placeholder mailboxes are not allowed; use the user\'s real email' };
+    // Allow legitimate business role mailboxes (e.g. owner@glossylooks.in, admin@glossylooks.in)
+    // while continuing to block synthetic/throwaway local parts.
+    if (['test', 'demo', 'dummy', 'noemail', 'noreply', 'temp', 'placeholder'].includes(localPart)) {
+      return { valid: false, reason: 'Synthetic placeholder mailboxes are not allowed; use the user\'s real email' };
     }
     return { valid: true };
   }
@@ -685,28 +782,44 @@ Deno.serve(async (req: Request) => {
           return errorResponse('Forbidden: Caller cannot manage users for this outlet', 403);
         }
 
+        const canManageAdminRoles = callerContext.isSuperadmin || isAuthoritativeOutletBackend(resolvedOutletCode);
+        const isUpdateOnly = action === 'update-user' || action === 'update_user';
+
         const cleanEmail = String(email || '').trim().toLowerCase();
-        const emailCheck = validateReachableEmail(cleanEmail);
-        if (!emailCheck.valid) {
-          return errorResponse(emailCheck.reason || 'Valid email is required', 400);
+        if (cleanEmail) {
+          const emailCheck = validateReachableEmail(cleanEmail);
+          if (!emailCheck.valid) {
+            return errorResponse(emailCheck.reason || 'Valid email is required', 400);
+          }
+        } else if (!isUpdateOnly) {
+          return errorResponse('A valid reachable email address is required', 400);
         }
 
-        const cleanName = String(fullName || '').trim() || cleanEmail.split('@')[0];
-        const cleanPhone = String(phone || '').trim();
-        const cleanUsername = username ? String(username).trim().toLowerCase() : cleanEmail.split('@')[0];
-        const cleanExternalId = externalStaffId ? String(externalStaffId).trim() : cleanUsername;
-        const syncOrigin = String(rawSyncOrigin || req.headers.get('X-SMAV-Sync-Origin') || 'smav_portal').trim();
+        const cleanPhone = typeof phone === 'string' ? phone.trim() : undefined;
+        const cleanExternalId = externalStaffId ? String(externalStaffId).trim() : '';
+        const syncOrigin = String(rawSyncOrigin || req.headers.get('X-SMAV-Sync-Origin') || (callerContext.isServiceOrBackend ? 'outlet_admin' : 'smav_portal')).trim();
+        const hasExplicitStatus = typeof rawIsActive === 'boolean';
         const desiredActive = rawIsActive !== false;
 
-        // Normalize target outlet role. Never auto-promote to SUPERADMIN.
-        const rawRoleNorm = String(requestedRoleInput || externalRole || 'STAFF').trim().toUpperCase();
-        const mappedOutletRole: 'ADMIN' | 'STAFF' =
-          rawRoleNorm === 'ADMIN' || rawRoleNorm === 'SUPERADMIN'
-            ? 'ADMIN'
-            : mapPortalRoleToSmav(rawRoleNorm, resolvedOutletCode).smavRole;
+        // Normalize target outlet role ONLY when explicitly supplied (or creating a new user).
+        // Never auto-promote to SUPERADMIN and never silently downgrade an existing ADMIN to STAFF.
+        const hasExplicitRole = Boolean(
+          (typeof requestedRoleInput === 'string' && requestedRoleInput.trim()) ||
+          (typeof externalRole === 'string' && externalRole.trim())
+        );
+        let mappedOutletRole: 'ADMIN' | 'STAFF' | null = null;
+        if (hasExplicitRole) {
+          const rawRoleNorm = String(requestedRoleInput || externalRole).trim().toUpperCase();
+          mappedOutletRole =
+            rawRoleNorm === 'ADMIN' || rawRoleNorm === 'SUPERADMIN'
+              ? 'ADMIN'
+              : mapPortalRoleToSmav(rawRoleNorm, resolvedOutletCode).smavRole;
+        } else if (!isUpdateOnly) {
+          mappedOutletRole = 'STAFF';
+        }
 
-        if (mappedOutletRole === 'ADMIN' && !callerContext.isSuperadmin) {
-          return errorResponse('Forbidden: Only SUPERADMIN can assign or update ADMIN roles', 403);
+        if (mappedOutletRole === 'ADMIN' && !canManageAdminRoles) {
+          return errorResponse('Forbidden: Only SUPERADMIN or the authoritative outlet backend can assign or update ADMIN roles', 403);
         }
 
         const matchedCandidates = new Map<string, any>();
@@ -733,21 +846,23 @@ Deno.serve(async (req: Request) => {
           }
         }
 
-        // Match priority 3: email ownership in Auth users (fail closed on multiple)
-        const authEmailLookup = await findAuthUsersByEmailFailClosed(cleanEmail);
-        if (authEmailLookup.error) {
-          return errorResponse(`Auth email lookup failed: ${authEmailLookup.error}`, 500);
-        }
-        if (authEmailLookup.users.length > 1) {
-          return errorResponse(`Ambiguous Auth email "${cleanEmail}" matches multiple accounts; conflict requires review`, 409);
-        }
-        if (authEmailLookup.users[0]?.id) {
-          matchedCandidates.set(String(authEmailLookup.users[0].id), authEmailLookup.users[0]);
+        // Match priority 3: verified email ownership in Auth users (fail closed on multiple)
+        if (cleanEmail) {
+          const authEmailLookup = await findAuthUsersByEmailFailClosed(cleanEmail);
+          if (authEmailLookup.error) {
+            return errorResponse(`Auth email lookup failed: ${authEmailLookup.error}`, 500);
+          }
+          if (authEmailLookup.users.length > 1) {
+            return errorResponse(`Ambiguous Auth email "${cleanEmail}" matches multiple accounts; conflict requires review`, 409);
+          }
+          if (authEmailLookup.users[0]?.id) {
+            matchedCandidates.set(String(authEmailLookup.users[0].id), authEmailLookup.users[0]);
+          }
         }
 
         if (matchedCandidates.size > 1) {
           return errorResponse(
-            'Identity conflict: provided userId, externalStaffId, or email resolves to different Central Auth accounts. No duplicate created.',
+            'Identity conflict: provided userId, externalStaffId, or email resolves to different Central Auth accounts. Reconcile duplicate records before updating; no duplicate created.',
             409,
             { candidateUserIds: Array.from(matchedCandidates.keys()) }
           );
@@ -763,10 +878,10 @@ Deno.serve(async (req: Request) => {
             return errorResponse(`Resolved user "${resolvedId}" missing in Central Supabase Auth`, 409);
           }
 
-          // Protect SUPERADMIN accounts from non-SUPERADMIN mutation
+          // Protect SUPERADMIN accounts strictly from non-SUPERADMIN mutation
           const { data: targetProf } = await supabaseAdmin
             .from('smav_profiles')
-            .select('platform_role')
+            .select('platform_role, full_name, is_active')
             .eq('id', targetUser.id)
             .maybeSingle();
 
@@ -774,30 +889,113 @@ Deno.serve(async (req: Request) => {
             return errorResponse('Forbidden: Cannot modify a platform SUPERADMIN account', 403);
           }
 
-          // Update email/metadata/ban state on existing Auth UUID without altering existing password
           const currentEmail = String(targetUser.email || '').trim().toLowerCase();
+          const finalEmail = cleanEmail || currentEmail;
+          const finalName = String(fullName || '').trim() || targetProf?.full_name || targetUser.user_metadata?.full_name || finalEmail.split('@')[0];
+          const finalUsername = username
+            ? String(username).trim().toLowerCase()
+            : String(targetUser.user_metadata?.username || finalEmail.split('@')[0]).trim().toLowerCase();
+          const finalPhone = cleanPhone !== undefined ? cleanPhone : String(targetUser.user_metadata?.phone || '');
+
           const updateAttrs: Record<string, any> = {
             user_metadata: {
               ...(targetUser.user_metadata || {}),
-              full_name: cleanName,
-              username: cleanUsername,
-              phone: cleanPhone,
+              full_name: finalName,
+              username: finalUsername,
+              phone: finalPhone,
             },
           };
-          if (currentEmail !== cleanEmail) {
+          if (cleanEmail && currentEmail !== cleanEmail) {
             updateAttrs.email = cleanEmail;
             updateAttrs.email_confirm = true;
-          }
-          if (callerContext.isSuperadmin && rawIsActive !== undefined) {
-            updateAttrs.ban_duration = desiredActive ? 'none' : '876000h';
           }
           const { data: updData, error: updErr } = await supabaseAdmin.auth.admin.updateUserById(targetUser.id, updateAttrs);
           if (updErr || !updData?.user) {
             return errorResponse(`Failed to update Central Auth user: ${updErr?.message || 'Unknown error'}`, 409);
           }
           targetUser = updData.user;
+
+          const profileErr = await saveProfile(targetUser.id, finalName, desiredActive, false);
+          if (profileErr) {
+            return errorResponse(`Failed to update smav_profiles: ${profileErr.message}`, 400);
+          }
+
+          const effectiveActive = hasExplicitStatus ? desiredActive : (targetProf?.is_active !== false);
+          const roleErr = await saveOutletRole(targetUser.id, outlet.id, mappedOutletRole, effectiveActive, canManageAdminRoles);
+          if (roleErr) {
+            return errorResponse(`Failed to update smav_user_outlet_roles: ${roleErr.message}`, 403);
+          }
+
+          if (hasExplicitStatus && canManageAdminRoles) {
+            await syncEffectiveAccountStatus(targetUser.id, desiredActive, outlet.id);
+          }
+
+          const identKey = cleanExternalId || finalUsername || finalEmail;
+          const identErr = await saveExternalIdentity(
+            resolvedOutletCode,
+            identKey,
+            targetUser.id,
+            finalUsername,
+            finalEmail,
+            syncOrigin
+          );
+          if (identErr) {
+            return errorResponse(`Failed to update smav_external_identities: ${identErr.message}`, 409);
+          }
+
+          // Also keep any existing external identity rows for this auth_user_id in sync when email changes
+          if (cleanEmail && currentEmail !== cleanEmail) {
+            await supabaseAdmin
+              .from('smav_external_identities')
+              .update({ email: cleanEmail, last_synced_at: new Date().toISOString(), sync_origin: syncOrigin })
+              .eq('auth_user_id', targetUser.id);
+          }
+
+          // Re-read authoritative outlet role so response reflects true role even if role was omitted on update
+          const { data: persistedRole } = await supabaseAdmin
+            .from('smav_user_outlet_roles')
+            .select('role, is_active')
+            .eq('user_id', targetUser.id)
+            .eq('outlet_id', outlet.id)
+            .maybeSingle();
+          const finalRole: 'ADMIN' | 'STAFF' = String(persistedRole?.role || mappedOutletRole || 'STAFF').toUpperCase() === 'ADMIN' ? 'ADMIN' : 'STAFF';
+          const finalIsActive = persistedRole ? persistedRole.is_active !== false : effectiveActive;
+
+          await recordAudit({
+            action: 'UPSERT_USER_UPDATED',
+            entityType: 'USER',
+            entityId: targetUser.id,
+            outletId: outlet.id,
+            details: {
+              targetEmail: finalEmail,
+              username: finalUsername,
+              externalStaffId: cleanExternalId || null,
+              outletCode: resolvedOutletCode,
+              outletRole: finalRole,
+              isActive: finalIsActive,
+              isNewUser: false,
+              syncOrigin,
+            },
+          });
+
+          return jsonResponse({
+            success: true,
+            message: `User "${finalName}" (${finalEmail}) updated cleanly on Central UUID ${targetUser.id}.`,
+            userId: targetUser.id,
+            email: finalEmail,
+            username: finalUsername,
+            fullName: finalName,
+            externalStaffId: cleanExternalId || null,
+            outletId: outlet.id,
+            outletCode: resolvedOutletCode,
+            role: finalRole,
+            displayRole: finalRole === 'ADMIN' ? 'ADMIN' : 'POS_BILLING',
+            isActive: finalIsActive,
+            isNewUser: false,
+            mustChangePassword: Boolean(targetUser.user_metadata?.must_change_password),
+          });
         } else {
-          if (action === 'update-user' || action === 'update_user') {
+          if (isUpdateOnly) {
             return errorResponse('Target user not found in Central Supabase Auth for update', 404);
           }
           const assignedPassword = initialPassword ?? temporaryPassword ?? rawPassword;
@@ -805,6 +1003,10 @@ Deno.serve(async (req: Request) => {
           if (pwdError) {
             return errorResponse(pwdError, 400);
           }
+
+          const cleanName = String(fullName || '').trim() || cleanEmail.split('@')[0];
+          const cleanUsername = username ? String(username).trim().toLowerCase() : cleanEmail.split('@')[0];
+          const newPhone = cleanPhone || '';
 
           isNewUser = true;
           const { data: created, error: createErr } = await supabaseAdmin.auth.admin.createUser({
@@ -815,7 +1017,7 @@ Deno.serve(async (req: Request) => {
             user_metadata: {
               full_name: cleanName,
               username: cleanUsername,
-              phone: cleanPhone,
+              phone: newPhone,
               must_change_password: true,
               password_assigned_at: new Date().toISOString(),
             },
@@ -824,62 +1026,64 @@ Deno.serve(async (req: Request) => {
             return errorResponse(`Failed to create Central Auth user: ${createErr?.message || 'Unknown error'}`, 400);
           }
           targetUser = created.user;
-        }
 
-        const profileErr = await saveProfile(targetUser.id, cleanName, desiredActive);
-        if (profileErr) {
-          return errorResponse(`Failed to update smav_profiles: ${profileErr.message}`, 400);
-        }
+          const profileErr = await saveProfile(targetUser.id, cleanName, desiredActive, true);
+          if (profileErr) {
+            return errorResponse(`Failed to update smav_profiles: ${profileErr.message}`, 400);
+          }
 
-        const roleErr = await saveOutletRole(targetUser.id, outlet.id, mappedOutletRole, desiredActive, callerContext.isSuperadmin);
-        if (roleErr) {
-          return errorResponse(`Failed to update smav_user_outlet_roles: ${roleErr.message}`, 403);
-        }
+          const finalRole: 'ADMIN' | 'STAFF' = mappedOutletRole || 'STAFF';
+          const roleErr = await saveOutletRole(targetUser.id, outlet.id, finalRole, desiredActive, canManageAdminRoles);
+          if (roleErr) {
+            return errorResponse(`Failed to update smav_user_outlet_roles: ${roleErr.message}`, 403);
+          }
 
-        const identErr = await saveExternalIdentity(
-          resolvedOutletCode,
-          cleanExternalId,
-          targetUser.id,
-          cleanUsername,
-          cleanEmail,
-          syncOrigin
-        );
-        if (identErr) {
-          return errorResponse(`Failed to update smav_external_identities: ${identErr.message}`, 409);
-        }
+          const identErr = await saveExternalIdentity(
+            resolvedOutletCode,
+            cleanExternalId || cleanUsername,
+            targetUser.id,
+            cleanUsername,
+            cleanEmail,
+            syncOrigin
+          );
+          if (identErr) {
+            return errorResponse(`Failed to update smav_external_identities: ${identErr.message}`, 409);
+          }
 
-        await recordAudit({
-          action: isNewUser ? 'UPSERT_USER_CREATED' : 'UPSERT_USER_UPDATED',
-          entityType: 'USER',
-          entityId: targetUser.id,
-          outletId: outlet.id,
-          details: {
-            targetEmail: cleanEmail,
+          await recordAudit({
+            action: 'UPSERT_USER_CREATED',
+            entityType: 'USER',
+            entityId: targetUser.id,
+            outletId: outlet.id,
+            details: {
+              targetEmail: cleanEmail,
+              username: cleanUsername,
+              externalStaffId: cleanExternalId || null,
+              outletCode: resolvedOutletCode,
+              outletRole: finalRole,
+              isActive: desiredActive,
+              isNewUser: true,
+              syncOrigin,
+            },
+          });
+
+          return jsonResponse({
+            success: true,
+            message: `User "${cleanName}" (${cleanEmail}) created in Central SMAV with temporary password.`,
+            userId: targetUser.id,
+            email: cleanEmail,
             username: cleanUsername,
+            fullName: cleanName,
+            externalStaffId: cleanExternalId || null,
+            outletId: outlet.id,
             outletCode: resolvedOutletCode,
-            outletRole: mappedOutletRole,
+            role: finalRole,
+            displayRole: finalRole === 'ADMIN' ? 'ADMIN' : 'POS_BILLING',
             isActive: desiredActive,
-            isNewUser,
-            syncOrigin,
-          },
-        });
-
-        return jsonResponse({
-          success: true,
-          message: isNewUser
-            ? `User "${cleanName}" (${cleanEmail}) created in Central SMAV with temporary password.`
-            : `User "${cleanName}" (${cleanEmail}) updated cleanly on Central UUID ${targetUser.id}.`,
-          userId: targetUser.id,
-          email: cleanEmail,
-          username: cleanUsername,
-          fullName: cleanName,
-          outletId: outlet.id,
-          outletCode: resolvedOutletCode,
-          role: mappedOutletRole,
-          isActive: desiredActive,
-          isNewUser,
-          mustChangePassword: Boolean(targetUser.user_metadata?.must_change_password),
-        });
+            isNewUser: true,
+            mustChangePassword: Boolean(targetUser.user_metadata?.must_change_password),
+          });
+        }
       }
 
       // ==============================================================================
@@ -1241,24 +1445,38 @@ Deno.serve(async (req: Request) => {
           }
 
           // 4. Requirement 4: Role is strictly outlet-scoped (ADMIN or STAFF, never SUPERADMIN)
-          const roleError = await saveOutletRole(user.id, outlet.id, smavRole, isActive, callerContext.isSuperadmin);
+          // Authoritative Glossy Looks backend is allowed to assign ADMIN for OWNER/MANAGER and STAFF for STYLIST/RECEPTIONIST.
+          const roleError = await saveOutletRole(
+            user.id,
+            outlet.id,
+            smavRole,
+            isActive,
+            callerContext.isSuperadmin || isAuthoritativeOutletBackend('glossylooks')
+          );
 
           if (roleError) {
             syncResults.push({ email, status: 'error', error: roleError.message });
             continue;
           }
 
-          // 5. Upsert external identity for username resolution
-          if (username) {
-            const identError = await saveExternalIdentity('glossylooks', String(externalStaffId || username), user.id, String(username).trim().toLowerCase(), email);
+          await syncEffectiveAccountStatus(user.id, isActive, outlet.id);
 
-            if (identError) {
-              syncResults.push({ email, status: 'error', error: 'Identity mapping failed; administrator review required' });
-              continue;
-            }
+          // 5. Upsert external identity for username & externalStaffId resolution
+          const identError = await saveExternalIdentity(
+            'glossylooks',
+            externalKey,
+            user.id,
+            String(username || email.split('@')[0]).trim().toLowerCase(),
+            email,
+            'outlet_admin'
+          );
+
+          if (identError) {
+            syncResults.push({ email, status: 'error', error: 'Identity mapping failed; administrator review required' });
+            continue;
           }
 
-          syncResults.push({ email, name, smavRole, rawRole, isNewUser, status: 'synced' });
+          syncResults.push({ userId: user.id, email, name, smavRole, rawRole, isActive, isNewUser, status: 'synced' });
         }
 
         return jsonResponse({
@@ -1410,10 +1628,16 @@ Deno.serve(async (req: Request) => {
       // ==============================================================================
       case 'set-status':
       case 'set_status': {
-        const { userId, email, outletCode, isActive } = body;
+        const { userId, email, externalStaffId, outletCode, isActive } = body;
+        const desiredActive = Boolean(isActive);
 
-        // Resolve target user
-        const targetUser = await findAuthUser({ id: userId, email });
+        // Resolve target user by UUID, externalStaffId (scoped to outlet), or email
+        const targetUser = await resolveAuthUserByAnyIdentifier({
+          userId: typeof userId === 'string' ? userId : undefined,
+          email: typeof email === 'string' ? email : undefined,
+          externalStaffId: typeof externalStaffId === 'string' ? externalStaffId : undefined,
+          outletCode: typeof outletCode === 'string' ? outletCode : callerContext.businessSource,
+        });
         if (!targetUser) {
           return errorResponse('Target user not found in Central Supabase Auth', 404);
         }
@@ -1436,7 +1660,7 @@ Deno.serve(async (req: Request) => {
           return errorResponse('Forbidden: Only a SUPERADMIN can modify a Superadmin status', 403);
         }
 
-        if (isTargetSuperadmin && targetUserId === callerContext.callerUserId && isActive === false) {
+        if (isTargetSuperadmin && targetUserId === callerContext.callerUserId && desiredActive === false) {
           return errorResponse('Bad Request: You cannot deactivate your own active SUPERADMIN account', 400);
         }
 
@@ -1444,23 +1668,25 @@ Deno.serve(async (req: Request) => {
           const outlet = await resolveOutlet(outletCode);
           if (!outlet) return errorResponse('Outlet not found or inactive', 404);
 
-          // Requirement 3: Enforce outlet authorization
-          if (!canManageOutlet(outlet.id, outlet.code || outlet.outlet_code)) {
+          const resolvedOutletCode = String(outlet.code || outlet.outlet_code || outletCode).trim().toLowerCase();
+          if (!canManageOutlet(outlet.id, resolvedOutletCode)) {
             return errorResponse('Forbidden: You cannot modify staff status for this outlet', 403);
           }
 
-          if (!callerContext.isSuperadmin) {
+          const canManageAdminStatus = callerContext.isSuperadmin || isAuthoritativeOutletBackend(resolvedOutletCode);
+          if (!canManageAdminStatus) {
             const { data: targetRole, error: targetRoleError } = await supabaseAdmin
               .from('smav_user_outlet_roles').select('role').eq('user_id', targetUserId)
               .eq('outlet_id', outlet.id).maybeSingle();
-            if (targetRoleError || !targetRole || String(targetRole.role).toUpperCase() !== 'STAFF')
+            if (targetRoleError || !targetRole || String(targetRole.role).toUpperCase() !== 'STAFF') {
               return errorResponse('Forbidden: Outlet ADMINs can only change STAFF status', 403);
+            }
           }
 
           // Toggle outlet-specific membership status
           const { error: updateErr } = await supabaseAdmin
             .from('smav_user_outlet_roles')
-            .update({ is_active: Boolean(isActive) })
+            .update({ is_active: desiredActive })
             .eq('user_id', targetUserId)
             .eq('outlet_id', outlet.id);
 
@@ -1468,12 +1694,20 @@ Deno.serve(async (req: Request) => {
             return errorResponse(`Failed to update outlet status: ${updateErr.message}`, 400);
           }
 
+          // Synchronize smav_profiles.is_active & Supabase Auth ban_duration if user has no other active outlets
+          const effectiveStatus = await syncEffectiveAccountStatus(targetUserId, desiredActive, outlet.id);
+
           await recordAudit({
-            action: isActive ? 'ACTIVATE_OUTLET_STAFF' : 'DEACTIVATE_OUTLET_STAFF',
+            action: desiredActive ? 'ACTIVATE_OUTLET_STAFF' : 'DEACTIVATE_OUTLET_STAFF',
             entityType: 'USER_OUTLET_ROLE',
             entityId: `${targetUserId}_${outlet.id}`,
             outletId: outlet.id,
-            details: { targetUserId, isActive: Boolean(isActive) },
+            details: {
+              targetUserId,
+              outletCode: resolvedOutletCode,
+              isActive: desiredActive,
+              globallyActive: effectiveStatus.globallyActive,
+            },
           });
         } else {
           // Global status toggle strictly requires authenticated SUPERADMIN
@@ -1483,16 +1717,15 @@ Deno.serve(async (req: Request) => {
 
           const { error: profileErr } = await supabaseAdmin
             .from('smav_profiles')
-            .update({ is_active: Boolean(isActive) })
+            .update({ is_active: desiredActive })
             .eq('id', targetUserId);
 
           if (profileErr) {
             return errorResponse(`Failed to update profile status: ${profileErr.message}`, 400);
           }
 
-          // Synchronize auth user ban duration
           const { error: banErr } = await supabaseAdmin.auth.admin.updateUserById(targetUserId, {
-            ban_duration: isActive ? 'none' : '876000h',
+            ban_duration: desiredActive ? 'none' : '876000h',
           });
 
           if (banErr) {
@@ -1500,18 +1733,19 @@ Deno.serve(async (req: Request) => {
           }
 
           await recordAudit({
-            action: isActive ? 'GLOBAL_ACTIVATE_USER' : 'GLOBAL_DEACTIVATE_USER',
+            action: desiredActive ? 'GLOBAL_ACTIVATE_USER' : 'GLOBAL_DEACTIVATE_USER',
             entityType: 'USER',
             entityId: targetUserId,
-            details: { targetUserId, isActive: Boolean(isActive) },
+            details: { targetUserId, isActive: desiredActive },
           });
         }
 
         return jsonResponse({
           success: true,
-          message: `Staff member ${isActive ? 'activated' : 'deactivated'} successfully`,
+          message: `Staff member ${desiredActive ? 'activated' : 'deactivated'} successfully`,
           userId: targetUserId,
-          isActive: Boolean(isActive),
+          email: targetUser.email || undefined,
+          isActive: desiredActive,
         });
       }
 
@@ -1625,52 +1859,58 @@ Deno.serve(async (req: Request) => {
         return errorResponse('Invalid stage. Use preflight, release-email, or assign-email.',400);
       }
       case 'update-email': {
-        if (callerContext.isServiceOrBackend || !callerContext.callerUserId) {
-          return errorResponse('A verified central admin session is required for email updates', 403);
+        const { userId, externalStaffId, newEmail, outletCode } = body;
+        const resolvedSource = String(outletCode || callerContext.businessSource || '').trim().toLowerCase();
+        const isAuthBackend = isAuthoritativeOutletBackend(resolvedSource);
+
+        if (!isAuthBackend && !callerContext.callerUserId) {
+          return errorResponse('A verified central admin session or authoritative outlet integration key is required for email updates', 403);
         }
-        const { userId, newEmail, outletCode } = body;
-        if (typeof userId !== 'string' || !/^[0-9a-f-]{36}$/i.test(userId)) {
-          return errorResponse('A valid target userId is required', 400);
+        if (typeof newEmail !== 'string' || !validateReachableEmail(newEmail).valid) {
+          return errorResponse(validateReachableEmail(String(newEmail || '')).reason || 'A valid newEmail is required', 400);
         }
-        if (typeof newEmail !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail.trim()) || newEmail.length > 254) {
-          return errorResponse('A valid newEmail is required', 400);
-        }
-        const target = await findAuthUser({ id: userId });
+
+        const target = await resolveAuthUserByAnyIdentifier({
+          userId: typeof userId === 'string' ? userId : undefined,
+          externalStaffId: typeof externalStaffId === 'string' ? externalStaffId : undefined,
+          outletCode: resolvedSource || undefined,
+        });
         if (!target) return errorResponse('Target account not found', 404);
+
+        const targetUserId = target.id;
         const { data: profile, error: pErr } = await supabaseAdmin.from('smav_profiles')
-          .select('platform_role').eq('id', userId).maybeSingle();
+          .select('platform_role').eq('id', targetUserId).maybeSingle();
         if (pErr || !profile) return errorResponse('Unable to verify target profile', 403);
         if (String(profile.platform_role).toUpperCase() === 'SUPERADMIN') {
           return errorResponse('SUPERADMIN email changes require the standard recovery process', 403);
         }
-        if (!callerContext.isSuperadmin) {
+        if (!callerContext.isSuperadmin && !isAuthBackend) {
           if (typeof outletCode !== 'string' || !outletCode) return errorResponse('outletCode is required', 400);
           const outlet = await resolveOutlet(outletCode);
           if (!outlet || !canManageOutlet(outlet.id, outlet.code || outlet.outlet_code)) {
             return errorResponse('Caller cannot administer this outlet', 403);
           }
           const { data: targetRole, error: rErr } = await supabaseAdmin.from('smav_user_outlet_roles')
-            .select('role,is_active').eq('user_id', userId).eq('outlet_id', outlet.id).maybeSingle();
+            .select('role,is_active').eq('user_id', targetUserId).eq('outlet_id', outlet.id).maybeSingle();
           if (rErr || !targetRole || !targetRole.is_active || String(targetRole.role).toUpperCase() !== 'STAFF') {
             return errorResponse('Outlet ADMIN may only change active STAFF email addresses', 403);
           }
         }
         const cleanEmail = newEmail.trim().toLowerCase();
-        if (target.email?.toLowerCase() === cleanEmail) return jsonResponse({ success: true, userId, unchanged: true });
-        const { error: changeErr } = await supabaseAdmin.auth.admin.updateUserById(userId, {
+        if (target.email?.toLowerCase() === cleanEmail) return jsonResponse({ success: true, userId: targetUserId, email: cleanEmail, unchanged: true });
+        const { error: changeErr } = await supabaseAdmin.auth.admin.updateUserById(targetUserId, {
           email: cleanEmail, email_confirm: true,
         });
-        if (changeErr) return errorResponse(`Email update failed: ${changeErr.message}`, 400);
-        // Keep linked identity metadata in sync; never recreate the auth account.
+        if (changeErr) return errorResponse(`Email update failed: ${changeErr.message}`, 409);
         const { error: linkErr } = await supabaseAdmin.from('smav_external_identities')
-          .update({ email: cleanEmail }).eq('auth_user_id', userId);
+          .update({ email: cleanEmail }).eq('auth_user_id', targetUserId);
         if (linkErr) {
           console.error('Email updated in Auth but external identity metadata update failed', linkErr);
           return errorResponse('Email changed in Auth, but identity metadata sync needs administrator attention', 500);
         }
-        await recordAudit({ action: 'UPDATE_EMAIL', entityType: 'USER', entityId: userId,
-          details: { previousEmail: target.email || null, newEmail: cleanEmail, byCaller: callerContext.callerEmail || callerContext.callerUserId } });
-        return jsonResponse({ success: true, userId, email: cleanEmail });
+        await recordAudit({ action: 'UPDATE_EMAIL', entityType: 'USER', entityId: targetUserId,
+          details: { previousEmail: target.email || null, newEmail: cleanEmail, byCaller: callerContext.callerEmail || callerContext.businessSource || callerContext.callerUserId } });
+        return jsonResponse({ success: true, userId: targetUserId, email: cleanEmail });
       }
 
       case 'send-activation':
@@ -1683,12 +1923,13 @@ Deno.serve(async (req: Request) => {
 
       case 'reset-password':
       case 'reset_password': {
-        const { email, userId, newPassword, temporaryPassword, outletCode } = body;
+        const { email, userId, externalStaffId, newPassword, temporaryPassword, outletCode, mustChangePassword } = body;
         const cleanUserId = typeof userId === 'string' && userId.trim() !== '' && userId.trim() !== 'undefined' ? userId.trim() : undefined;
         const cleanEmail = typeof email === 'string' && email.trim() !== '' && email.trim() !== 'undefined' ? email.trim().toLowerCase() : undefined;
+        const cleanExternalId = typeof externalStaffId === 'string' && externalStaffId.trim() !== '' ? externalStaffId.trim() : undefined;
 
-        if (!cleanUserId && !cleanEmail) {
-          return errorResponse('Target userId or email is required for password reset', 400);
+        if (!cleanUserId && !cleanEmail && !cleanExternalId) {
+          return errorResponse('Target userId, externalStaffId, or email is required for password reset', 400);
         }
 
         const assignedPassword = newPassword ?? temporaryPassword;
@@ -1697,10 +1938,15 @@ Deno.serve(async (req: Request) => {
           return errorResponse(`${pwdErr}. Recovery links are retired; supply newPassword.`, 400);
         }
 
-        const targetUser = await findAuthUser({ id: cleanUserId, email: cleanEmail });
+        const targetUser = await resolveAuthUserByAnyIdentifier({
+          userId: cleanUserId,
+          email: cleanEmail,
+          externalStaffId: cleanExternalId,
+          outletCode: typeof outletCode === 'string' ? outletCode : callerContext.businessSource,
+        });
         if (!targetUser) {
           return errorResponse(
-            `Target user not found in Central Supabase Auth for "${cleanEmail || cleanUserId}"`,
+            `Target user not found in Central Supabase Auth for "${cleanEmail || cleanUserId || cleanExternalId}"`,
             404
           );
         }
@@ -1724,20 +1970,27 @@ Deno.serve(async (req: Request) => {
 
         if (!callerContext.isSuperadmin) {
           if (isTargetSuperadmin) return errorResponse('Forbidden: Cannot reset SUPERADMIN password', 403);
-          if (!outletCode) return errorResponse('outletCode is required for outlet staff password resets', 400);
-          const outlet = await resolveOutlet(String(outletCode));
-          if (!outlet || !canManageOutlet(outlet.id, outlet.code || outlet.outlet_code)) {
+          const effectiveOutletCode = String(outletCode || callerContext.businessSource || '').trim();
+          if (!effectiveOutletCode) return errorResponse('outletCode is required for outlet staff password resets', 400);
+          const outlet = await resolveOutlet(effectiveOutletCode);
+          const code = String(outlet?.code || outlet?.outlet_code || effectiveOutletCode).trim().toLowerCase();
+          if (!outlet || !canManageOutlet(outlet.id, code)) {
             return errorResponse('Forbidden: Outlet not active or not administered by caller', 403);
           }
           resolvedOutletId = outlet.id;
-          resolvedOutletCode = outlet.code || outlet.outlet_code;
+          resolvedOutletCode = code;
+
+          const isAuthBackend = isAuthoritativeOutletBackend(code);
           const { data: targetRole, error: targetRoleError } = await supabaseAdmin
             .from('smav_user_outlet_roles')
             .select('role, is_active')
             .eq('user_id', targetUserId)
             .eq('outlet_id', outlet.id)
             .maybeSingle();
-          if (targetRoleError || !targetRole || String(targetRole.role).toUpperCase() !== 'STAFF') {
+          if (targetRoleError || !targetRole) {
+            return errorResponse('Forbidden: Target user is not assigned to this outlet', 403);
+          }
+          if (!isAuthBackend && String(targetRole.role).toUpperCase() !== 'STAFF') {
             return errorResponse('Forbidden: Outlet ADMINs can only reset STAFF passwords', 403);
           }
         } else if (outletCode) {
@@ -1748,11 +2001,12 @@ Deno.serve(async (req: Request) => {
           }
         }
 
+        const enforceMustChange = mustChangePassword !== false;
         const { error: resetErr } = await supabaseAdmin.auth.admin.updateUserById(targetUserId, {
           password: String(assignedPassword),
           user_metadata: {
             ...(targetUser.user_metadata || {}),
-            must_change_password: true,
+            must_change_password: enforceMustChange,
             password_assigned_at: new Date().toISOString(),
             password_reset_by: callerContext.callerEmail || callerContext.businessSource || 'admin',
           },
@@ -1770,7 +2024,7 @@ Deno.serve(async (req: Request) => {
           details: {
             targetEmail,
             outletCode: resolvedOutletCode,
-            mustChangePassword: true,
+            mustChangePassword: enforceMustChange,
             byCaller: callerContext.callerEmail || callerContext.businessSource || 'admin',
           },
         });
@@ -1780,7 +2034,7 @@ Deno.serve(async (req: Request) => {
           message: `Temporary password assigned for "${targetEmail}". User will be required to change it on next sign-in.`,
           userId: targetUserId,
           email: targetEmail,
-          mustChangePassword: true,
+          mustChangePassword: enforceMustChange,
         });
       }
 
@@ -1864,6 +2118,7 @@ Deno.serve(async (req: Request) => {
             const authUser = authUserMap.get(r.user_id);
             const code = String(r.smav_outlets?.code || r.smav_outlets?.outlet_code || '').toLowerCase();
             const extIdent = extIdentMap.get(`${r.user_id}_${code}`) || extIdentMap.get(r.user_id);
+            const isBanned = Boolean(authUser?.banned_until && new Date(authUser.banned_until).getTime() > Date.now());
             return {
               id: r.user_id,
               userId: r.user_id,
@@ -1890,7 +2145,7 @@ Deno.serve(async (req: Request) => {
               lastSyncedAt: extIdent?.last_synced_at || null,
               syncOrigin: extIdent?.sync_origin || null,
               syncVersion: extIdent?.sync_version || 1,
-              isActive: Boolean(r.is_active && r.smav_profiles?.is_active !== false),
+              isActive: Boolean(r.is_active && r.smav_profiles?.is_active !== false && !isBanned),
             };
           }),
         });

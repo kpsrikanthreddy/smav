@@ -116,6 +116,14 @@ class AdminNetworkRepository(
         runCatching {
             val existing = sessionManager.getStaffSession() ?: throw UnauthorizedSessionException()
             val sessionResp = api.getAuthSession(SmavApiClient.bearer(existing.token))
+            if (sessionResp.code() == 401 || sessionResp.code() == 403) {
+                throw UnauthorizedSessionException(
+                    SmavApiClient.parseErrorMessage(
+                        sessionResp,
+                        "Your account is inactive or your session has expired. Please sign in again."
+                    )
+                )
+            }
             val sessionJson = SmavApiClient.unwrapOrThrow(sessionResp) { it }
             var updated = parseSessionPayload(sessionJson, existing.email, existing.token)
 

@@ -39,6 +39,8 @@ import com.smav.printagent.model.*
 import com.smav.printagent.network.*
 import com.smav.printagent.ui.components.*
 import com.smav.printagent.ui.screens.*
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.smav.printagent.ui.theme.SMAVTheme
 import com.smav.printagent.ui.theme.SmavColors
 import kotlinx.coroutines.launch
@@ -80,9 +82,9 @@ class MainActivity : ComponentActivity() {
                 var pendingOutlets by remember { mutableStateOf<List<AvailableBusinessOption>>(emptyList()) }
                 var pendingSelectionBusy by remember { mutableStateOf(false) }
 
-                // Background startup session validation (never wipes Room bills on 401)
-                LaunchedEffect(Unit) {
-                    if (active != null) {
+                fun revalidateActiveSession() {
+                    if (active == null) return
+                    scope.launch {
                         adminRepo.validateCurrentSession()
                             .onSuccess { refreshed ->
                                 active = refreshed
@@ -92,11 +94,37 @@ class MainActivity : ComponentActivity() {
                                 if (err is UnauthorizedSessionException) {
                                     sessions.clearSession()
                                     active = null
-                                    authErrorMessage = err.message ?: "Your session has expired. Please sign in again."
+                                    authErrorMessage = err.message
+                                        ?: "Your account is inactive or your session has expired. Please sign in again."
+                                } else if (sessions.isOfflineAuthorizationExpired()) {
+                                    sessions.clearSession()
+                                    active = null
+                                    isOnline = false
+                                    authErrorMessage =
+                                        "Offline authorization window expired. Please reconnect to the internet and sign in again."
                                 } else {
                                     isOnline = false
                                 }
                             }
+                    }
+                }
+
+                // Background startup session validation (never wipes Room bills on 401/offline expiry)
+                LaunchedEffect(Unit) {
+                    revalidateActiveSession()
+                }
+
+                // Revalidate session every time the POS returns to foreground so deactivated or
+                // role-updated users are refreshed immediately when connectivity is available.
+                DisposableEffect(this@MainActivity) {
+                    val observer = LifecycleEventObserver { _, event ->
+                        if (event == Lifecycle.Event.ON_RESUME && active != null) {
+                            revalidateActiveSession()
+                        }
+                    }
+                    this@MainActivity.lifecycle.addObserver(observer)
+                    onDispose {
+                        this@MainActivity.lifecycle.removeObserver(observer)
                     }
                 }
 

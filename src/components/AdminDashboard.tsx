@@ -298,7 +298,30 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
     }
   };
 
+  const handleResolveOutbox = async (outboxId: string) => {
+    setIsActionLoading(true);
+    setActionError(null);
+    setActionSuccess(null);
+    try {
+      const res = await identityAdminService.resolveSyncOutboxItem(session.token, outboxId);
+      if (res.success) {
+        setActionSuccess(res.message);
+      } else {
+        setActionError(res.message);
+      }
+      await fetchAdminData();
+    } finally {
+      setIsActionLoading(false);
+    }
+  };
+
   const pendingOutbox = outboxItems.filter((i) => i.status !== 'SYNCED');
+  const isExternallyManaged =
+    session.activeOutlet.code?.trim().toLowerCase() === 'glossylooks' ||
+    staffList.some((u) => Boolean(u.managedByOutlet));
+  const managedByLabel =
+    staffList.find((u) => u.managedByLabel)?.managedByLabel || 'Managed by Glossy Looks';
+  const canMutateOutletUsers = !isExternallyManaged || isSuperadmin;
 
   return (
     <div className="space-y-5">
@@ -398,11 +421,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
         <div className="space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <h3 className="text-sm font-bold text-[#2F3033]">
-                User Management — {session.activeOutlet.name}
-              </h3>
+              <div className="flex items-center gap-2 flex-wrap">
+                <h3 className="text-sm font-bold text-[#2F3033]">
+                  User Management — {session.activeOutlet.name}
+                </h3>
+                {isExternallyManaged && <StatusBadge label={managedByLabel} tone="info" />}
+              </div>
               <p className="text-xs text-[#6F737D]">
-                Synchronized automatically with Central SMAV Auth and this outlet.
+                {isExternallyManaged
+                  ? 'Authoritative staff directory synced automatically from Glossy Looks Admin Portal.'
+                  : 'Synchronized automatically with Central SMAV Auth and this outlet.'}
               </p>
             </div>
             <div className="flex items-center gap-2">
@@ -414,18 +442,42 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
               >
                 Refresh
               </Button>
-              <Button
-                size="sm"
-                onClick={() => {
-                  setActionError(null);
-                  setIsAddUserOpen(true);
-                }}
-                leftIcon={<UserPlus className="w-3.5 h-3.5" />}
-              >
-                Add User
-              </Button>
+              {canMutateOutletUsers && (
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    setActionError(null);
+                    setIsAddUserOpen(true);
+                  }}
+                  leftIcon={<UserPlus className="w-3.5 h-3.5" />}
+                >
+                  {isExternallyManaged ? 'Emergency Add User' : 'Add User'}
+                </Button>
+              )}
             </div>
           </div>
+
+          {isExternallyManaged && (
+            <Card
+              padding="md"
+              className="border-[#BFDBFE] bg-[#EFF6FF] flex flex-wrap items-start justify-between gap-3"
+            >
+              <div className="space-y-1">
+                <div className="flex items-center gap-2 text-xs font-bold text-[#1D4ED8]">
+                  <ShieldCheck className="w-4 h-4 shrink-0" />
+                  <span>
+                    {managedByLabel}
+                    {isSuperadmin ? ' · SUPERADMIN Emergency Recovery Mode' : ' · Read-Only View'}
+                  </span>
+                </div>
+                <p className="text-xs text-[#1E40AF] leading-relaxed">
+                  {isSuperadmin
+                    ? 'Glossy Looks Admin Portal is the authoritative source for creating, updating, deactivating, and resetting passwords for these users. Changes performed here by SUPERADMIN are permitted only for emergency recovery and are audit logged.'
+                    : 'User creation, email updates, role assignments, activation/deactivation, and password resets must be performed in the Glossy Looks Admin Portal. Updates synchronize automatically to SMAV.'}
+                </p>
+              </div>
+            </Card>
+          )}
 
           {actionError && (
             <div
@@ -545,56 +597,68 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
                 align: 'right',
                 render: (user) => {
                   const visibleRole = getVisibleRole(user.outletRole || user.displayRole || user.role);
+                  const rowExternallyManaged = Boolean(user.managedByOutlet || isExternallyManaged);
+                  const rowManagedLabel = user.managedByLabel || managedByLabel;
                   const isProtected = user.platformRole === 'SUPERADMIN' || visibleRole === 'ADMIN';
+                  if (rowExternallyManaged && !isSuperadmin) {
+                    return <StatusBadge label={rowManagedLabel} tone="info" />;
+                  }
                   const canManageRow = isSuperadmin || !isProtected;
                   if (!canManageRow) {
                     return <span className="text-[11px] text-[#6F737D]">SUPERADMIN Managed</span>;
                   }
                   return (
-                    <div className="flex flex-wrap items-center justify-end gap-1.5">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={isActionLoading}
-                        onClick={() => {
-                          setActionError(null);
-                          setEditingUser(user);
-                          setEditUserForm({
-                            fullName: user.fullName || '',
-                            username: user.username || '',
-                            email: user.email || '',
-                            phone: user.phone || '',
-                            role: visibleRole === 'ADMIN' ? 'ADMIN' : 'STAFF',
-                          });
-                        }}
-                        leftIcon={<Edit2 className="w-3 h-3" />}
-                      >
-                        Edit
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={isActionLoading}
-                        onClick={() => {
-                          setActionError(null);
-                          setResetTarget(user);
-                          setResetNewPassword('');
-                          setResetConfirmPassword('');
-                        }}
-                        leftIcon={<KeyRound className="w-3 h-3" />}
-                      >
-                        Reset Password
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant={user.isActive ? 'danger' : 'success'}
-                        disabled={isActionLoading}
-                        onClick={() =>
-                          user.isActive ? setConfirmToggleUser(user) : void executeToggleStatus(user)
-                        }
-                      >
-                        {user.isActive ? 'Disable' : 'Enable'}
-                      </Button>
+                    <div className="space-y-1">
+                      {rowExternallyManaged && isSuperadmin && (
+                        <div className="text-[10px] font-semibold text-[#B45309] text-right">
+                          Emergency Override (Audited)
+                        </div>
+                      )}
+                      <div className="flex flex-wrap items-center justify-end gap-1.5">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={isActionLoading}
+                          onClick={() => {
+                            setActionError(null);
+                            setEditingUser(user);
+                            setEditUserForm({
+                              fullName: user.fullName || '',
+                              username: user.username || '',
+                              email: user.email || '',
+                              phone: user.phone || '',
+                              role: visibleRole === 'ADMIN' ? 'ADMIN' : 'STAFF',
+                            });
+                          }}
+                          leftIcon={<Edit2 className="w-3 h-3" />}
+                        >
+                          Edit
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={isActionLoading}
+                          onClick={() => {
+                            setActionError(null);
+                            setResetTarget(user);
+                            setResetNewPassword('');
+                            setResetConfirmPassword('');
+                          }}
+                          leftIcon={<KeyRound className="w-3 h-3" />}
+                        >
+                          Reset Password
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant={user.isActive ? 'danger' : 'success'}
+                          disabled={isActionLoading}
+                          onClick={() =>
+                            user.isActive ? setConfirmToggleUser(user) : void executeToggleStatus(user)
+                          }
+                        >
+                          {user.isActive ? 'Disable' : 'Enable'}
+                        </Button>
+                      </div>
                     </div>
                   );
                 },
@@ -602,8 +666,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
             ]}
             renderMobileCard={(user) => {
               const visibleRole = getVisibleRole(user.outletRole || user.displayRole || user.role);
+              const rowExternallyManaged = Boolean(user.managedByOutlet || isExternallyManaged);
+              const rowManagedLabel = user.managedByLabel || managedByLabel;
               const isProtected = user.platformRole === 'SUPERADMIN' || visibleRole === 'ADMIN';
-              const canManageRow = isSuperadmin || !isProtected;
+              const canManageRow = rowExternallyManaged
+                ? isSuperadmin
+                : isSuperadmin || !isProtected;
               return (
                 <div className="space-y-2.5 text-xs">
                   <div className="flex items-start justify-between gap-2">
@@ -620,9 +688,22 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
                     <StatusBadge
-                      label={!user.isActive ? 'DISABLED' : user.syncStatus.toUpperCase()}
-                      tone={!user.isActive ? 'danger' : 'success'}
+                      label={
+                        !user.isActive
+                          ? 'DISABLED'
+                          : user.syncStatus === 'pending_outlet_sync'
+                            ? 'OUTBOX PENDING'
+                            : user.syncStatus.toUpperCase()
+                      }
+                      tone={
+                        !user.isActive
+                          ? 'danger'
+                          : user.syncStatus === 'pending_outlet_sync'
+                            ? 'warning'
+                            : 'success'
+                      }
                     />
+                    {rowExternallyManaged && <StatusBadge label={rowManagedLabel} tone="info" />}
                     {user.mustChangePassword && user.isActive && (
                       <span className="text-[11px] text-[#B45309] font-medium">
                         Password change pending
@@ -697,15 +778,27 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
                         <div className="text-[11px] text-[#6F737D] mt-0.5">{item.lastError}</div>
                       )}
                     </div>
-                    {item.status !== 'CONFLICT' && (
-                      <Button
-                        size="sm"
-                        disabled={isActionLoading}
-                        onClick={() => handleRetryOutbox(item.id)}
-                      >
-                        Retry Sync
-                      </Button>
-                    )}
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {item.status !== 'CONFLICT' && (
+                        <Button
+                          size="sm"
+                          disabled={isActionLoading}
+                          onClick={() => handleRetryOutbox(item.id)}
+                        >
+                          Retry Sync
+                        </Button>
+                      )}
+                      {isSuperadmin && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={isActionLoading}
+                          onClick={() => handleResolveOutbox(item.id)}
+                        >
+                          Resolve Stale
+                        </Button>
+                      )}
+                    </div>
                   </div>
                 ))}
               </div>

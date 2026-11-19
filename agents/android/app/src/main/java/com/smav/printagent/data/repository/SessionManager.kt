@@ -131,6 +131,22 @@ class SessionManager(context: Context) {
 
     fun isLoggedIn(): Boolean = prefs.getBoolean(KEY_IS_LOGGED_IN, false)
 
+    fun touchSessionValidatedAt(timestampMs: Long = System.currentTimeMillis()) {
+        if (isLoggedIn()) {
+            prefs.edit().putLong(KEY_LAST_LOGIN_TIME, timestampMs).apply()
+        }
+    }
+
+    /**
+     * Prevents indefinite offline POS access on stale or deactivated credentials.
+     * Devices must revalidate against Central SMAV Auth within OFFLINE_AUTH_GRACE_MS.
+     */
+    fun isOfflineAuthorizationExpired(nowMs: Long = System.currentTimeMillis()): Boolean {
+        val lastValidated = prefs.getLong(KEY_LAST_LOGIN_TIME, 0L)
+        if (lastValidated <= 0L) return true
+        return (nowMs - lastValidated) > OFFLINE_AUTH_GRACE_MS
+    }
+
     /**
      * Clears authentication tokens and role/outlet session state on sign out.
      * Intentionally preserves deviceId, printer pairings, and ALL unsynchronized Room bills/orders.
@@ -240,5 +256,6 @@ class SessionManager(context: Context) {
         private const val KEY_LAST_LOGIN_TIME = "last_login_time"
         private const val KEY_PAPER_WIDTH = "paper_width"
         private const val KEY_SERVER_URL = "server_url"
+        const val OFFLINE_AUTH_GRACE_MS: Long = 24L * 60L * 60L * 1000L
     }
 }

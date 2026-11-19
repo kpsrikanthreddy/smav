@@ -267,6 +267,39 @@ export class IdentityAdminService {
       };
     }
   }
+
+  async resolveSyncOutboxItem(
+    sessionToken: string,
+    outboxId: string,
+    reason?: string
+  ): Promise<{ success: boolean; message: string; item?: SyncOutboxItem }> {
+    try {
+      const response = await fetch(`/api/sync/outbox/${encodeURIComponent(outboxId)}/resolve`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({
+          reason: reason || 'Resolved by SUPERADMIN after confirming authoritative outlet sync.',
+        }),
+      });
+      const data = await response.json().catch(() => ({
+        success: false,
+        message: `HTTP ${response.status}: Invalid server response`,
+      }));
+      return {
+        success: Boolean(response.ok && data.success !== false),
+        message: data.message || data.error || 'Outbox item resolved.',
+        item: data.item,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        message: `Network error resolving sync item: ${err?.message || 'Unknown error'}`,
+      };
+    }
+  }
 }
 
 export const identityAdminService = new IdentityAdminService();

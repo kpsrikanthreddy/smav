@@ -260,6 +260,21 @@ export const PortalAuthDashboard: React.FC<PortalAuthDashboardProps> = ({
     }
   };
 
+  const handleResolveOutbox = async (id: string) => {
+    setIsActionLoading(true);
+    setFeedback(null);
+    try {
+      const res = await identityAdminService.resolveSyncOutboxItem(session.token, id);
+      setFeedback({
+        type: res.success ? 'success' : 'error',
+        message: res.message,
+      });
+      await loadData();
+    } finally {
+      setIsActionLoading(false);
+    }
+  };
+
   const syncedOutboxCount = outboxItems.filter((i) => i.status === 'SYNCED').length;
   const pendingOutboxCount = outboxItems.filter(
     (i) => i.status === 'PARTIAL_CENTRAL_ONLY' || i.status === 'PENDING' || i.status === 'FAILED'
@@ -387,10 +402,16 @@ export const PortalAuthDashboard: React.FC<PortalAuthDashboardProps> = ({
               header: 'User & UUID',
               render: (user) => (
                 <div className="space-y-0.5">
-                  <div className="font-bold text-[#2F3033] flex items-center gap-2">
+                  <div className="font-bold text-[#2F3033] flex items-center gap-2 flex-wrap">
                     <span>{user.fullName}</span>
                     {user.platformRole === 'SUPERADMIN' && (
                       <StatusBadge label="SUPERADMIN" tone="brand" />
+                    )}
+                    {(user.managedByOutlet || user.outletCode?.toLowerCase() === 'glossylooks') && (
+                      <StatusBadge
+                        label={user.managedByLabel || 'Managed by Glossy Looks'}
+                        tone="info"
+                      />
                     )}
                   </div>
                   <div className="font-mono text-[11px] text-[#2F3033]">
@@ -477,67 +498,77 @@ export const PortalAuthDashboard: React.FC<PortalAuthDashboardProps> = ({
               render: (user) => {
                 const visibleRole = getVisibleRole(user.outletRole || user.displayRole || user.role);
                 const isProtectedSuper = user.platformRole === 'SUPERADMIN';
+                const isExternallyManagedRow = Boolean(
+                  user.managedByOutlet || user.outletCode?.toLowerCase() === 'glossylooks'
+                );
                 return (
-                  <div className="flex flex-wrap items-center justify-end gap-1.5">
-                    {!isProtectedSuper && (
-                      <>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={isActionLoading}
-                          onClick={() => {
-                            setFeedback(null);
-                            setEditingUser(user);
-                            setEditForm({
-                              outletCode: user.outletCode,
-                              fullName: user.fullName || '',
-                              username: user.username || '',
-                              email: user.email || '',
-                              phone: user.phone || '',
-                              role: visibleRole === 'ADMIN' ? 'ADMIN' : 'STAFF',
-                            });
-                          }}
-                          leftIcon={<Edit2 className="w-3 h-3" />}
-                        >
-                          Edit
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={isActionLoading}
-                          onClick={() => {
-                            setFeedback(null);
-                            setResetTarget(user);
-                            setResetNewPassword('');
-                            setResetConfirmPassword('');
-                          }}
-                          leftIcon={<KeyRound className="w-3 h-3" />}
-                        >
-                          Reset Password
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant={user.isActive ? 'danger' : 'success'}
-                          disabled={isActionLoading}
-                          onClick={() =>
-                            user.isActive
-                              ? setConfirmToggleUser(user)
-                              : void executeToggleStatus(user)
-                          }
-                        >
-                          {user.isActive ? 'Disable' : 'Enable'}
-                        </Button>
-                      </>
+                  <div className="space-y-1">
+                    {isExternallyManagedRow && !isProtectedSuper && (
+                      <div className="text-[10px] font-semibold text-[#B45309] text-right">
+                        SUPERADMIN Emergency Override
+                      </div>
                     )}
-                    {user.outletId && (
-                      <Button
-                        size="sm"
-                        onClick={() => onLaunchOutletPos(user.outletId)}
-                        leftIcon={<Play className="w-3 h-3 fill-current" />}
-                      >
-                        POS
-                      </Button>
-                    )}
+                    <div className="flex flex-wrap items-center justify-end gap-1.5">
+                      {!isProtectedSuper && (
+                        <>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={isActionLoading}
+                            onClick={() => {
+                              setFeedback(null);
+                              setEditingUser(user);
+                              setEditForm({
+                                outletCode: user.outletCode,
+                                fullName: user.fullName || '',
+                                username: user.username || '',
+                                email: user.email || '',
+                                phone: user.phone || '',
+                                role: visibleRole === 'ADMIN' ? 'ADMIN' : 'STAFF',
+                              });
+                            }}
+                            leftIcon={<Edit2 className="w-3 h-3" />}
+                          >
+                            Edit
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={isActionLoading}
+                            onClick={() => {
+                              setFeedback(null);
+                              setResetTarget(user);
+                              setResetNewPassword('');
+                              setResetConfirmPassword('');
+                            }}
+                            leftIcon={<KeyRound className="w-3 h-3" />}
+                          >
+                            Reset Password
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant={user.isActive ? 'danger' : 'success'}
+                            disabled={isActionLoading}
+                            onClick={() =>
+                              user.isActive
+                                ? setConfirmToggleUser(user)
+                                : void executeToggleStatus(user)
+                            }
+                          >
+                            {user.isActive ? 'Disable' : 'Enable'}
+                          </Button>
+                        </>
+                      )}
+                      {user.outletId && (
+                        <Button
+                          size="sm"
+                          onClick={() => onLaunchOutletPos(user.outletId)}
+                          leftIcon={<Play className="w-3 h-3 fill-current" />}
+                        >
+                          POS
+                        </Button>
+                      )}
+                    </div>
                   </div>
                 );
               },
@@ -728,14 +759,26 @@ export const PortalAuthDashboard: React.FC<PortalAuthDashboardProps> = ({
                 header: 'Action',
                 align: 'right',
                 render: (item) =>
-                  item.status !== 'SYNCED' && item.status !== 'CONFLICT' ? (
-                    <Button
-                      size="sm"
-                      disabled={isActionLoading}
-                      onClick={() => handleRetryOutbox(item.id)}
-                    >
-                      Retry Sync
-                    </Button>
+                  item.status !== 'SYNCED' ? (
+                    <div className="flex flex-wrap items-center justify-end gap-1.5">
+                      {item.status !== 'CONFLICT' && (
+                        <Button
+                          size="sm"
+                          disabled={isActionLoading}
+                          onClick={() => handleRetryOutbox(item.id)}
+                        >
+                          Retry Sync
+                        </Button>
+                      )}
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={isActionLoading}
+                        onClick={() => handleResolveOutbox(item.id)}
+                      >
+                        Resolve Stale
+                      </Button>
+                    </div>
                   ) : (
                     <span className="text-[#6F737D]">—</span>
                   ),
@@ -763,14 +806,26 @@ export const PortalAuthDashboard: React.FC<PortalAuthDashboardProps> = ({
                   />
                 </div>
                 {item.lastError && <p className="text-[11px] text-[#B45309]">{item.lastError}</p>}
-                {item.status !== 'SYNCED' && item.status !== 'CONFLICT' && (
-                  <Button
-                    size="sm"
-                    disabled={isActionLoading}
-                    onClick={() => handleRetryOutbox(item.id)}
-                  >
-                    Retry Sync
-                  </Button>
+                {item.status !== 'SYNCED' && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    {item.status !== 'CONFLICT' && (
+                      <Button
+                        size="sm"
+                        disabled={isActionLoading}
+                        onClick={() => handleRetryOutbox(item.id)}
+                      >
+                        Retry Sync
+                      </Button>
+                    )}
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={isActionLoading}
+                      onClick={() => handleResolveOutbox(item.id)}
+                    >
+                      Resolve Stale
+                    </Button>
+                  </div>
                 )}
               </div>
             )}
