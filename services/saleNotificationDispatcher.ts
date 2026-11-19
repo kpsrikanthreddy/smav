@@ -47,8 +47,23 @@ export interface InternalDispatcherRuntimeState {
 const FEEDBACK_DELAY_MS = 2 * 60_000;
 // Allow scheduler polling & retry jitter (3 min past scheduled_at = up to 5 min past billed_at)
 const FEEDBACK_GRACE_MS = 3 * 60_000;
+// Allow downstream serverless cold start + DB persistence + Meta WhatsApp API round-trip
+const DISPATCH_TIMEOUT_MS = 25_000;
 const MEMORY_STEP_LOG_LIMIT = 120;
 const memoryStepLogs: StepLogEntry[] = [];
+
+function isMissingColumnError(err: { code?: string; message?: string } | null | undefined): boolean {
+  if (!err) return false;
+  const code = String(err.code || '').toUpperCase();
+  const msg = String(err.message || '');
+  return (
+    code === '42703' ||
+    code === 'PGRST204' ||
+    /column .* does not exist/i.test(msg) ||
+    /could not find .* column/i.test(msg) ||
+    /schema cache/i.test(msg)
+  );
+}
 
 export function maskPhone(phone?: string | null): string | null {
   const digits = String(phone || '').replace(/\D+/g, '');
@@ -78,9 +93,15 @@ export function sanitizeUrlForDisplay(rawUrl?: string | null): string | null {
   }
 }
 
+function asPlainObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
 export function sanitizeReceiverResponse(raw: unknown): Record<string, unknown> | null {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const obj = raw as Record<string, unknown>;
+  const obj = asPlainObject(raw);
+  if (!obj) return null;
   const safe: Record<string, unknown> = {};
   const allowedKeys = [
     'success',
@@ -94,8 +115,19 @@ export function sanitizeReceiverResponse(raw: unknown): Record<string, unknown> 
     'saved',
     'whatsapp_status',
     'whatsappStatus',
+    'whatsapp_sent',
+    'whatsappSent',
+    'whatsapp_error',
+    'whatsappError',
+    'provider_status',
+    'providerStatus',
+    'delivery_status',
+    'deliveryStatus',
     'whatsapp_message_id',
     'whatsappMessageId',
+    'provider_message_id',
+    'providerMessageId',
+    'wamid',
     'message_id',
     'messageId',
     'template_name',
@@ -106,54 +138,381 @@ export function sanitizeReceiverResponse(raw: unknown): Record<string, unknown> 
     'message',
     'error'
   ];
-  for (const key of allowedKeys) {
-    if (obj[key] !== undefined && obj[key] !== null) {
-      const val = obj[key];
-      if (typeof val === 'string') {
-        safe[key] = sanitizeErrorMessage(val);
-      } else if (typeof val === 'number' || typeof val === 'boolean') {
-        safe[key] = val;
+  const copySafeFields = (src: Record<string, unknown>, target: Record<string, unknown>) => {
+    for (const key of allowedKeys) {
+      if (src[key] !== undefined && src[key] !== null) {
+        const val = src[key];
+        if (typeof val === 'string') {
+          target[key] = sanitizeErrorMessage(val);
+        } else if (typeof val === 'number' || typeof val === 'boolean') {
+          target[key] = val;
+        }
+      }
+    }
+  };
+
+  copySafeFields(obj, safe);
+
+  for (const nestedKey of ['whatsapp', 'result', 'data', 'notification', 'delivery', 'provider']) {
+    const nested = asPlainObject(obj[nestedKey]);
+    if (nested) {
+      const safeNested: Record<string, unknown> = {};
+      copySafeFields(nested, safeNested);
+      if (typeof nested.id === 'string' && nested.id.trim()) {
+        safeNested.id = sanitizeErrorMessage(nested.id.trim());
+      }
+      if (typeof nested.sent === 'boolean') {
+        safeNested.sent = nested.sent;
+      }
+      if (Array.isArray(nested.messages) && nested.messages.length > 0) {
+        const firstMsg = asPlainObject(nested.messages[0]);
+        if (firstMsg) {
+          if (typeof firstMsg.id === 'string') safeNested.message_id = sanitizeErrorMessage(firstMsg.id);
+          if (typeof firstMsg.message_status === 'string') {
+            safeNested.provider_status = sanitizeErrorMessage(firstMsg.message_status);
+          }
+        }
+      }
+      if (Object.keys(safeNested).length > 0) {
+        safe[nestedKey] = safeNested;
       }
     }
   }
+
   return Object.keys(safe).length > 0 ? safe : null;
 }
 
-function extractWhatsAppMetadata(parsed: Record<string, unknown> | null): {
-  downstreamStatus: string | null;
-  whatsappStatus: string | null;
+export type NormalizedWhatsAppStatus =
+  | 'confirmed_delivered'
+  | 'confirmed_read'
+  | 'whatsapp_api_accepted'
+  | 'downstream_accepted'
+  | 'skipped'
+  | 'failed';
+
+export function extractWhatsAppMetadata(
+  parsed: Record<string, unknown> | null,
+  httpOk = true
+): {
+  downstreamStatus: string;
+  whatsappStatus: NormalizedWhatsAppStatus;
+  rawProviderStatus: string | null;
   whatsappMessageId: string | null;
+  whatsappFailed: boolean;
+  whatsappError: string | null;
+  downstreamSkipped: boolean;
 } {
   if (!parsed) {
-    return { downstreamStatus: 'accepted', whatsappStatus: null, whatsappMessageId: null };
+    return {
+      downstreamStatus: httpOk ? 'accepted' : 'error',
+      whatsappStatus: httpOk ? 'downstream_accepted' : 'failed',
+      rawProviderStatus: null,
+      whatsappMessageId: null,
+      whatsappFailed: !httpOk,
+      whatsappError: null,
+      downstreamSkipped: false
+    };
   }
+
+  const nestedData = asPlainObject(parsed.data) || asPlainObject(parsed.result);
   const whatsappObj =
-    parsed.whatsapp && typeof parsed.whatsapp === 'object' && !Array.isArray(parsed.whatsapp)
-      ? (parsed.whatsapp as Record<string, unknown>)
-      : null;
-  const rawWaStatus =
-    parsed.whatsapp_status ??
-    parsed.whatsappStatus ??
-    whatsappObj?.status ??
-    null;
-  const rawWaId =
-    parsed.whatsapp_message_id ??
-    parsed.whatsappMessageId ??
-    parsed.message_id ??
-    parsed.messageId ??
-    whatsappObj?.message_id ??
-    whatsappObj?.messageId ??
-    null;
+    asPlainObject(parsed.whatsapp) ||
+    asPlainObject(nestedData?.whatsapp) ||
+    asPlainObject(parsed.notification) ||
+    asPlainObject(nestedData?.notification) ||
+    asPlainObject(parsed.delivery) ||
+    asPlainObject(nestedData?.delivery) ||
+    asPlainObject(parsed.provider) ||
+    asPlainObject(nestedData?.provider);
+
+  const metaMessages =
+    (Array.isArray(whatsappObj?.messages) ? whatsappObj.messages : null) ||
+    (Array.isArray(parsed.messages) ? parsed.messages : null);
+  const firstMetaMsg = metaMessages && metaMessages.length > 0 ? asPlainObject(metaMessages[0]) : null;
+
+  const pickString = (...vals: unknown[]): string | null => {
+    for (const v of vals) {
+      if (typeof v === 'string' && v.trim()) return v.trim();
+    }
+    return null;
+  };
+
+  const rawWaId = pickString(
+    parsed.whatsapp_message_id,
+    parsed.whatsappMessageId,
+    parsed.provider_message_id,
+    parsed.providerMessageId,
+    parsed.wamid,
+    parsed.message_id,
+    parsed.messageId,
+    nestedData?.whatsapp_message_id,
+    nestedData?.whatsappMessageId,
+    nestedData?.provider_message_id,
+    nestedData?.wamid,
+    nestedData?.message_id,
+    nestedData?.messageId,
+    whatsappObj?.whatsapp_message_id,
+    whatsappObj?.whatsappMessageId,
+    whatsappObj?.provider_message_id,
+    whatsappObj?.providerMessageId,
+    whatsappObj?.wamid,
+    whatsappObj?.message_id,
+    whatsappObj?.messageId,
+    whatsappObj?.id,
+    firstMetaMsg?.id
+  );
+
+  const rawProviderStatus = pickString(
+    parsed.delivery_status,
+    parsed.deliveryStatus,
+    parsed.whatsapp_status,
+    parsed.whatsappStatus,
+    parsed.provider_status,
+    parsed.providerStatus,
+    nestedData?.delivery_status,
+    nestedData?.deliveryStatus,
+    nestedData?.whatsapp_status,
+    nestedData?.whatsappStatus,
+    nestedData?.provider_status,
+    whatsappObj?.delivery_status,
+    whatsappObj?.deliveryStatus,
+    whatsappObj?.provider_status,
+    whatsappObj?.providerStatus,
+    whatsappObj?.status,
+    firstMetaMsg?.message_status
+  );
+
+  const whatsappError = pickString(
+    parsed.whatsapp_error,
+    parsed.whatsappError,
+    nestedData?.whatsapp_error,
+    nestedData?.whatsappError,
+    whatsappObj?.error,
+    whatsappObj?.error_message,
+    whatsappObj?.message && whatsappObj?.ok === false ? whatsappObj.message : null
+  );
+
+  const explicitWaSentTrue =
+    parsed.whatsapp_sent === true ||
+    parsed.whatsappSent === true ||
+    nestedData?.whatsapp_sent === true ||
+    nestedData?.whatsappSent === true ||
+    whatsappObj?.sent === true ||
+    whatsappObj?.accepted === true ||
+    whatsappObj?.ok === true ||
+    whatsappObj?.success === true;
+
+  const explicitWaSentFalse =
+    parsed.whatsapp_sent === false ||
+    parsed.whatsappSent === false ||
+    nestedData?.whatsapp_sent === false ||
+    nestedData?.whatsappSent === false ||
+    whatsappObj?.sent === false ||
+    whatsappObj?.ok === false ||
+    whatsappObj?.success === false;
+
+  const isDuplicate =
+    parsed.duplicate === true ||
+    parsed.deduplicated === true ||
+    nestedData?.duplicate === true ||
+    nestedData?.deduplicated === true;
+
   const rawDownstreamStatus =
-    parsed.status ??
-    (parsed.duplicate === true || parsed.deduplicated === true ? 'duplicate_accepted' : null) ??
-    (parsed.accepted === true || parsed.success === true || parsed.ok === true ? 'accepted' : null);
+    pickString(parsed.status, nestedData?.status) ||
+    (isDuplicate ? 'duplicate_accepted' : null) ||
+    (parsed.accepted === true || parsed.success === true || parsed.ok === true ? 'accepted' : null) ||
+    (httpOk ? 'accepted' : 'error');
+
+  const downstreamLower = rawDownstreamStatus.toLowerCase();
+  const providerLower = (rawProviderStatus || '').toLowerCase();
+  const downstreamSkipped =
+    downstreamLower === 'skipped' ||
+    downstreamLower === 'ignored' ||
+    providerLower === 'skipped';
+
+  const explicitProviderFailed =
+    providerLower === 'failed' ||
+    providerLower === 'error' ||
+    providerLower === 'rejected' ||
+    providerLower === 'undeliverable' ||
+    (explicitWaSentFalse && !downstreamSkipped && !isDuplicate) ||
+    Boolean(whatsappError && !rawWaId && !explicitWaSentTrue);
+
+  const whatsappFailed = !httpOk || explicitProviderFailed;
+
+  let normalizedWaStatus: NormalizedWhatsAppStatus;
+  if (whatsappFailed) {
+    normalizedWaStatus = 'failed';
+  } else if (downstreamSkipped) {
+    normalizedWaStatus = 'skipped';
+  } else if (providerLower === 'read' || providerLower === 'confirmed_read') {
+    normalizedWaStatus = 'confirmed_read';
+  } else if (
+    providerLower === 'delivered' ||
+    providerLower === 'confirmed_delivered' ||
+    providerLower === 'delivery_confirmed'
+  ) {
+    normalizedWaStatus = 'confirmed_delivered';
+  } else if (
+    rawWaId ||
+    explicitWaSentTrue ||
+    providerLower === 'whatsapp_api_accepted' ||
+    providerLower === 'api_accepted' ||
+    providerLower === 'accepted' ||
+    providerLower === 'sent' ||
+    providerLower === 'queued' ||
+    providerLower === 'submitted' ||
+    providerLower === 'dispatched' ||
+    providerLower === 'enqueued' ||
+    providerLower === 'ok' ||
+    providerLower === 'success'
+  ) {
+    normalizedWaStatus = 'whatsapp_api_accepted';
+  } else {
+    normalizedWaStatus = 'downstream_accepted';
+  }
 
   return {
-    downstreamStatus: rawDownstreamStatus ? String(rawDownstreamStatus).slice(0, 64) : 'accepted',
-    whatsappStatus: rawWaStatus ? String(rawWaStatus).slice(0, 64) : null,
-    whatsappMessageId: rawWaId ? String(rawWaId).slice(0, 128) : null
+    downstreamStatus: rawDownstreamStatus.slice(0, 64),
+    whatsappStatus: normalizedWaStatus,
+    rawProviderStatus: rawProviderStatus ? rawProviderStatus.slice(0, 64) : null,
+    whatsappMessageId: rawWaId ? rawWaId.slice(0, 128) : null,
+    whatsappFailed,
+    whatsappError: whatsappError ? sanitizeErrorMessage(whatsappError) : null,
+    downstreamSkipped
   };
+}
+
+type NotificationJobPatch = {
+  status: 'pending' | 'processing' | 'sent' | 'failed' | 'skipped';
+  scheduled_at?: string;
+  last_error?: string | null;
+  last_http_status?: number | null;
+  downstream_status?: string | null;
+  whatsapp_status?: string | null;
+  whatsapp_message_id?: string | null;
+  receiver_response?: Record<string, unknown> | null;
+  dispatched_at?: string | null;
+  completed_at?: string | null;
+  updated_at: string;
+};
+
+async function updateNotificationJobSafe(
+  db: SupabaseClient,
+  jobId: string,
+  patch: NotificationJobPatch,
+  onlyIfProcessing = false
+): Promise<{ ok: boolean; error: string | null; usedLegacyFallback: boolean }> {
+  const buildQuery = (payload: Record<string, unknown>) => {
+    let q = db.from('smav_sale_notification_jobs').update(payload).eq('id', jobId);
+    if (onlyIfProcessing) {
+      q = q.eq('status', 'processing');
+    }
+    return q;
+  };
+
+  const attemptUpdate = async (payload: Record<string, unknown>) => {
+    try {
+      const { error } = await buildQuery(payload);
+      return error || null;
+    } catch (e: any) {
+      return { message: sanitizeErrorMessage(e) };
+    }
+  };
+
+  let err = await attemptUpdate(patch as unknown as Record<string, unknown>);
+  if (!err) {
+    return { ok: true, error: null, usedLegacyFallback: false };
+  }
+
+  // Fallback to base 014 columns if any 016 diagnostic column is missing or uncached
+  if (isMissingColumnError(err)) {
+    const legacyPatch: Record<string, unknown> = {
+      status: patch.status,
+      last_error: patch.last_error ?? null,
+      updated_at: patch.updated_at
+    };
+    if (patch.scheduled_at !== undefined) {
+      legacyPatch.scheduled_at = patch.scheduled_at;
+    }
+    const legacyErr = await attemptUpdate(legacyPatch);
+    if (!legacyErr) {
+      return { ok: true, error: null, usedLegacyFallback: true };
+    }
+    err = legacyErr;
+  }
+
+  // Single short retry for transient Supabase/network errors so jobs never stall in processing
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const retryErr = await attemptUpdate(patch as unknown as Record<string, unknown>);
+  if (!retryErr) {
+    return { ok: true, error: null, usedLegacyFallback: false };
+  }
+
+  return {
+    ok: false,
+    error: sanitizeErrorMessage(retryErr.message || (retryErr as any).code || 'Failed to update notification job'),
+    usedLegacyFallback: false
+  };
+}
+
+async function selectNotificationRouteSafe(db: SupabaseClient, outletId: string): Promise<{
+  route: {
+    endpoint_url: string;
+    enabled: boolean;
+    send_receipts: boolean;
+    send_feedback: boolean;
+    receipt_template_name?: string | null;
+    feedback_template_name?: string | null;
+  } | null;
+  error: string | null;
+}> {
+  let { data, error } = await db
+    .from('smav_outlet_notification_routes')
+    .select('endpoint_url,enabled,send_receipts,send_feedback,receipt_template_name,feedback_template_name')
+    .eq('outlet_id', outletId)
+    .maybeSingle();
+
+  if (error && isMissingColumnError(error)) {
+    const fallback = await db
+      .from('smav_outlet_notification_routes')
+      .select('endpoint_url,enabled,send_receipts,send_feedback')
+      .eq('outlet_id', outletId)
+      .maybeSingle();
+    data = fallback.data as any;
+    error = fallback.error;
+  }
+
+  if (error) {
+    return { route: null, error: sanitizeErrorMessage(error.message || error.code || 'Route lookup failed') };
+  }
+  return { route: (data as any) || null, error: null };
+}
+
+async function updateNotificationRouteSafe(
+  db: SupabaseClient,
+  outletId: string,
+  patch: {
+    last_verified_at: string;
+    last_http_status: number | null;
+    last_error: string | null;
+    updated_at: string;
+  }
+): Promise<void> {
+  try {
+    const { error } = await db
+      .from('smav_outlet_notification_routes')
+      .update(patch)
+      .eq('outlet_id', outletId);
+    if (error && isMissingColumnError(error)) {
+      await db
+        .from('smav_outlet_notification_routes')
+        .update({ updated_at: patch.updated_at })
+        .eq('outlet_id', outletId);
+    }
+  } catch {
+    // Non-fatal metadata update on route row
+  }
 }
 
 export async function recordNotificationStepLog(
@@ -243,7 +602,9 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
     event_type: NotificationEventType;
     status: string;
     http_status?: number | null;
+    downstream_status?: string | null;
     whatsapp_status?: string | null;
+    whatsapp_message_id?: string | null;
     error?: string | null;
   }> = [];
 
@@ -255,15 +616,12 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
     const maskedPhone = maskPhone(
       typeof job.payload?.customer_phone === 'string' ? job.payload.customer_phone : null
     );
+    let dispatchedAt: string | null = null;
+    let downstreamAccepted = false;
 
     try {
-      const { data: route, error: routeError } = await db
-        .from('smav_outlet_notification_routes')
-        .select('endpoint_url,enabled,send_receipts,send_feedback,receipt_template_name,feedback_template_name')
-        .eq('outlet_id', job.outlet_id)
-        .maybeSingle();
-
-      if (routeError) throw new Error(routeError.message);
+      const { route, error: routeError } = await selectNotificationRouteSafe(db, job.outlet_id);
+      if (routeError) throw new Error(routeError);
 
       let skipReason: string | null = null;
       if (!route || !route.enabled || !route.endpoint_url) {
@@ -276,17 +634,19 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
 
       if (skipReason) {
         const nowIso = new Date().toISOString();
-        await db
-          .from('smav_sale_notification_jobs')
-          .update({
+        await updateNotificationJobSafe(
+          db,
+          job.id,
+          {
             status: 'skipped',
             last_error: skipReason,
             downstream_status: 'skipped',
+            whatsapp_status: 'skipped',
             completed_at: nowIso,
             updated_at: nowIso
-          })
-          .eq('id', job.id)
-          .eq('status', 'processing');
+          },
+          true
+        );
 
         await recordNotificationStepLog(db, {
           job_id: job.id,
@@ -297,6 +657,7 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
           event_type: job.event_type,
           step: 'skipped',
           status: 'skipped',
+          whatsapp_status: 'skipped',
           masked_phone: maskedPhone,
           sanitized_error: skipReason
         });
@@ -306,6 +667,8 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
           outlet_id: job.outlet_id,
           event_type: job.event_type,
           status: 'skipped',
+          downstream_status: 'skipped',
+          whatsapp_status: 'skipped',
           error: skipReason
         });
         continue;
@@ -315,17 +678,19 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
       if (job.event_type === 'feedback' && !isFeedbackWithinDeadline(billedAtRaw, job.scheduled_at)) {
         const reason = 'Overdue feedback deadline passed';
         const nowIso = new Date().toISOString();
-        await db
-          .from('smav_sale_notification_jobs')
-          .update({
+        await updateNotificationJobSafe(
+          db,
+          job.id,
+          {
             status: 'skipped',
             last_error: reason,
             downstream_status: 'skipped',
+            whatsapp_status: 'skipped',
             completed_at: nowIso,
             updated_at: nowIso
-          })
-          .eq('id', job.id)
-          .eq('status', 'processing');
+          },
+          true
+        );
 
         await recordNotificationStepLog(db, {
           job_id: job.id,
@@ -336,6 +701,7 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
           event_type: job.event_type,
           step: 'skipped',
           status: 'skipped',
+          whatsapp_status: 'skipped',
           masked_phone: maskedPhone,
           sanitized_error: reason
         });
@@ -345,6 +711,8 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
           outlet_id: job.outlet_id,
           event_type: job.event_type,
           status: 'skipped',
+          downstream_status: 'skipped',
+          whatsapp_status: 'skipped',
           error: reason
         });
         continue;
@@ -375,7 +743,7 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
         .update(`${timestamp}.${body}`)
         .digest('hex');
 
-      const dispatchedAt = new Date().toISOString();
+      dispatchedAt = new Date().toISOString();
       const response = await fetch(url.toString(), {
         method: 'POST',
         headers: {
@@ -385,7 +753,7 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
           'x-smav-event-id': job.id
         },
         body,
-        signal: AbortSignal.timeout(12000)
+        signal: AbortSignal.timeout(DISPATCH_TIMEOUT_MS)
       });
 
       const rawText = await response.text().catch(() => '');
@@ -402,7 +770,7 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
       }
 
       const sanitizedBody = sanitizeReceiverResponse(parsedBody);
-      const waMeta = extractWhatsAppMetadata(parsedBody);
+      const waMeta = extractWhatsAppMetadata(parsedBody, response.ok);
 
       if (!response.ok) {
         const downstreamErr =
@@ -411,16 +779,14 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
           sanitizeErrorMessage(rawText.slice(0, 200)) ||
           '';
         const errMessage = `Downstream HTTP ${response.status}${downstreamErr ? `: ${downstreamErr}` : ''}`;
+        const failedAt = new Date().toISOString();
 
-        await db
-          .from('smav_outlet_notification_routes')
-          .update({
-            last_verified_at: dispatchedAt,
-            last_http_status: response.status,
-            last_error: sanitizeErrorMessage(errMessage),
-            updated_at: dispatchedAt
-          })
-          .eq('outlet_id', job.outlet_id);
+        await updateNotificationRouteSafe(db, job.outlet_id, {
+          last_verified_at: failedAt,
+          last_http_status: response.status,
+          last_error: sanitizeErrorMessage(errMessage),
+          updated_at: failedAt
+        });
 
         const nonRetryableClientError =
           response.status >= 400 &&
@@ -430,22 +796,24 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
         const retry = !nonRetryableClientError && job.attempts < 5;
         const nextSchedule = new Date(Date.now() + Math.min(60, 2 ** job.attempts) * 60000).toISOString();
 
-        await db
-          .from('smav_sale_notification_jobs')
-          .update({
+        await updateNotificationJobSafe(
+          db,
+          job.id,
+          {
             status: retry ? 'pending' : 'failed',
             scheduled_at: retry ? nextSchedule : job.scheduled_at,
             last_error: sanitizeErrorMessage(errMessage),
             last_http_status: response.status,
             downstream_status: 'error',
-            whatsapp_status: waMeta.whatsappStatus,
+            whatsapp_status: 'failed',
+            whatsapp_message_id: waMeta.whatsappMessageId,
             receiver_response: sanitizedBody,
             dispatched_at: dispatchedAt,
-            completed_at: retry ? null : dispatchedAt,
-            updated_at: dispatchedAt
-          })
-          .eq('id', job.id)
-          .eq('status', 'processing');
+            completed_at: retry ? null : failedAt,
+            updated_at: failedAt
+          },
+          true
+        );
 
         await recordNotificationStepLog(db, {
           job_id: job.id,
@@ -457,7 +825,7 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
           step: retry ? 'retry_scheduled' : 'failed',
           status: retry ? 'retry' : 'failed',
           http_status: response.status,
-          whatsapp_status: waMeta.whatsappStatus,
+          whatsapp_status: 'failed',
           whatsapp_message_id: waMeta.whatsappMessageId,
           masked_phone: maskedPhone,
           sanitized_error: errMessage,
@@ -470,53 +838,70 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
           event_type: job.event_type,
           status: retry ? 'retry' : 'failed',
           http_status: response.status,
-          whatsapp_status: waMeta.whatsappStatus,
+          downstream_status: 'error',
+          whatsapp_status: 'failed',
           error: sanitizeErrorMessage(errMessage)
         });
         continue;
       }
 
+      // Downstream returned HTTP 2xx: never fall into retry catch block after acceptance
+      downstreamAccepted = true;
       const completedAt = new Date().toISOString();
-      const explicitWaFailed = waMeta.whatsappStatus?.toLowerCase() === 'failed';
-      const explicitDownstreamSkipped = waMeta.downstreamStatus?.toLowerCase() === 'skipped';
-      const finalJobStatus = explicitWaFailed
+      const explicitWaFailed = waMeta.whatsappFailed;
+      const explicitDownstreamSkipped = waMeta.downstreamSkipped;
+      const finalJobStatus: 'sent' | 'failed' | 'skipped' = explicitWaFailed
         ? 'failed'
         : explicitDownstreamSkipped
           ? 'skipped'
           : 'sent';
+      const finalErrMsg = explicitWaFailed
+        ? sanitizeErrorMessage(
+            waMeta.whatsappError ||
+              String(sanitizedBody?.error || sanitizedBody?.message || 'Downstream WhatsApp failure')
+          )
+        : null;
 
-      await db
-        .from('smav_outlet_notification_routes')
-        .update({
-          last_verified_at: completedAt,
-          last_http_status: response.status,
-          last_error: explicitWaFailed
-            ? sanitizeErrorMessage(String(sanitizedBody?.error || sanitizedBody?.message || 'Downstream WhatsApp failure'))
-            : null,
-          updated_at: completedAt
-        })
-        .eq('outlet_id', job.outlet_id);
+      await updateNotificationRouteSafe(db, job.outlet_id, {
+        last_verified_at: completedAt,
+        last_http_status: response.status,
+        last_error: finalErrMsg,
+        updated_at: completedAt
+      });
 
-      const { error: markError } = await db
-        .from('smav_sale_notification_jobs')
-        .update({
+      const jobUpdate = await updateNotificationJobSafe(
+        db,
+        job.id,
+        {
           status: finalJobStatus,
-          last_error: explicitWaFailed
-            ? sanitizeErrorMessage(String(sanitizedBody?.error || sanitizedBody?.message || 'WhatsApp delivery failed'))
-            : null,
+          last_error: finalErrMsg,
           last_http_status: response.status,
           downstream_status: waMeta.downstreamStatus,
-          whatsapp_status: waMeta.whatsappStatus || (finalJobStatus === 'sent' ? 'accepted_by_receiver' : 'skipped'),
+          whatsapp_status: waMeta.whatsappStatus,
           whatsapp_message_id: waMeta.whatsappMessageId,
           receiver_response: sanitizedBody,
           dispatched_at: dispatchedAt,
           completed_at: completedAt,
           updated_at: completedAt
-        })
-        .eq('id', job.id)
-        .eq('status', 'processing');
+        },
+        true
+      );
 
-      if (markError) throw new Error(markError.message);
+      if (!jobUpdate.ok) {
+        console.error(
+          `[SMAV notification dispatcher] Job ${job.id} accepted by downstream (HTTP ${response.status}) but status persistence failed: ${jobUpdate.error}`
+        );
+      }
+
+      const stepName = explicitWaFailed
+        ? 'whatsapp_failed'
+        : waMeta.whatsappStatus === 'confirmed_delivered' || waMeta.whatsappStatus === 'confirmed_read'
+          ? 'whatsapp_delivery_confirmed'
+          : waMeta.whatsappStatus === 'whatsapp_api_accepted'
+            ? 'whatsapp_api_accepted'
+            : explicitDownstreamSkipped
+              ? 'downstream_skipped'
+              : 'downstream_accepted';
 
       await recordNotificationStepLog(db, {
         job_id: job.id,
@@ -525,15 +910,13 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
         outlet_id: job.outlet_id,
         bill_number: billNumber,
         event_type: job.event_type,
-        step: explicitWaFailed ? 'whatsapp_failed' : 'downstream_accepted',
+        step: stepName,
         status: finalJobStatus,
         http_status: response.status,
-        whatsapp_status: waMeta.whatsappStatus || (finalJobStatus === 'sent' ? 'accepted_by_receiver' : 'skipped'),
+        whatsapp_status: waMeta.whatsappStatus,
         whatsapp_message_id: waMeta.whatsappMessageId,
         masked_phone: maskedPhone,
-        sanitized_error: explicitWaFailed
-          ? sanitizeErrorMessage(String(sanitizedBody?.error || sanitizedBody?.message || 'WhatsApp failure'))
-          : null,
+        sanitized_error: finalErrMsg || (jobUpdate.ok ? null : `Job update failed: ${jobUpdate.error}`),
         response_summary: sanitizedBody || {}
       });
 
@@ -541,25 +924,47 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
         id: job.id,
         outlet_id: job.outlet_id,
         event_type: job.event_type,
-        status: finalJobStatus === 'sent' ? 'accepted' : finalJobStatus,
+        status: finalJobStatus,
         http_status: response.status,
-        whatsapp_status: waMeta.whatsappStatus || (finalJobStatus === 'sent' ? 'accepted_by_receiver' : 'skipped')
+        downstream_status: waMeta.downstreamStatus,
+        whatsapp_status: waMeta.whatsappStatus,
+        whatsapp_message_id: waMeta.whatsappMessageId,
+        ...(finalErrMsg ? { error: finalErrMsg } : {})
       });
     } catch (err: any) {
       const safeErr = sanitizeErrorMessage(err);
-      const retry = job.attempts < 5;
+      const isTimeout = err?.name === 'TimeoutError' || err?.name === 'AbortError' || /timeout|aborted/i.test(safeErr);
       const nowIso = new Date().toISOString();
-      await db
-        .from('smav_sale_notification_jobs')
-        .update({
+
+      if (downstreamAccepted) {
+        // Never reset an already-accepted job back to pending
+        results.push({
+          id: job.id,
+          outlet_id: job.outlet_id,
+          event_type: job.event_type,
+          status: 'sent',
+          error: safeErr
+        });
+        continue;
+      }
+
+      const retry = job.attempts < 5;
+      const nextSchedule = new Date(Date.now() + Math.min(60, 2 ** job.attempts) * 60000).toISOString();
+      await updateNotificationJobSafe(
+        db,
+        job.id,
+        {
           status: retry ? 'pending' : 'failed',
-          scheduled_at: new Date(Date.now() + Math.min(60, 2 ** job.attempts) * 60000).toISOString(),
+          scheduled_at: retry ? nextSchedule : job.scheduled_at,
           last_error: safeErr,
-          downstream_status: 'network_error',
+          downstream_status: isTimeout ? 'timeout' : 'network_error',
+          whatsapp_status: retry ? 'pending' : 'failed',
+          dispatched_at: dispatchedAt,
+          completed_at: retry ? null : nowIso,
           updated_at: nowIso
-        })
-        .eq('id', job.id)
-        .eq('status', 'processing');
+        },
+        true
+      );
 
       await recordNotificationStepLog(db, {
         job_id: job.id,
@@ -570,6 +975,7 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
         event_type: job.event_type,
         step: retry ? 'retry_scheduled' : 'failed',
         status: retry ? 'retry' : 'failed',
+        whatsapp_status: retry ? 'pending' : 'failed',
         masked_phone: maskedPhone,
         sanitized_error: safeErr
       });
@@ -579,6 +985,7 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
         outlet_id: job.outlet_id,
         event_type: job.event_type,
         status: retry ? 'retry' : 'failed',
+        downstream_status: isTimeout ? 'timeout' : 'network_error',
         error: safeErr
       });
     }
@@ -670,18 +1077,6 @@ export async function runSafeIntegrationDiagnostics(params: {
   let routesData: any[] | null = null;
   let recentJobs: any[] = [];
   let recentLogs: StepLogEntry[] = [];
-
-  const isMissingColumnError = (err: { code?: string; message?: string } | null | undefined) => {
-    if (!err) return false;
-    const code = String(err.code || '').toUpperCase();
-    const msg = String(err.message || '');
-    return (
-      code === '42703' ||
-      code === 'PGRST204' ||
-      /column .* does not exist/i.test(msg) ||
-      /could not find .* column/i.test(msg)
-    );
-  };
 
   if (db) {
     for (const [table, probeCol] of Object.entries(tableProbeColumns)) {
@@ -1050,7 +1445,8 @@ export async function runConfirmedE2EIntegrationTest(params: {
     items: [{ name: 'SMAV Diagnostic Verification', quantity: 1, price: 1 }]
   };
 
-  const { data: jobRow, error: jobErr } = await db
+  const dispatchedAt = new Date().toISOString();
+  let { data: jobRow, error: jobErr } = await db
     .from('smav_sale_notification_jobs')
     .insert({
       outlet_id: outlet.id,
@@ -1062,10 +1458,30 @@ export async function runConfirmedE2EIntegrationTest(params: {
       attempts: 1,
       payload,
       bill_id: billId,
-      bill_number: billNumber
+      bill_number: billNumber,
+      dispatched_at: dispatchedAt
     })
     .select('id')
     .single();
+
+  if (jobErr && isMissingColumnError(jobErr)) {
+    const legacyInsert = await db
+      .from('smav_sale_notification_jobs')
+      .insert({
+        outlet_id: outlet.id,
+        source_type: outlet.category === 'salon' ? 'salon' : outlet.category === 'restaurant' ? 'restaurant' : 'retail',
+        source_key: idempotencyKey,
+        event_type: eventType,
+        status: 'processing',
+        scheduled_at: nowIso,
+        attempts: 1,
+        payload
+      })
+      .select('id')
+      .single();
+    jobRow = legacyInsert.data as any;
+    jobErr = legacyInsert.error;
+  }
 
   if (jobErr || !jobRow?.id) {
     throw new Error(`Stage 2 queue insert failed: ${sanitizeErrorMessage(jobErr?.message || 'Missing job ID')}`);
@@ -1112,19 +1528,89 @@ export async function runConfirmedE2EIntegrationTest(params: {
 
   const timestamp = String(Math.floor(Date.now() / 1000));
   const signature = crypto.createHmac('sha256', secret).update(`${timestamp}.${body}`).digest('hex');
-  const dispatchedAt = new Date().toISOString();
 
-  const response = await fetch(url.toString(), {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-smav-timestamp': timestamp,
-      'x-smav-signature': signature,
-      'x-smav-event-id': eventId
-    },
-    body,
-    signal: AbortSignal.timeout(12000)
-  });
+  let response: Response;
+  try {
+    response = await fetch(url.toString(), {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-smav-timestamp': timestamp,
+        'x-smav-signature': signature,
+        'x-smav-event-id': eventId
+      },
+      body,
+      signal: AbortSignal.timeout(DISPATCH_TIMEOUT_MS)
+    });
+  } catch (fetchErr: any) {
+    const failedAt = new Date().toISOString();
+    const safeErr = sanitizeErrorMessage(fetchErr);
+    const isTimeout =
+      fetchErr?.name === 'TimeoutError' ||
+      fetchErr?.name === 'AbortError' ||
+      /timeout|aborted/i.test(safeErr);
+    const downstreamErrStatus = isTimeout ? 'timeout' : 'network_error';
+    const detailErr = isTimeout
+      ? `Downstream request timed out after ${DISPATCH_TIMEOUT_MS / 1000}s (${safeErr})`
+      : safeErr;
+
+    await updateNotificationJobSafe(db, eventId, {
+      status: 'failed',
+      last_error: detailErr,
+      last_http_status: null,
+      downstream_status: downstreamErrStatus,
+      whatsapp_status: 'failed',
+      dispatched_at: dispatchedAt,
+      completed_at: failedAt,
+      updated_at: failedAt
+    });
+
+    await updateNotificationRouteSafe(db, outlet.id, {
+      last_verified_at: failedAt,
+      last_http_status: null,
+      last_error: detailErr,
+      updated_at: failedAt
+    });
+
+    await recordNotificationStepLog(db, {
+      job_id: eventId,
+      event_id: eventId,
+      bill_id: billId,
+      outlet_id: outlet.id,
+      bill_number: billNumber,
+      event_type: eventType,
+      step: isTimeout ? 'e2e_test_timeout' : 'e2e_test_network_error',
+      status: 'failed',
+      whatsapp_status: 'failed',
+      masked_phone: maskedPhone,
+      sanitized_error: detailErr
+    });
+
+    steps.push({
+      step: 'stage3_downstream_and_whatsapp',
+      status: 'failed',
+      timestamp: failedAt,
+      detail: detailErr
+    });
+
+    return {
+      success: false,
+      outlet_id: outlet.id,
+      outlet_name: outlet.name,
+      bill_id: billId,
+      bill_number: billNumber,
+      event_id: eventId,
+      event_type: eventType,
+      masked_phone: maskedPhone,
+      http_status: null,
+      downstream_status: downstreamErrStatus,
+      whatsapp_status: 'failed',
+      whatsapp_message_id: null,
+      receiver_response: null,
+      sanitized_error: detailErr,
+      steps
+    };
+  }
 
   const rawText = await response.text().catch(() => '');
   let parsedBody: Record<string, unknown> | null = null;
@@ -1139,40 +1625,40 @@ export async function runConfirmedE2EIntegrationTest(params: {
     }
   }
   const sanitizedBody = sanitizeReceiverResponse(parsedBody);
-  const waMeta = extractWhatsAppMetadata(parsedBody);
+  const waMeta = extractWhatsAppMetadata(parsedBody, response.ok);
   const completedAt = new Date().toISOString();
-  const ok = response.ok && waMeta.whatsappStatus?.toLowerCase() !== 'failed';
+  const ok = response.ok && !waMeta.whatsappFailed;
+  const finalStatus: 'sent' | 'failed' | 'skipped' = !ok
+    ? 'failed'
+    : waMeta.downstreamSkipped
+      ? 'skipped'
+      : 'sent';
   const errMsg = ok
     ? null
     : sanitizeErrorMessage(
-        String(sanitizedBody?.error || sanitizedBody?.message || `HTTP ${response.status}`)
+        waMeta.whatsappError ||
+          String(sanitizedBody?.error || sanitizedBody?.message || `HTTP ${response.status}`)
       );
 
-  await db
-    .from('smav_sale_notification_jobs')
-    .update({
-      status: ok ? 'sent' : 'failed',
-      last_error: errMsg,
-      last_http_status: response.status,
-      downstream_status: waMeta.downstreamStatus,
-      whatsapp_status: waMeta.whatsappStatus || (ok ? 'accepted_by_receiver' : 'failed'),
-      whatsapp_message_id: waMeta.whatsappMessageId,
-      receiver_response: sanitizedBody,
-      dispatched_at: dispatchedAt,
-      completed_at: completedAt,
-      updated_at: completedAt
-    })
-    .eq('id', eventId);
+  const jobUpdate = await updateNotificationJobSafe(db, eventId, {
+    status: finalStatus,
+    last_error: errMsg,
+    last_http_status: response.status,
+    downstream_status: waMeta.downstreamStatus,
+    whatsapp_status: waMeta.whatsappStatus,
+    whatsapp_message_id: waMeta.whatsappMessageId,
+    receiver_response: sanitizedBody,
+    dispatched_at: dispatchedAt,
+    completed_at: completedAt,
+    updated_at: completedAt
+  });
 
-  await db
-    .from('smav_outlet_notification_routes')
-    .update({
-      last_verified_at: completedAt,
-      last_http_status: response.status,
-      last_error: errMsg,
-      updated_at: completedAt
-    })
-    .eq('outlet_id', outlet.id);
+  await updateNotificationRouteSafe(db, outlet.id, {
+    last_verified_at: completedAt,
+    last_http_status: response.status,
+    last_error: errMsg,
+    updated_at: completedAt
+  });
 
   await recordNotificationStepLog(db, {
     job_id: eventId,
@@ -1182,12 +1668,12 @@ export async function runConfirmedE2EIntegrationTest(params: {
     bill_number: billNumber,
     event_type: eventType,
     step: 'e2e_test_completed',
-    status: ok ? 'sent' : 'failed',
+    status: finalStatus,
     http_status: response.status,
-    whatsapp_status: waMeta.whatsappStatus || (ok ? 'accepted_by_receiver' : 'failed'),
+    whatsapp_status: waMeta.whatsappStatus,
     whatsapp_message_id: waMeta.whatsappMessageId,
     masked_phone: maskedPhone,
-    sanitized_error: errMsg,
+    sanitized_error: errMsg || (jobUpdate.ok ? null : `Job update failed: ${jobUpdate.error}`),
     response_summary: sanitizedBody || {}
   });
 
@@ -1195,8 +1681,95 @@ export async function runConfirmedE2EIntegrationTest(params: {
     step: 'stage3_downstream_and_whatsapp',
     status: ok ? 'ok' : 'failed',
     timestamp: completedAt,
-    detail: `HTTP ${response.status} · downstream=${waMeta.downstreamStatus} · whatsapp=${waMeta.whatsappStatus || 'unknown'}`
+    detail: `HTTP ${response.status} · downstream=${waMeta.downstreamStatus} · whatsapp=${waMeta.whatsappStatus}${waMeta.whatsappMessageId ? ` · id=${waMeta.whatsappMessageId}` : ''}${!jobUpdate.ok ? ` · job_update_warning=${jobUpdate.error}` : ''}`
   });
+
+  let feedbackJobId: string | null = null;
+  let feedbackScheduledAt: string | null = null;
+  if (ok && eventType === 'receipt' && route.send_feedback) {
+    feedbackScheduledAt = new Date(Date.parse(nowIso) + FEEDBACK_DELAY_MS).toISOString();
+    const feedbackSourceType =
+      outlet.category === 'salon' ? 'salon' : outlet.category === 'restaurant' ? 'restaurant' : 'retail';
+    const feedbackPayload = {
+      bill_id: billId,
+      bill_number: billNumber,
+      customer_name: 'SMAV Integration Test',
+      customer_phone: digits,
+      billed_at: nowIso,
+      diagnostic_e2e_test: true
+    };
+
+    let { data: fbRow, error: fbErr } = await db
+      .from('smav_sale_notification_jobs')
+      .upsert(
+        {
+          outlet_id: outlet.id,
+          source_type: feedbackSourceType,
+          source_key: idempotencyKey,
+          event_type: 'feedback',
+          status: 'pending',
+          scheduled_at: feedbackScheduledAt,
+          attempts: 0,
+          payload: feedbackPayload,
+          bill_id: billId,
+          bill_number: billNumber
+        },
+        { onConflict: 'outlet_id,source_type,source_key,event_type', ignoreDuplicates: true }
+      )
+      .select('id')
+      .maybeSingle();
+
+    if (fbErr && isMissingColumnError(fbErr)) {
+      const legacyFb = await db
+        .from('smav_sale_notification_jobs')
+        .upsert(
+          {
+            outlet_id: outlet.id,
+            source_type: feedbackSourceType,
+            source_key: idempotencyKey,
+            event_type: 'feedback',
+            status: 'pending',
+            scheduled_at: feedbackScheduledAt,
+            attempts: 0,
+            payload: feedbackPayload
+          },
+          { onConflict: 'outlet_id,source_type,source_key,event_type', ignoreDuplicates: true }
+        )
+        .select('id')
+        .maybeSingle();
+      fbRow = legacyFb.data as any;
+      fbErr = legacyFb.error;
+    }
+
+    if (fbErr) {
+      const fbErrMsg = sanitizeErrorMessage(fbErr.message || 'Failed to schedule feedback job');
+      steps.push({
+        step: 'stage2_feedback_scheduled',
+        status: 'failed',
+        timestamp: new Date().toISOString(),
+        detail: `Feedback queue insert failed: ${fbErrMsg}`
+      });
+    } else {
+      feedbackJobId = fbRow?.id ? String(fbRow.id) : null;
+      await recordNotificationStepLog(db, {
+        job_id: feedbackJobId,
+        event_id: feedbackJobId,
+        bill_id: billId,
+        outlet_id: outlet.id,
+        bill_number: billNumber,
+        event_type: 'feedback',
+        step: 'e2e_feedback_scheduled',
+        status: 'pending',
+        masked_phone: maskedPhone
+      });
+      steps.push({
+        step: 'stage2_feedback_scheduled',
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        detail: `Scheduled feedback job${feedbackJobId ? ` (${feedbackJobId})` : ''} for ${feedbackScheduledAt} (+2m delay)`
+      });
+    }
+  }
 
   return {
     success: ok,
@@ -1209,10 +1782,14 @@ export async function runConfirmedE2EIntegrationTest(params: {
     masked_phone: maskedPhone,
     http_status: response.status,
     downstream_status: waMeta.downstreamStatus,
-    whatsapp_status: waMeta.whatsappStatus || (ok ? 'accepted_by_receiver' : 'failed'),
+    whatsapp_status: waMeta.whatsappStatus,
     whatsapp_message_id: waMeta.whatsappMessageId,
     receiver_response: sanitizedBody,
     sanitized_error: errMsg,
+    job_status_persisted: jobUpdate.ok,
+    ...(jobUpdate.error ? { job_update_error: jobUpdate.error } : {}),
+    feedback_job_id: feedbackJobId,
+    feedback_scheduled_at: feedbackScheduledAt,
     steps
   };
 }

@@ -104,6 +104,8 @@ type DiagnosticReport = {
     whatsapp_status?: string | null;
     whatsapp_message_id?: string | null;
     last_error?: string | null;
+    dispatched_at?: string | null;
+    completed_at?: string | null;
     updated_at: string;
   }>;
   recentLogs: Array<{
@@ -127,13 +129,94 @@ type DiagnosticReport = {
 
 const statusTone = (status?: string | null): 'success' | 'warning' | 'danger' | 'info' | 'neutral' => {
   const s = String(status || '').toLowerCase();
-  if (s === 'sent' || s === 'accepted' || s === 'accepted_by_receiver' || s === 'delivered' || s === 'ok') {
+  if (
+    s === 'confirmed_delivered' ||
+    s === 'confirmed_read' ||
+    s === 'delivered' ||
+    s === 'read' ||
+    s === 'sent' ||
+    s === 'ok'
+  ) {
     return 'success';
   }
-  if (s === 'pending' || s === 'processing' || s === 'retry') return 'info';
+  if (
+    s === 'whatsapp_api_accepted' ||
+    s === 'api_accepted' ||
+    s === 'downstream_accepted' ||
+    s === 'accepted_by_receiver' ||
+    s === 'accepted' ||
+    s === 'pending' ||
+    s === 'processing' ||
+    s === 'retry'
+  ) {
+    return 'info';
+  }
   if (s === 'skipped') return 'warning';
   if (s === 'failed' || s === 'error') return 'danger';
   return 'neutral';
+};
+
+type RecentJobItem = DiagnosticReport['recentJobs'][number];
+
+const formatWhatsAppDelivery = (
+  j: RecentJobItem
+): { label: string; tone: 'success' | 'warning' | 'danger' | 'info' | 'neutral'; detail?: string } => {
+  const raw = String(j.whatsapp_status || '').trim().toLowerCase();
+  if (raw === 'confirmed_delivered' || raw === 'delivered') {
+    return { label: 'Confirmed delivered', tone: 'success', detail: 'Handset delivery confirmed' };
+  }
+  if (raw === 'confirmed_read' || raw === 'read') {
+    return { label: 'Confirmed read', tone: 'success', detail: 'Read by recipient' };
+  }
+  if (raw === 'whatsapp_api_accepted' || raw === 'api_accepted' || (j.whatsapp_message_id && raw !== 'failed')) {
+    return { label: 'WhatsApp API accepted', tone: 'info', detail: 'Provider accepted (awaiting delivery webhook)' };
+  }
+  if (raw === 'downstream_accepted' || raw === 'accepted_by_receiver' || raw === 'accepted') {
+    return { label: 'Downstream accepted', tone: 'neutral', detail: 'Receiver 2xx (no provider status)' };
+  }
+  if (raw === 'skipped' || j.status === 'skipped') {
+    return { label: 'Skipped', tone: 'warning' };
+  }
+  if (raw === 'failed' || j.status === 'failed') {
+    return { label: 'Failed', tone: 'danger' };
+  }
+  if (j.status === 'sent') {
+    return { label: 'Downstream accepted', tone: 'neutral', detail: 'Receiver 2xx recorded' };
+  }
+  if (j.status === 'processing') {
+    const stale = Date.now() - Date.parse(j.updated_at) > 2 * 60_000;
+    return stale
+      ? { label: 'Unconfirmed (stale)', tone: 'warning', detail: 'No completion reply recorded' }
+      : { label: 'In progress', tone: 'info' };
+  }
+  return { label: 'Pending', tone: 'neutral' };
+};
+
+const formatDownstreamHttp = (j: RecentJobItem): string => {
+  if (j.last_http_status) {
+    return `HTTP ${j.last_http_status}${j.downstream_status ? ` · ${j.downstream_status}` : ''}`;
+  }
+  if (j.status === 'skipped') {
+    return 'Skipped before dispatch';
+  }
+  if (j.downstream_status === 'timeout') {
+    return 'Dispatched · timed out';
+  }
+  if (j.downstream_status === 'network_error') {
+    return 'Dispatched · network error';
+  }
+  if (j.status === 'processing') {
+    const stale = Date.now() - Date.parse(j.updated_at) > 2 * 60_000;
+    return stale
+      ? 'Stale processing (no HTTP reply recorded)'
+      : j.dispatched_at
+        ? 'Dispatched · awaiting HTTP reply'
+        : 'In flight';
+  }
+  if (j.dispatched_at) {
+    return `Dispatched${j.downstream_status ? ` · ${j.downstream_status}` : ''}`;
+  }
+  return 'Queued (not dispatched)';
 };
 
 export const IntegrationDiagnostics: React.FC<IntegrationDiagnosticsProps> = ({
@@ -693,60 +776,75 @@ export const IntegrationDiagnostics: React.FC<IntegrationDiagnosticsProps> = ({
                   header: 'Downstream / HTTP',
                   render: (j) => (
                     <div className="text-[11px] font-mono text-[#2F3033]">
-                      {j.last_http_status ? `HTTP ${j.last_http_status}` : 'Not dispatched'}
-                      {j.downstream_status ? ` · ${j.downstream_status}` : ''}
+                      {formatDownstreamHttp(j)}
                     </div>
                   ),
                 },
                 {
                   key: 'wa',
                   header: 'WhatsApp Delivery',
-                  render: (j) => (
-                    <div>
-                      <StatusBadge
-                        label={j.whatsapp_status || 'pending'}
-                        tone={statusTone(j.whatsapp_status || j.status)}
-                      />
-                      {j.whatsapp_message_id && (
-                        <div className="text-[10px] font-mono text-[#6F737D] mt-0.5 truncate max-w-[160px]">
-                          {j.whatsapp_message_id}
-                        </div>
-                      )}
-                    </div>
-                  ),
+                  render: (j) => {
+                    const wa = formatWhatsAppDelivery(j);
+                    return (
+                      <div>
+                        <StatusBadge label={wa.label} tone={wa.tone} />
+                        {wa.detail && (
+                          <div className="text-[10px] text-[#6F737D] mt-0.5">{wa.detail}</div>
+                        )}
+                        {j.whatsapp_message_id && (
+                          <div className="text-[10px] font-mono text-[#6F737D] mt-0.5 truncate max-w-[160px]">
+                            {j.whatsapp_message_id}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  },
                 },
                 {
                   key: 'err',
-                  header: 'Error / Updated',
+                  header: 'Error / Timestamp',
                   align: 'right',
                   render: (j) => (
-                    <div className="text-right text-[11px]">
-                      {j.last_error ? (
-                        <span className="text-[#B91C1C] font-medium">{j.last_error}</span>
-                      ) : (
-                        <span className="text-[#6F737D] tabular-nums">
-                          {new Date(j.updated_at).toLocaleString()}
-                        </span>
+                    <div className="text-right text-[11px] space-y-0.5">
+                      {j.last_error && (
+                        <div className="text-[#B91C1C] font-medium">{j.last_error}</div>
                       )}
+                      <div className="text-[#6F737D] tabular-nums">
+                        {j.completed_at
+                          ? `Completed ${new Date(j.completed_at).toLocaleString()}`
+                          : j.status === 'pending'
+                            ? `Scheduled ${new Date(j.scheduled_at).toLocaleString()}`
+                            : new Date(j.updated_at).toLocaleString()}
+                      </div>
                     </div>
                   ),
                 },
               ]}
-              renderMobileCard={(j) => (
-                <div className="space-y-1 text-xs">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-mono font-bold text-[#2F3033]">
-                      {j.bill_number || j.id.slice(0, 8)}
-                    </span>
-                    <StatusBadge label={j.status} tone={statusTone(j.status)} />
+              renderMobileCard={(j) => {
+                const wa = formatWhatsAppDelivery(j);
+                return (
+                  <div className="space-y-1 text-xs">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-mono font-bold text-[#2F3033]">
+                        {j.bill_number || j.id.slice(0, 8)}
+                      </span>
+                      <StatusBadge label={j.status} tone={statusTone(j.status)} />
+                    </div>
+                    <div className="text-[11px] text-[#6F737D]">
+                      {j.event_type} · {j.masked_phone || 'No phone'} · {formatDownstreamHttp(j)}
+                    </div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <StatusBadge label={wa.label} tone={wa.tone} />
+                      {j.completed_at && (
+                        <span className="text-[10px] text-[#6F737D] tabular-nums">
+                          {new Date(j.completed_at).toLocaleTimeString()}
+                        </span>
+                      )}
+                    </div>
+                    {j.last_error && <div className="text-[11px] text-[#B91C1C]">{j.last_error}</div>}
                   </div>
-                  <div className="text-[11px] text-[#6F737D]">
-                    {j.event_type} · {j.masked_phone || 'No phone'} ·{' '}
-                    {j.last_http_status ? `HTTP ${j.last_http_status}` : 'Pending'}
-                  </div>
-                  {j.last_error && <div className="text-[11px] text-[#B91C1C]">{j.last_error}</div>}
-                </div>
-              )}
+                );
+              }}
             />
           </Card>
 

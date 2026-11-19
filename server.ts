@@ -1674,6 +1674,25 @@ function startInternalSaleNotificationDispatcher() {
   }
 }
 
+function parseSaleTimestampIso(raw: unknown): string {
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    const ms = raw < 1e12 ? raw * 1000 : raw;
+    const d = new Date(ms);
+    if (!Number.isNaN(d.getTime())) return d.toISOString();
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (/^\d{10,13}$/.test(trimmed)) {
+      const n = Number(trimmed);
+      const d = new Date(trimmed.length === 10 ? n * 1000 : n);
+      if (!Number.isNaN(d.getTime())) return d.toISOString();
+    }
+    const parsed = Date.parse(trimmed);
+    if (!Number.isNaN(parsed)) return new Date(parsed).toISOString();
+  }
+  return new Date().toISOString();
+}
+
 async function upsertNotificationJobSafe(
   db: ReturnType<typeof getCentralSupabaseClient>,
   row: {
@@ -5176,9 +5195,7 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
       }
 
       // Register notification jobs only after the bill is durably persisted.
-      const saleTime = bill.createdAt && !Number.isNaN(Date.parse(bill.createdAt))
-        ? new Date(bill.createdAt).toISOString()
-        : new Date().toISOString();
+      const saleTime = parseSaleTimestampIso(bill.createdAt);
       const sendReceipts = outletRoute ? Boolean(outletRoute.send_receipts) : true;
       const sendFeedback = outletRoute ? Boolean(outletRoute.send_feedback) : true;
       const basePayload = {
@@ -5298,8 +5315,7 @@ app.post('/api/mobile/sync/orders', requireAuth, async (req, res) => {
         return res.status(403).json({ success: false, message: 'Order outlet mismatch' });
       }
       const cleanIdempotencyKey = String(idempotency_key);
-      const billedAt = order.createdAt && !Number.isNaN(Date.parse(order.createdAt))
-        ? new Date(order.createdAt).toISOString() : new Date().toISOString();
+      const billedAt = parseSaleTimestampIso(order.createdAt);
 
       const { error } = await db.from('smav_central_sales').upsert({
         outlet_id: session.activeOutlet.id,
