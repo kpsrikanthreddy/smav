@@ -3200,13 +3200,27 @@ async function resolveOutletTargetDescriptor(codeOrId: string, callerJwt?: strin
   const db = callerJwt ? getCentralSupabaseClient(callerJwt) : serviceClient;
   if (db) {
     try {
-      const { data } = await db
-        .from('smav_outlets')
-        .select('*')
-        .or(`outlet_code.ilike.${target},id.eq.${target}`)
-        .limit(1);
-      if (data && data[0]) {
-        const mapped = outletFromRow(data[0]);
+      // Query text codes separately from UUID ids. Combining
+      // `id.eq.glossylooks` in an OR filter makes Postgres cast the outlet code
+      // to UUID, causing the whole request to fail even when outlet_code exists.
+      const lookupBy = async (column: 'outlet_code' | 'code' | 'id') => {
+        const { data, error } = await db
+          .from('smav_outlets')
+          .select('*')
+          .eq(column, target)
+          .limit(1);
+        if (error) throw error;
+        return data?.[0] || null;
+      };
+
+      let row = await lookupBy('outlet_code');
+      if (!row) row = await lookupBy('code');
+      if (!row && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(target)) {
+        row = await lookupBy('id');
+      }
+
+      if (row) {
+        const mapped = outletFromRow(row);
         return {
           id: mapped.id,
           code: mapped.code,
