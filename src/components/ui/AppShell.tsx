@@ -1,5 +1,5 @@
 import React from 'react';
-import { Download, LogOut, Printer } from 'lucide-react';
+import { LogOut, Printer, ShoppingCart } from 'lucide-react';
 import { StatusBadge } from './StatusBadge';
 
 export interface AppShellTab {
@@ -27,6 +27,9 @@ export interface AppShellProps {
   onOutletChange?: (outletId: string) => void;
   isSwitchingOutlet?: boolean;
   onLogout: () => void;
+  cartItemCount?: number;
+  cartTotalAmount?: number;
+  onOpenSelectedCart?: () => void;
   bannerError?: string | null;
   children: React.ReactNode;
 }
@@ -45,6 +48,9 @@ export const AppShell: React.FC<AppShellProps> = ({
   onOutletChange,
   isSwitchingOutlet = false,
   onLogout,
+  cartItemCount = 0,
+  cartTotalAmount = 0,
+  onOpenSelectedCart,
   bannerError,
   children,
 }) => {
@@ -92,16 +98,25 @@ export const AppShell: React.FC<AppShellProps> = ({
                 </select>
               )}
 
-              <a
-                href="/api/download/android-project.zip"
-                download="SMAV-Print-Agent-Android.zip"
-                className="min-h-[38px] inline-flex items-center gap-1.5 rounded-xl border border-[#E5E7EC] bg-white hover:bg-[#F5F6FA] px-2.5 sm:px-3 py-1.5 text-xs font-semibold text-[#2F3033] transition"
-                title="Download native Kotlin Android Studio project"
+              <button
+                type="button"
+                onClick={onOpenSelectedCart}
+                className={`min-h-[38px] inline-flex items-center gap-1.5 rounded-xl border px-2.5 sm:px-3 py-1.5 text-xs font-semibold transition cursor-pointer ${
+                  cartItemCount > 0
+                    ? 'border-[#FF1B7A]/40 bg-[#FFF1F7] hover:bg-[#FFE4F0] text-[#2F3033]'
+                    : 'border-[#E5E7EC] bg-white hover:bg-[#F5F6FA] text-[#2F3033]'
+                }`}
+                title="Open Selected Cart"
               >
-                <Download className="w-3.5 h-3.5 text-[#FF1B7A]" />
-                <span className="hidden md:inline">Android App (.ZIP)</span>
-                <span className="md:hidden sr-only">Android ZIP</span>
-              </a>
+                <ShoppingCart className="w-3.5 h-3.5 text-[#FF1B7A] shrink-0" />
+                <span className="hidden sm:inline">Selected Cart</span>
+                <span className="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 rounded-md bg-[#FF1B7A] text-white text-[11px] font-bold tabular-nums">
+                  {cartItemCount}
+                </span>
+                <span className="font-bold text-[#2F3033] tabular-nums">
+                  ₹{Math.round(cartTotalAmount).toLocaleString('en-IN')}
+                </span>
+              </button>
 
               <button
                 type="button"

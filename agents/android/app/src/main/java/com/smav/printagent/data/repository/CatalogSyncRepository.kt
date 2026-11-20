@@ -10,6 +10,8 @@ import com.smav.printagent.data.local.OutletCatalogDatabase
 import com.smav.printagent.data.local.entities.CachedMenuItemEntity
 import com.smav.printagent.data.local.entities.CachedSalonServiceEntity
 import com.smav.printagent.data.local.entities.CatalogSyncStateEntity
+import com.smav.printagent.data.local.entities.PreallocatedBillNumberEntity
+import com.smav.printagent.model.BranchOption
 import com.smav.printagent.model.BusinessType
 import com.smav.printagent.model.RestaurantMenuItem
 import com.smav.printagent.model.RestaurantTable
@@ -26,6 +28,7 @@ import com.smav.printagent.network.optDouble
 import com.smav.printagent.network.optInt
 import com.smav.printagent.network.optLong
 import com.smav.printagent.network.optString
+import com.smav.printagent.util.BillIdGenerator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -41,6 +44,9 @@ data class PosInitBundle(
     val stylists: List<Stylist> = emptyList(),
     val appointments: List<SalonAppointment> = emptyList(),
     val stylistWarning: String? = null,
+    val branches: List<BranchOption> = emptyList(),
+    val autoSelectedBranch: BranchOption? = null,
+    val offlinePreallocatedCounts: Map<String, Int> = emptyMap(),
     val menuItems: List<RestaurantMenuItem> = emptyList(),
     val tables: List<RestaurantTable> = emptyList(),
     val retailProducts: List<RetailProduct> = emptyList()
@@ -163,6 +169,30 @@ class CatalogSyncRepository(
                         }
                     }
 
+                    var branches = parseBranches(body.getAsJsonArray("branches"))
+                    if (branches.isEmpty()) {
+                        val branchRes = runCatching { api.getPermittedBranches(bearer) }.getOrNull()
+                        val branchBody = branchRes?.body()
+                        if (branchRes != null && branchRes.isSuccessful && branchBody != null) {
+                            branches = parseBranches(branchBody.getAsJsonArray("branches"))
+                        }
+                    }
+                    if (branches.isNotEmpty()) {
+                        sessionManager.savePermittedBranches(outletId, branches)
+                    } else {
+                        branches = sessionManager.getPermittedBranches(outletId)
+                    }
+                    // Preselect ONLY when authenticated user has exactly 1 assigned branch
+                    val autoSelectedBranch = if (branches.size == 1) branches.first() else null
+
+                    // Proactively replenish offline branch-specific preallocated bill number ranges
+                    val offlineCounts = ensureOfflineBillNumberRanges(
+                        api = api,
+                        bearer = bearer,
+                        outletId = outletId,
+                        branches = branches
+                    )
+
                     Result.success(
                         PosInitBundle(
                             outletId = outletId,
@@ -172,7 +202,10 @@ class CatalogSyncRepository(
                             salonServices = services,
                             stylists = stylists,
                             appointments = appointments,
-                            stylistWarning = stylistWarning
+                            stylistWarning = stylistWarning,
+                            branches = branches,
+                            autoSelectedBranch = autoSelectedBranch,
+                            offlinePreallocatedCounts = offlineCounts
                         )
                     )
                 }
@@ -286,12 +319,21 @@ class CatalogSyncRepository(
                         )
                     }
                 }
+                val cachedBranches = sessionManager.getPermittedBranches(outletId)
+                val todayIso = BillIdGenerator.getIndiaIsoDate()
+                database.preallocatedBillNumberDao().expireBeforeDate(todayIso)
+                val poolCounts = cachedBranches.associate { br ->
+                    br.branchCode to database.preallocatedBillNumberDao().countAvailable(outletId, br.branchCode, todayIso)
+                }
                 if (services.isEmpty()) null else PosInitBundle(
                     outletId = outletId,
                     businessType = BusinessType.SALON,
                     revision = database.cachedCatalogDao().getSyncState("the_glossy_looks")?.currentRevision ?: 0L,
                     fromCache = true,
-                    salonServices = services
+                    salonServices = services,
+                    branches = cachedBranches,
+                    autoSelectedBranch = if (cachedBranches.size == 1) cachedBranches.first() else null,
+                    offlinePreallocatedCounts = poolCounts
                 )
             }
 
@@ -492,6 +534,19 @@ class CatalogSyncRepository(
         }
     }
 
+    private fun normalizeAuthoritativeRoleLabel(rawRole: String): String {
+        return when (rawRole.trim().uppercase().replace(Regex("[\\s-]+"), "_")) {
+            "STYLIST" -> "Stylist"
+            "RECEPTIONIST" -> "Receptionist"
+            "INVENTORY_STAFF" -> "Inventory Staff"
+            "MANAGER" -> "Manager"
+            "OWNER" -> "Owner"
+            "ADMIN" -> "Admin"
+            "POS_BILLING", "STAFF" -> "POS Billing"
+            else -> ""
+        }
+    }
+
     private fun parseStylists(array: JsonArray?): List<Stylist> {
         if (array == null) return emptyList()
         return array.mapNotNull { el ->
@@ -505,10 +560,15 @@ class CatalogSyncRepository(
                 obj.optBool("isAvailable", true)
             }
             if (!available) return@mapNotNull null
+            // Authoritative Glossy Looks public.users.role only — never use public.staff.role job titles
+            val nestedUsersRole = obj.get("users").asJsonObjectOrNull()?.optString("role").orEmpty()
+            val rawAuthRole = obj.optString("userRole", "user_role", "sourceRole", "source_role", "role")
+                .ifBlank { nestedUsersRole }
+            val normalizedRole = normalizeAuthoritativeRoleLabel(rawAuthRole)
             Stylist(
                 id = id,
                 name = name,
-                specialty = obj.optString("role", "specialty", "designation", "jobTitle", "job_title"),
+                specialty = normalizedRole.ifBlank { "Stylist" },
                 branchId = obj.optString("outletId", "branchId", "branch_id", "outlet_id", "outletCode", "outlet_code"),
                 isAvailable = true
             )
@@ -596,5 +656,88 @@ class CatalogSyncRepository(
                 isActive = obj.optBool("isActive", true)
             )
         }
+    }
+
+    private fun parseBranches(array: JsonArray?): List<BranchOption> {
+        if (array == null) return emptyList()
+        return array.mapNotNull { el ->
+            val obj = el.asJsonObjectOrNull() ?: return@mapNotNull null
+            val code = obj.optString("branchCode", "branch_code").trim().uppercase()
+            if (code.isBlank()) return@mapNotNull null
+            val name = obj.optString("branchName", "branch_name").ifBlank { BranchOption.displayNameForCode(code) }
+            val id = obj.optString("id").ifBlank { "branch_$code" }
+            val prefix = obj.optString("billPrefix", "bill_prefix").ifBlank { "TGL" }
+            BranchOption(
+                id = id,
+                branchCode = code,
+                branchName = name,
+                billPrefix = prefix
+            )
+        }
+    }
+
+    /**
+     * Proactively tops up centrally preallocated, branch-specific bill numbers for safe offline billing.
+     */
+    suspend fun ensureOfflineBillNumberRanges(
+        api: com.smav.printagent.network.ApiService,
+        bearer: String,
+        outletId: String,
+        branches: List<BranchOption>,
+        lowWaterMark: Int = 5,
+        batchSize: Int = 15
+    ): Map<String, Int> {
+        val todayIso = BillIdGenerator.getIndiaIsoDate()
+        val dao = database.preallocatedBillNumberDao()
+        dao.expireBeforeDate(todayIso)
+        val counts = mutableMapOf<String, Int>()
+        for (br in branches) {
+            var available = dao.countAvailable(outletId, br.branchCode, todayIso)
+            if (available < lowWaterMark) {
+                runCatching {
+                    val req = JsonObject().apply {
+                        addProperty("outletId", outletId)
+                        addProperty("branchCode", br.branchCode)
+                        addProperty("deviceId", sessionManager.deviceId)
+                        addProperty("count", batchSize)
+                        addProperty("sourceSystem", "smav_android_agent")
+                    }
+                    val resp = api.allocateBillNumberRange(bearer, req)
+                    val respBody = resp.body()
+                    if (resp.isSuccessful && respBody != null && respBody.optBool("success", false)) {
+                        val batchId = respBody.optString("batchId").ifBlank { "batch_${System.currentTimeMillis()}" }
+                        val numbersArr = respBody.getAsJsonArray("numbers")
+                        val entities = mutableListOf<PreallocatedBillNumberEntity>()
+                        numbersArr?.forEach { itemEl ->
+                            val itemObj = itemEl.asJsonObjectOrNull() ?: return@forEach
+                            val centralId = itemObj.optString("centralBillId")
+                            val centralNum = itemObj.optString("centralBillNumber")
+                            if (centralId.isBlank() || centralNum.isBlank()) return@forEach
+                            entities.add(
+                                PreallocatedBillNumberEntity(
+                                    centralBillId = centralId,
+                                    centralBillNumber = centralNum,
+                                    outletId = outletId,
+                                    branchId = itemObj.optString("branchId").ifBlank { br.id },
+                                    branchCode = itemObj.optString("branchCode").ifBlank { br.branchCode },
+                                    branchName = itemObj.optString("branchName").ifBlank { br.branchName },
+                                    billingDate = itemObj.optString("billingDate").ifBlank { todayIso },
+                                    sequenceNumber = itemObj.optInt("sequenceNumber", default = 0),
+                                    batchId = itemObj.optString("batchId").ifBlank { batchId },
+                                    idempotencyKey = itemObj.optString("idempotencyKey").ifBlank { "PREALLOC_$centralNum" },
+                                    status = "AVAILABLE"
+                                )
+                            )
+                        }
+                        if (entities.isNotEmpty()) {
+                            dao.insertAll(entities)
+                            available = dao.countAvailable(outletId, br.branchCode, todayIso)
+                        }
+                    }
+                }
+            }
+            counts[br.branchCode] = available
+        }
+        return counts
     }
 }

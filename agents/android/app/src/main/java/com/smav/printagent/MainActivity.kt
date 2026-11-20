@@ -481,6 +481,9 @@ private fun SmavAuthenticatedApp(
     val scope = rememberCoroutineScope()
     var currentRoute by remember(session.role) { mutableStateOf(defaultRouteForRole(session.role)) }
     var showOutletSwitcher by remember { mutableStateOf(false) }
+    var cartItemCount by remember(session.businessId) { mutableStateOf(0) }
+    var cartTotalAmount by remember(session.businessId) { mutableStateOf(0.0) }
+    var openCartSignal by remember { mutableStateOf(0) }
 
     // Observe outlet-scoped pending offline bill counts
     val pendingSalon by database.salonBillDao().countPendingBillsForBranch(session.businessId).collectAsState(initial = 0)
@@ -512,7 +515,13 @@ private fun SmavAuthenticatedApp(
         onOpenOutletSwitcher = if (session.role.isSuperadmin() || session.assignedOutlets.size > 1) {
             { showOutletSwitcher = true }
         } else null,
-        onSignOutConfirmed = { onSignedOut(null) }
+        onSignOutConfirmed = { onSignedOut(null) },
+        cartItemCount = cartItemCount,
+        cartTotalAmount = cartTotalAmount,
+        onOpenSelectedCart = {
+            currentRoute = SmavRoute.POS_BILLING
+            openCartSignal += 1
+        }
     ) { innerPadding ->
         Box(
             modifier = Modifier
@@ -636,7 +645,12 @@ private fun SmavAuthenticatedApp(
                     onOpenOutletSwitcher = { showOutletSwitcher = true },
                     onOpenRecentBills = { currentRoute = SmavRoute.POS_RECENT_BILLS },
                     onOpenPrinterSettings = { currentRoute = SmavRoute.PRINTER_SETTINGS },
-                    onUnauthorized = { msg -> onSignedOut(msg) }
+                    onUnauthorized = { msg -> onSignedOut(msg) },
+                    onCartSummaryChange = { count, total ->
+                        cartItemCount = count
+                        cartTotalAmount = total
+                    },
+                    openCartSignal = openCartSignal
                 )
 
                 SmavRoute.POS_RECENT_BILLS -> RecentBillsScreen(

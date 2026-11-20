@@ -160,3 +160,48 @@ class SyncDuplicatePreventionTest {
         assertEquals(1, syncLog.size)
     }
 }
+
+class LedgerAndPermissionsTest {
+
+    @Test
+    fun testOutletLocalTodayBoundaryFiltering() {
+        val nowMs = System.currentTimeMillis()
+        val startOfTodayIst = com.smav.printagent.util.BillIdGenerator.getStartOfTodayMillis(nowMs, "Asia/Kolkata")
+        val yesterdayMs = startOfTodayIst - 60_000L
+
+        assertTrue(com.smav.printagent.util.BillIdGenerator.isSameOutletLocalDay(nowMs, nowMs, "Asia/Kolkata"))
+        assertFalse(com.smav.printagent.util.BillIdGenerator.isSameOutletLocalDay(yesterdayMs, nowMs, "Asia/Kolkata"))
+        assertTrue(nowMs >= startOfTodayIst)
+        assertTrue(yesterdayMs < startOfTodayIst)
+    }
+
+    @Test
+    fun testOnlyAdminOrManagerCanEditOrVoidBills() {
+        assertTrue(UserRole.SUPERADMIN.isAdminOrAbove())
+        assertTrue(UserRole.ADMIN.isAdminOrAbove())
+        assertTrue(UserRole.OWNER.isAdminOrAbove())
+        assertTrue(UserRole.MANAGER.isAdminOrAbove())
+
+        assertFalse(UserRole.STAFF.isAdminOrAbove())
+        assertEquals("POS_BILLING", UserRole.STAFF.visibleRole)
+        assertFalse(UserRole.SALON_RECEPTIONIST.isAdminOrAbove())
+        assertFalse(UserRole.CASHIER.isAdminOrAbove())
+    }
+}
+
+class CentralBillNumberAndBranchTest {
+
+    @Test
+    fun testCanonicalGlossyBranchNames() {
+        assertEquals("Gachibowli", com.smav.printagent.model.BranchOption.displayNameForCode("GACHI"))
+        assertEquals("Kondapur", com.smav.printagent.model.BranchOption.displayNameForCode("KONDA"))
+    }
+
+    @Test
+    fun testCentralBillNumberFormatValidation() {
+        assertTrue(com.smav.printagent.util.BillIdGenerator.isValidBillNumber("TGL-GACHI-20261120-0001"))
+        assertTrue(com.smav.printagent.util.BillIdGenerator.isValidBillNumber("TGL-KONDA-20261120-0002"))
+        assertFalse(com.smav.printagent.util.BillIdGenerator.isValidBillNumber("GL-2026-0001"))
+    }
+}
+

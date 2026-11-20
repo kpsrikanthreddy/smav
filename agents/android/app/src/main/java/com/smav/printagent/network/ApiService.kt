@@ -18,6 +18,7 @@ import retrofit2.Response
 import retrofit2.http.Body
 import retrofit2.http.GET
 import retrofit2.http.Header
+import retrofit2.http.PATCH
 import retrofit2.http.POST
 import retrofit2.http.PUT
 import retrofit2.http.Path
@@ -457,4 +458,49 @@ interface ApiService {
         @Header("Authorization") token: String,
         @Body request: SyncPrintStatusRequest
     ): Response<SyncResponse>
+
+    // 6. Today-Only Outlet-Local Transaction Ledger, Audited Edit & Soft-Delete (Void)
+    @GET("api/pos/ledger/today")
+    suspend fun getTodayLedger(
+        @Header("Authorization") token: String,
+        @Query("timezone") timezone: String = "Asia/Kolkata"
+    ): Response<JsonObject>
+
+    @PATCH("api/pos/bills/{billId}")
+    suspend fun editBill(
+        @Header("Authorization") token: String,
+        @Path("billId") billId: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
+
+    @POST("api/pos/bills/{billId}/void")
+    suspend fun voidBill(
+        @Header("Authorization") token: String,
+        @Path("billId") billId: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
+
+    // 7. Central Bill Numbering, Mandatory Branch Selection & Offline Range Preallocation
+    @GET("api/pos/branches")
+    suspend fun getPermittedBranches(
+        @Header("Authorization") token: String
+    ): Response<JsonObject>
+
+    @POST("api/central/bill-numbers/reserve")
+    suspend fun reserveCentralBillNumber(
+        @Header("Authorization") token: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
+
+    @POST("api/central/bill-numbers/finalize")
+    suspend fun finalizeCentralBillNumber(
+        @Header("Authorization") token: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
+
+    @POST("api/central/bill-numbers/allocate-range")
+    suspend fun allocateBillNumberRange(
+        @Header("Authorization") token: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
 }

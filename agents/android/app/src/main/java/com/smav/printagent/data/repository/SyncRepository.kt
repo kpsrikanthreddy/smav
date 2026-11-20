@@ -60,7 +60,7 @@ class SyncRepository(
                 sessionManager.touchSessionValidatedAt()
             }
 
-            // 1. Sync Salon Bills strictly belonging to the active outlet
+            // 1. Sync Salon Bills strictly belonging to the active outlet (preserving already-printed central bill number)
             if (session.businessType == BusinessType.SALON) {
                 val pendingBills = database.salonBillDao().getUnsyncedBills().filter {
                     it.branchId == activeOutletId || it.branchId == session.branchId
@@ -71,12 +71,26 @@ class SyncRepository(
                         val items = database.salonBillDao().getItemsForBill(bill.id)
                         if (items.isEmpty()) continue
 
+                        val resolvedBranchName = bill.branchName?.takeIf { it.isNotBlank() }
+                            ?: com.smav.printagent.model.BranchOption.displayNameForCode(bill.branchCode)
+
                         val billObj = JsonObject().apply {
+                            addProperty("id", bill.id)
                             addProperty("outletId", activeOutletId)
                             addProperty("billNumber", bill.billNumber)
+                            addProperty("centralBillNumber", bill.billNumber)
+                            if (!bill.centralBillId.isNullOrBlank()) {
+                                addProperty("centralBillId", bill.centralBillId)
+                            }
+                            addProperty("branchCode", bill.branchCode)
+                            addProperty("branchName", resolvedBranchName)
+                            addProperty("sourceSystem", bill.sourceSystem.ifBlank { "smav_android_agent" })
                             addProperty("customerName", bill.customerName ?: "Walk-in Guest")
                             addProperty("customerPhone", bill.customerPhone ?: "")
                             addProperty("paymentMode", bill.paymentMode)
+                            addProperty("subtotal", bill.subtotal)
+                            addProperty("discountAmount", bill.discountAmount)
+                            addProperty("totalTax", bill.totalTax)
                             addProperty("grandTotal", bill.grandTotal)
                             addProperty("createdAt", formatIsoUtc(bill.createdAtLocal))
                         }
@@ -115,6 +129,15 @@ class SyncRepository(
                             database.salonBillDao().updateSyncStatus(syncedId, "SYNCED", null, body.serverTimestamp)
                         }
                         totalSynced += body.syncedIds.size
+                    }
+                }
+
+                // Replenish offline preallocated bill number ranges on reconnect when below threshold
+                val cachedBranches = sessionManager.getPermittedBranches(activeOutletId)
+                if (cachedBranches.isNotEmpty()) {
+                    runCatching {
+                        CatalogSyncRepository(context, database, sessionManager)
+                            .ensureOfflineBillNumberRanges(api, bearer, activeOutletId, cachedBranches)
                     }
                 }
             }
@@ -189,6 +212,56 @@ class SyncRepository(
                     return@withContext Result.failure(
                         IOException("Retail bills are saved safely offline. Server endpoint POST /api/mobile/sync/retail-bills is required for cloud upload.")
                     )
+                }
+            }
+
+            // 3B. Replay queued offline bill_edit and bill_void mutations safely after bill creation sync
+            val queuedMutations = database.syncQueueDao().getQueuedItems().filter {
+                it.entityType == "bill_edit" || it.entityType == "bill_void"
+            }
+            for (mutation in queuedMutations) {
+                try {
+                    val payload = com.google.gson.JsonParser.parseString(mutation.payloadJson).asJsonObject
+                    val billIdentifier = payload.get("billNumber")?.asString?.takeIf { it.isNotBlank() }
+                        ?: mutation.recordId
+                    val resp = if (mutation.entityType == "bill_edit") {
+                        api.editBill(bearer, billIdentifier, payload)
+                    } else {
+                        api.voidBill(bearer, billIdentifier, payload)
+                    }
+                    when {
+                        resp.code() == 401 -> {
+                            throw UnauthorizedSessionException(SmavApiClient.parseErrorMessage(resp))
+                        }
+                        resp.code() == 409 || resp.code() == 403 -> {
+                            val conflictMsg = SmavApiClient.parseErrorMessage(
+                                resp,
+                                if (resp.code() == 409) {
+                                    "Offline edit/void conflict detected on server. Refresh ledger before retrying."
+                                } else {
+                                    "Forbidden: Only SUPERADMIN, ADMIN, or MANAGER can edit or void bills."
+                                }
+                            )
+                            database.syncQueueDao().updateStatus(mutation.id, "CONFLICT", conflictMsg)
+                            database.salonBillDao().markConflict(mutation.recordId, conflictMsg)
+                            database.restaurantOrderDao().markConflict(mutation.recordId, conflictMsg)
+                            database.retailBillDao().markConflict(mutation.recordId, conflictMsg)
+                        }
+                        resp.isSuccessful -> {
+                            database.syncQueueDao().markSynced(mutation.id, System.currentTimeMillis())
+                            database.salonBillDao().updateSyncStatus(mutation.recordId, "SYNCED", null, System.currentTimeMillis())
+                            database.restaurantOrderDao().updateSyncStatus(mutation.recordId, "SYNCED", null, System.currentTimeMillis())
+                            totalSynced += 1
+                        }
+                        else -> {
+                            val errMsg = SmavApiClient.parseErrorMessage(resp, "Mutation sync failed (HTTP ${resp.code()})")
+                            database.syncQueueDao().recordRetry(mutation.id, errMsg)
+                        }
+                    }
+                } catch (u: UnauthorizedSessionException) {
+                    throw u
+                } catch (e: Exception) {
+                    database.syncQueueDao().recordRetry(mutation.id, e.message ?: "Offline mutation retry pending")
                 }
             }
 

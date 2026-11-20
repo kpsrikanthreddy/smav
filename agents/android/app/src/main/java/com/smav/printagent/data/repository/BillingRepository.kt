@@ -2,6 +2,8 @@ package com.smav.printagent.data.repository
 
 import android.content.Context
 import com.google.gson.Gson
+import com.google.gson.JsonArray
+import com.google.gson.JsonObject
 import com.smav.printagent.bluetooth.BluetoothPrinterManager
 import com.smav.printagent.data.local.AppDatabase
 import com.smav.printagent.data.local.entities.PrintJobEntity
@@ -13,16 +15,21 @@ import com.smav.printagent.data.local.entities.SalonBillEntity
 import com.smav.printagent.data.local.entities.SalonBillItemEntity
 import com.smav.printagent.data.local.entities.SyncQueueEntity
 import com.smav.printagent.model.Branch
+import com.smav.printagent.model.BranchOption
 import com.smav.printagent.model.PrinterConnectionStatus
 import com.smav.printagent.model.PrinterPurpose
 import com.smav.printagent.model.RestaurantCartItem
 import com.smav.printagent.model.RetailCartItem
 import com.smav.printagent.model.SalonCartItem
+import com.smav.printagent.network.SmavApiClient
+import com.smav.printagent.network.optBool
+import com.smav.printagent.network.optString
 import com.smav.printagent.util.BillIdGenerator
 import com.smav.printagent.util.ReceiptFormatter
 import com.smav.printagent.worker.OfflineSyncWorker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.util.Locale
 import java.util.UUID
 
 class BillingRepository(
@@ -48,9 +55,17 @@ class BillingRepository(
         return printerManager.printBytes(bytes, purpose)
     }
 
+    suspend fun getOfflinePreallocatedCount(outletId: String, branchCode: String): Int = withContext(Dispatchers.IO) {
+        val todayIso = BillIdGenerator.getIndiaIsoDate()
+        database.preallocatedBillNumberDao().expireBeforeDate(todayIso)
+        database.preallocatedBillNumberDao().countAvailable(outletId, branchCode.uppercase(Locale.ENGLISH), todayIso)
+    }
+
     /**
-     * Creates and saves a Salon Bill offline first in Room SQLite.
-     * Queues print job and auto-sync immediately.
+     * Creates and saves a Salon Bill using ONLY centrally issued bill numbers:
+     * - Online: reserves atomically from SMAV central API (POST /api/central/bill-numbers/reserve) with deterministic idempotencyKey.
+     * - Offline: consumes a single centrally preallocated, branch-specific number permanently (never reused).
+     * - If offline with no preallocated number available: blocks generation with exact required message.
      */
     suspend fun createSalonBill(
         cartItems: List<SalonCartItem>,
@@ -58,12 +73,24 @@ class BillingRepository(
         customerPhone: String?,
         paymentMode: String,
         branch: Branch,
+        selectedBranch: BranchOption?,
         cashierName: String,
+        checkoutAttemptId: String = UUID.randomUUID().toString(),
         shouldPrint: Boolean = true
     ): Result<SalonBillEntity> = withContext(Dispatchers.IO) {
         if (cartItems.isEmpty()) {
             return@withContext Result.failure(IllegalArgumentException("Cart is empty"))
         }
+        val normalizedBranchCode = selectedBranch?.branchCode?.trim()?.uppercase(Locale.ENGLISH).orEmpty()
+        if (selectedBranch == null || normalizedBranchCode !in setOf("GACHI", "KONDA")) {
+            return@withContext Result.failure(
+                IllegalArgumentException("Branch selection is mandatory before generating a bill.")
+            )
+        }
+        val normalizedBranchName = selectedBranch.branchName.ifBlank {
+            BranchOption.displayNameForCode(normalizedBranchCode)
+        }
+
         val normalizedCustomerName = customerName?.trim().orEmpty()
         val normalizedCustomerPhone = customerPhone?.trim().orEmpty()
         if (normalizedCustomerName.isBlank()) {
@@ -78,24 +105,82 @@ class BillingRepository(
             )
         }
 
+        val session = sessionManager.getStaffSession()
+            ?: return@withContext Result.failure(IllegalStateException("Active session required."))
         val deviceId = sessionManager.deviceId
-        val branchCode = branch.code.ifBlank { "GACH" }
-        val billBranchCode = BillIdGenerator.salonBranchCode(branchCode, branch.name, branch.address)
+        val billId = UUID.randomUUID().toString()
+        val reserveIdempotencyKey = "AND_${normalizedBranchCode}_${checkoutAttemptId}"
 
-        // Count every salon bill for this physical branch/date, including legacy GL bill numbers,
-        // so changing the display branch token does not restart today's sequence at 0001.
-        val todayPrefix = "%-${BillIdGenerator.getTodayDateString()}-%"
-        val existingCount = database.salonBillDao().countBillsMatchingPrefix(branchCode, todayPrefix)
-        val nextSeq = existingCount + 1
+        var centralBillId: String? = null
+        var billNumber: String? = null
+        var idempotencyKey = reserveIdempotencyKey
+        var networkFailed = false
 
-        val billNumber = BillIdGenerator.generateBillNumber("TGL", billBranchCode, nextSeq)
-        val idempotencyKey = BillIdGenerator.generateIdempotencyKey(billNumber, deviceId)
+        // 1. Online path: reserve atomic central bill number from SMAV backend
+        try {
+            val api = SmavApiClient.create(sessionManager)
+            val bearer = SmavApiClient.bearer(session.token)
+            val req = JsonObject().apply {
+                addProperty("outletId", branch.id)
+                addProperty("branchCode", normalizedBranchCode)
+                addProperty("branchName", normalizedBranchName)
+                addProperty("sourceSystem", "smav_android_agent")
+                addProperty("idempotencyKey", reserveIdempotencyKey)
+                addProperty("deviceId", deviceId)
+            }
+            val resp = api.reserveCentralBillNumber(bearer, req)
+            val body = resp.body()
+            when {
+                resp.isSuccessful && body != null && body.optBool("success", false) && body.optString("centralBillNumber").isNotBlank() -> {
+                    centralBillId = body.optString("centralBillId").takeIf { it.isNotBlank() }
+                    billNumber = body.optString("centralBillNumber")
+                    idempotencyKey = body.optString("idempotencyKey").ifBlank { reserveIdempotencyKey }
+                }
+                resp.code() in 400..499 -> {
+                    val serverMsg = SmavApiClient.parseErrorMessage(
+                        resp,
+                        "Branch validation or central bill reservation rejected (HTTP ${resp.code()})."
+                    )
+                    return@withContext Result.failure(IllegalStateException(serverMsg))
+                }
+                else -> {
+                    networkFailed = true
+                }
+            }
+        } catch (_: Exception) {
+            networkFailed = true
+        }
+
+        // 2. Offline fallback: consume a single centrally preallocated, branch-specific bill number (NEVER invent locally)
+        if (billNumber.isNullOrBlank()) {
+            val todayIso = BillIdGenerator.getIndiaIsoDate()
+            database.preallocatedBillNumberDao().expireBeforeDate(todayIso)
+            val claimed = database.preallocatedBillNumberDao().claimNextAvailable(
+                outletId = branch.id,
+                branchCode = normalizedBranchCode,
+                billingDate = todayIso,
+                billId = billId
+            )
+            if (claimed != null) {
+                centralBillId = claimed.centralBillId
+                billNumber = claimed.centralBillNumber
+                idempotencyKey = claimed.idempotencyKey.ifBlank { "PREALLOC_${claimed.centralBillNumber}" }
+            } else {
+                val msg = if (networkFailed) {
+                    "Connect to internet to obtain a valid bill number."
+                } else {
+                    "Connect to internet to obtain a valid bill number."
+                }
+                return@withContext Result.failure(IllegalStateException(msg))
+            }
+        }
+
+        val finalBillNumber = billNumber!!
 
         var subtotal = 0.0
         var totalDiscount = 0.0
         var totalCgst = 0.0
         var totalSgst = 0.0
-        val billId = UUID.randomUUID().toString()
 
         val billItems = cartItems.map { item ->
             subtotal += item.subtotal
@@ -131,10 +216,13 @@ class BillingRepository(
 
         val billEntity = SalonBillEntity(
             id = billId,
-            billNumber = billNumber,
+            billNumber = finalBillNumber,
             businessId = "the_glossy_looks",
             branchId = branch.id,
-            branchCode = branchCode,
+            branchCode = normalizedBranchCode,
+            branchName = normalizedBranchName,
+            centralBillId = centralBillId,
+            sourceSystem = "smav_android_agent",
             deviceId = deviceId,
             idempotencyKey = idempotencyKey,
             customerName = normalizedCustomerName,
@@ -181,7 +269,7 @@ class BillingRepository(
             )
 
             val printJob = PrintJobEntity(
-                billNumber = billNumber,
+                billNumber = finalBillNumber,
                 printerMac = sessionManager.getPrinterMac(PrinterPurpose.SALON_RECEIPT),
                 printerName = "Salon Thermal Printer",
                 printerPurpose = PrinterPurpose.SALON_RECEIPT.code,
@@ -562,5 +650,280 @@ class BillingRepository(
         )
         val bytes = ReceiptFormatter.formatRetailReceiptBytes(data.bill, data.items, configuredBranch, cashierName, paperWidth)
         printWithSavedFallback(bytes, PrinterPurpose.RETAIL_RECEIPT)
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // AUDITED BILL EDIT & SOFT-DELETE (VOID) WITH ROLE GUARD & OFFLINE CONFLICT PROTECTION
+    // ---------------------------------------------------------------------------------------------
+    suspend fun editSalonBillOfflineOrOnline(
+        billId: String,
+        customerName: String,
+        customerPhone: String,
+        paymentMode: String,
+        discountAmount: Double,
+        editedItems: List<SalonBillItemEntity>,
+        reason: String
+    ): Result<SalonBillEntity> = withContext(Dispatchers.IO) {
+        val session = sessionManager.getStaffSession()
+            ?: return@withContext Result.failure(IllegalStateException("Active session required."))
+        if (!session.role.isAdminOrAbove()) {
+            return@withContext Result.failure(
+                SecurityException("Forbidden: Only SUPERADMIN, ADMIN, or authorized MANAGER can edit bills.")
+            )
+        }
+        val cleanReason = reason.trim()
+        if (cleanReason.length < 5) {
+            return@withContext Result.failure(IllegalArgumentException("Audit reason must be at least 5 characters."))
+        }
+        if (editedItems.isEmpty()) {
+            return@withContext Result.failure(IllegalArgumentException("At least one service item is required."))
+        }
+
+        val existing = database.salonBillDao().getBillById(billId)
+            ?: return@withContext Result.failure(IllegalArgumentException("Salon bill not found locally."))
+        if (existing.isVoided) {
+            return@withContext Result.failure(IllegalStateException("Conflict: Bill ${existing.billNumber} is already voided."))
+        }
+
+        val subtotal = editedItems.sumOf { it.unitPrice * it.quantity }
+        val safeDiscount = discountAmount.coerceIn(0.0, subtotal)
+        val taxable = (subtotal - safeDiscount).coerceAtLeast(0.0)
+        val totalTax = Math.round(taxable * 0.18 * 100.0) / 100.0
+        val cgst = Math.round((totalTax / 2.0) * 100.0) / 100.0
+        val sgst = Math.round((totalTax - cgst) * 100.0) / 100.0
+        val rawGrand = taxable + totalTax
+        val grandTotal = Math.round(rawGrand * 100.0) / 100.0
+        val nextVersion = existing.editVersion + 1
+        val nowMs = System.currentTimeMillis()
+
+        val recalculatedItems = editedItems.map { item ->
+            val lineGross = item.unitPrice * item.quantity
+            val lineShare = if (subtotal > 0.0) lineGross / subtotal else 0.0
+            val lineDisc = Math.round(safeDiscount * lineShare * 100.0) / 100.0
+            val lineTaxable = (lineGross - lineDisc).coerceAtLeast(0.0)
+            val lineGst = Math.round(lineTaxable * (item.gstPercent / 100.0) * 100.0) / 100.0
+            item.copy(
+                billId = existing.id,
+                discountAmount = lineDisc,
+                taxableAmount = lineTaxable,
+                gstAmount = lineGst,
+                totalAmount = Math.round((lineTaxable + lineGst) * 100.0) / 100.0
+            )
+        }
+
+        val updatedEntity = existing.copy(
+            customerName = customerName.trim().ifBlank { "Walk-in Guest" },
+            customerPhone = customerPhone.trim().takeIf { it.isNotBlank() },
+            paymentMode = paymentMode.trim().lowercase(),
+            subtotal = Math.round(subtotal * 100.0) / 100.0,
+            discountAmount = Math.round(safeDiscount * 100.0) / 100.0,
+            cgstAmount = cgst,
+            sgstAmount = sgst,
+            totalTax = totalTax,
+            grandTotal = grandTotal,
+            roundOff = 0.0,
+            editVersion = nextVersion,
+            editReason = cleanReason,
+            updatedAtLocal = nowMs,
+            conflictMessage = null
+        )
+
+        val payload = JsonObject().apply {
+            addProperty("billNumber", existing.billNumber)
+            addProperty("customerName", updatedEntity.customerName ?: "Walk-in Guest")
+            addProperty("customerPhone", updatedEntity.customerPhone ?: "")
+            addProperty("paymentMode", updatedEntity.paymentMode)
+            addProperty("discountAmount", updatedEntity.discountAmount)
+            addProperty("reason", cleanReason)
+            addProperty("expectedEditVersion", existing.editVersion)
+            val arr = JsonArray()
+            recalculatedItems.forEach { it ->
+                arr.add(JsonObject().apply {
+                    addProperty("id", it.serviceId)
+                    addProperty("name", it.serviceName)
+                    addProperty("quantity", it.quantity)
+                    addProperty("unitPrice", it.unitPrice)
+                    if (!it.stylistId.isNullOrBlank()) addProperty("stylistId", it.stylistId)
+                    if (!it.stylistName.isNullOrBlank()) addProperty("stylistName", it.stylistName)
+                    addProperty("gstPercent", it.gstPercent)
+                })
+            }
+            add("items", arr)
+        }
+
+        // Persist updated bill locally first
+        database.salonBillDao().replaceBillAndItems(updatedEntity, recalculatedItems)
+
+        // Try immediate online sync; if offline, queue mutation safely with expectedEditVersion
+        try {
+            val api = SmavApiClient.create(sessionManager)
+            val resp = api.editBill(SmavApiClient.bearer(session.token), existing.billNumber, payload)
+            when {
+                resp.isSuccessful -> {
+                    database.salonBillDao().updateSyncStatus(existing.id, "SYNCED", null, System.currentTimeMillis())
+                    return@withContext Result.success(updatedEntity.copy(syncStatus = "SYNCED"))
+                }
+                resp.code() == 409 || resp.code() == 403 -> {
+                    val conflictMsg = SmavApiClient.parseErrorMessage(resp, "Server rejected edit (HTTP ${resp.code()}).")
+                    database.salonBillDao().markConflict(existing.id, conflictMsg)
+                    return@withContext Result.failure(IllegalStateException(conflictMsg))
+                }
+            }
+        } catch (_: Exception) {
+            // Fall through to offline sync queue
+        }
+
+        database.syncQueueDao().insertSyncItem(
+            SyncQueueEntity(
+                idempotencyKey = "EDIT_${existing.billNumber}_v${nextVersion}_${nowMs}",
+                entityType = "bill_edit",
+                recordId = existing.id,
+                payloadJson = payload.toString(),
+                status = "QUEUED"
+            )
+        )
+        OfflineSyncWorker.scheduleImmediateSync(context)
+        Result.success(updatedEntity.copy(syncStatus = "PENDING"))
+    }
+
+    suspend fun voidSalonBillOfflineOrOnline(
+        billId: String,
+        reason: String
+    ): Result<String> = withContext(Dispatchers.IO) {
+        val session = sessionManager.getStaffSession()
+            ?: return@withContext Result.failure(IllegalStateException("Active session required."))
+        if (!session.role.isAdminOrAbove()) {
+            return@withContext Result.failure(
+                SecurityException("Forbidden: Only SUPERADMIN, ADMIN, or authorized MANAGER can void bills.")
+            )
+        }
+        val cleanReason = reason.trim()
+        if (cleanReason.length < 5) {
+            return@withContext Result.failure(IllegalArgumentException("Void reason must be at least 5 characters."))
+        }
+
+        val existing = database.salonBillDao().getBillById(billId)
+            ?: return@withContext Result.failure(IllegalArgumentException("Salon bill not found locally."))
+        if (existing.isVoided) {
+            return@withContext Result.failure(IllegalStateException("Bill ${existing.billNumber} is already voided."))
+        }
+
+        val nowMs = System.currentTimeMillis()
+        val payload = JsonObject().apply {
+            addProperty("billNumber", existing.billNumber)
+            addProperty("reason", cleanReason)
+            addProperty("expectedEditVersion", existing.editVersion)
+        }
+
+        try {
+            val api = SmavApiClient.create(sessionManager)
+            val resp = api.voidBill(SmavApiClient.bearer(session.token), existing.billNumber, payload)
+            when {
+                resp.isSuccessful -> {
+                    database.salonBillDao().markVoided(existing.id, cleanReason, nowMs, session.userId)
+                    return@withContext Result.success("Bill ${existing.billNumber} voided (audited soft-delete).")
+                }
+                resp.code() == 409 || resp.code() == 403 -> {
+                    val conflictMsg = SmavApiClient.parseErrorMessage(resp, "Cannot void bill (HTTP ${resp.code()}).")
+                    database.salonBillDao().markConflict(existing.id, conflictMsg)
+                    return@withContext Result.failure(IllegalStateException(conflictMsg))
+                }
+            }
+        } catch (_: Exception) {
+            // Offline fallback: soft-delete locally & queue audited void sync
+        }
+
+        database.salonBillDao().markVoided(existing.id, cleanReason, nowMs, session.userId)
+        database.syncQueueDao().insertSyncItem(
+            SyncQueueEntity(
+                idempotencyKey = "VOID_${existing.billNumber}_${nowMs}",
+                entityType = "bill_void",
+                recordId = existing.id,
+                payloadJson = payload.toString(),
+                status = "QUEUED"
+            )
+        )
+        OfflineSyncWorker.scheduleImmediateSync(context)
+        Result.success("Bill ${existing.billNumber} voided offline; will sync safely when online.")
+    }
+
+    suspend fun voidRestaurantOrderOfflineOrOnline(
+        orderId: String,
+        reason: String
+    ): Result<String> = withContext(Dispatchers.IO) {
+        val session = sessionManager.getStaffSession()
+            ?: return@withContext Result.failure(IllegalStateException("Active session required."))
+        if (!session.role.isAdminOrAbove()) {
+            return@withContext Result.failure(
+                SecurityException("Forbidden: Only SUPERADMIN, ADMIN, or authorized MANAGER can void orders.")
+            )
+        }
+        val cleanReason = reason.trim()
+        if (cleanReason.length < 5) {
+            return@withContext Result.failure(IllegalArgumentException("Void reason must be at least 5 characters."))
+        }
+        val existing = database.restaurantOrderDao().getOrderById(orderId)
+            ?: return@withContext Result.failure(IllegalArgumentException("Order not found locally."))
+
+        val nowMs = System.currentTimeMillis()
+        val payload = JsonObject().apply {
+            addProperty("billNumber", existing.orderNumber)
+            addProperty("reason", cleanReason)
+            addProperty("expectedEditVersion", existing.editVersion)
+        }
+
+        try {
+            val api = SmavApiClient.create(sessionManager)
+            val resp = api.voidBill(SmavApiClient.bearer(session.token), existing.orderNumber, payload)
+            when {
+                resp.isSuccessful -> {
+                    database.restaurantOrderDao().markVoided(existing.id, cleanReason, nowMs, session.userId)
+                    return@withContext Result.success("Order ${existing.orderNumber} voided (audited soft-delete).")
+                }
+                resp.code() == 409 || resp.code() == 403 -> {
+                    val conflictMsg = SmavApiClient.parseErrorMessage(resp, "Cannot void order (HTTP ${resp.code()}).")
+                    database.restaurantOrderDao().markConflict(existing.id, conflictMsg)
+                    return@withContext Result.failure(IllegalStateException(conflictMsg))
+                }
+            }
+        } catch (_: Exception) {
+            // Offline fallback
+        }
+
+        database.restaurantOrderDao().markVoided(existing.id, cleanReason, nowMs, session.userId)
+        database.syncQueueDao().insertSyncItem(
+            SyncQueueEntity(
+                idempotencyKey = "VOID_${existing.orderNumber}_${nowMs}",
+                entityType = "bill_void",
+                recordId = existing.id,
+                payloadJson = payload.toString(),
+                status = "QUEUED"
+            )
+        )
+        OfflineSyncWorker.scheduleImmediateSync(context)
+        Result.success("Order ${existing.orderNumber} voided offline; will sync safely when online.")
+    }
+
+    suspend fun voidRetailBillOfflineOrOnline(
+        billId: String,
+        reason: String
+    ): Result<String> = withContext(Dispatchers.IO) {
+        val session = sessionManager.getStaffSession()
+            ?: return@withContext Result.failure(IllegalStateException("Active session required."))
+        if (!session.role.isAdminOrAbove()) {
+            return@withContext Result.failure(
+                SecurityException("Forbidden: Only SUPERADMIN, ADMIN, or authorized MANAGER can void bills.")
+            )
+        }
+        val cleanReason = reason.trim()
+        if (cleanReason.length < 5) {
+            return@withContext Result.failure(IllegalArgumentException("Void reason must be at least 5 characters."))
+        }
+        val existing = database.retailBillDao().getBillById(billId)
+            ?: return@withContext Result.failure(IllegalArgumentException("Retail bill not found locally."))
+
+        val nowMs = System.currentTimeMillis()
+        database.retailBillDao().markVoided(existing.id, cleanReason, nowMs, session.userId)
+        Result.success("Bill ${existing.billNumber} voided (audited soft-delete).")
     }
 }

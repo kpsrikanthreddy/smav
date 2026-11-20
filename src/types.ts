@@ -49,6 +49,8 @@ export interface OutletUserRecord {
   role: 'admin' | 'staff';
   outletRole: 'ADMIN' | 'STAFF' | string;
   displayRole: 'ADMIN' | 'POS_BILLING';
+  sourceRole?: string | null;
+  sourceDisplayRole?: string | null;
   outletId: string;
   outletCode: string;
   outletName: string;
@@ -293,3 +295,102 @@ export interface AuditLogEntry {
   details: Record<string, any>;
   timestamp: string;
 }
+
+export interface TransactionLedgerItem {
+  id?: string;
+  name: string;
+  quantity: number;
+  unitPrice: number;
+  lineTotal: number;
+  stylistId?: string | null;
+  stylistName?: string | null;
+  discountPercent?: number;
+  gstPercent?: number;
+  variantName?: string | null;
+}
+
+export interface OutletBranchOption {
+  id: string;
+  outletId?: string;
+  outletCode?: string;
+  branchCode: string;
+  branchName: string;
+  billPrefix: string;
+  isActive?: boolean;
+}
+
+export interface BillNumberReconciliationReport {
+  outletId: string;
+  outletCode: string;
+  generatedAt: string;
+  summary: {
+    totalBills: number;
+    centralLinkedBills: number;
+    legacyHistoricalBills: number;
+    missingBillNumbersCount: number;
+    duplicateBillNumbersCount: number;
+    unlinkedCentralFormatBillsCount: number;
+    reservedUnusedCount: number;
+    preallocatedAvailableCount: number;
+  };
+  duplicates: Array<{
+    billNumber: string;
+    occurrences: number;
+    billIds: string[];
+  }>;
+  missingBillNumbers: Array<{
+    billId: string;
+    createdAt: string;
+    customerName: string;
+    grandTotal: number;
+  }>;
+  unlinkedCentralFormatBills: Array<{
+    billId: string;
+    billNumber: string;
+    branchCode: string | null;
+    createdAt: string;
+  }>;
+  branchBreakdown: Array<{
+    branchCode: string;
+    branchName: string;
+    centralBills: number;
+    legacyBills: number;
+  }>;
+}
+
+export interface TransactionLedgerEntry {
+  id: string;
+  sourceTable: 'smav_salon_bills' | 'smav_central_sales' | 'memory';
+  outletId: string;
+  billNumber: string;
+  centralBillId?: string | null;
+  centralBillNumber?: string | null;
+  branchId?: string | null;
+  branchCode?: string | null;
+  branchName?: string | null;
+  sourceSystem?: string | null;
+  isLegacyBill?: boolean;
+  idempotencyKey?: string;
+  customerName: string;
+  customerPhone: string;
+  items: TransactionLedgerItem[];
+  paymentMode: string;
+  subtotal: number;
+  discountAmount: number;
+  totalTax: number;
+  grandTotal: number;
+  createdAt: string;
+  stylistNames: string[];
+  editVersion: number;
+  isVoided: boolean;
+  editedAt?: string | null;
+  editReason?: string | null;
+  voidedAt?: string | null;
+  voidReason?: string | null;
+}
+
+export interface CartHeaderSummary {
+  itemCount: number;
+  grandTotal: number;
+}
+

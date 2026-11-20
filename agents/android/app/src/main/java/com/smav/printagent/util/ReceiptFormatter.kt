@@ -60,26 +60,29 @@ object ReceiptFormatter {
     ): ByteArray {
         val b = EscPosBuilder(paperWidth)
 
-        // Header
+        // Header (Glossy Looks 80mm thermal receipt: no street address, city, PIN, or GSTIN)
         b.alignCenter()
         b.setBold(true)
         b.setDoubleSize(true)
         b.textLine("THE GLOSSY LOOKS")
         b.setDoubleSize(false)
-        b.textLine("Professional Womens Salon")
+        b.textLine("Professional Women's Salon")
         b.setBold(false)
         b.rasterImage(whatsappContactLine(paperWidth))
-        if (branch.address.isNotBlank()) {
-            b.textLine(branch.address)
-        }
-        if (branch.gstin.isNotBlank()) {
-            b.textLine("GSTIN: ${branch.gstin}")
-        }
         b.doubleDivider()
 
         // Metadata
+        val resolvedBranchName = bill.branchName?.takeIf { it.isNotBlank() }
+            ?: com.smav.printagent.model.BranchOption.displayNameForCode(bill.branchCode)
         b.alignLeft()
-        b.rowTwoColumns("Bill No: ${bill.billNumber}", "Mode: ${bill.paymentMode.uppercase(Locale.ENGLISH)}")
+        if (resolvedBranchName.isNotBlank()) {
+            b.setBold(true)
+            b.rowTwoColumns("Branch: $resolvedBranchName", "Mode: ${bill.paymentMode.uppercase(Locale.ENGLISH)}")
+            b.setBold(false)
+            b.textLine("Bill No: ${bill.billNumber}")
+        } else {
+            b.rowTwoColumns("Bill No: ${bill.billNumber}", "Mode: ${bill.paymentMode.uppercase(Locale.ENGLISH)}")
+        }
         b.rowTwoColumns("Date: ${BillIdGenerator.getFormattedDateTime(bill.createdAtLocal)}", "Staff: $cashierName")
         if (!bill.customerName.isNullOrBlank() || !bill.customerPhone.isNullOrBlank()) {
             val name = bill.customerName?.takeIf { it.isNotBlank() } ?: "Guest"

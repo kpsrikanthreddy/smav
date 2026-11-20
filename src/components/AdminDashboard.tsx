@@ -15,9 +15,16 @@ import {
   UserPlus,
   Users,
 } from 'lucide-react';
-import { OutletUserRecord, SyncOutboxItem, UserSession, getVisibleRole } from '../types';
+import {
+  BillNumberReconciliationReport,
+  OutletUserRecord,
+  SyncOutboxItem,
+  UserSession,
+  getVisibleRole,
+} from '../types';
 import { identityAdminService } from '../services/identityAdminService';
 import { IntegrationDiagnostics } from './IntegrationDiagnostics';
+import { TransactionLedger } from './TransactionLedger';
 import {
   BASE_INPUT_CLASS,
   Button,
@@ -34,9 +41,16 @@ interface AdminDashboardProps {
   session: UserSession;
   onOpenPos: () => void;
   onLogout: () => void;
+  paperWidthMm?: 58 | 80;
+  onChangePaperWidth?: (width: 58 | 80) => void;
 }
 
-export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenPos }) => {
+export const AdminDashboard: React.FC<AdminDashboardProps> = ({
+  session,
+  onOpenPos,
+  paperWidthMm = 80,
+  onChangePaperWidth,
+}) => {
   const isSuperadmin =
     session.role === 'superadmin' ||
     getVisibleRole(session.displayRole || session.role) === 'SUPERADMIN';
@@ -47,9 +61,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
   const [staffList, setStaffList] = useState<OutletUserRecord[]>([]);
   const [outboxItems, setOutboxItems] = useState<SyncOutboxItem[]>([]);
   const [reports, setReports] = useState<any>(null);
+  const [reconciliation, setReconciliation] = useState<BillNumberReconciliationReport | null>(null);
   const [catalogItems, setCatalogItems] = useState<any[]>([]);
   const [printerConfig, setPrinterConfig] = useState({
-    paperWidth: 80,
+    paperWidth: paperWidthMm,
     receiptHeader: session.activeOutlet.receiptHeader,
     receiptFooter: session.activeOutlet.receiptFooter,
     autoCut: true,
@@ -101,10 +116,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
     try {
       const headers = { Authorization: `Bearer ${session.token}` };
 
-      const [usersRes, outboxRes, repRes] = await Promise.all([
+      const [usersRes, outboxRes, repRes, reconRes] = await Promise.all([
         identityAdminService.listOutletUsers(session.token, session.activeOutlet.code),
         identityAdminService.listSyncOutbox(session.token, session.activeOutlet.code),
         fetch('/api/admin/reports', { headers }).then((r) => r.json()).catch(() => null),
+        fetch('/api/admin/bill-numbers/reconciliation', { headers })
+          .then((r) => r.json())
+          .catch(() => null),
       ]);
 
       if (usersRes.success) {
@@ -118,6 +136,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
       }
 
       if (repRes && repRes.success !== false) setReports(repRes);
+      if (reconRes && reconRes.success && reconRes.report) {
+        setReconciliation(reconRes.report);
+      }
 
       if (session.activeOutlet.category === 'salon') {
         const srvRes = await fetch('/api/salon/services', { headers });
@@ -528,6 +549,117 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
               <span className="font-mono text-[#2F3033]">{session.activeOutlet.code}</span>). Users, bills, and catalog updates are isolated per outlet.
             </p>
           </Card>
+
+          {reconciliation && (
+            <Card padding="md" className="space-y-3.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-sm font-bold text-[#2F3033]">
+                    Central Bill Number Reconciliation
+                  </h3>
+                  <p className="text-xs text-[#6F737D]">
+                    Tracks centralized TGL-{'{BRANCH}'}-YYYYMMDD-#### bills alongside preserved legacy historical bills.
+                  </p>
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void fetchAdminData()}
+                  leftIcon={<RefreshCw className="w-3.5 h-3.5" />}
+                >
+                  Refresh Audit
+                </Button>
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                <div className="p-3 rounded-xl bg-[#F9FAFC] border border-[#E5E7EC]">
+                  <div className="text-[#6F737D]">Central Linked</div>
+                  <div className="text-lg font-bold text-[#15803D] tabular-nums">
+                    {reconciliation.summary.centralLinkedBills}
+                  </div>
+                </div>
+                <div className="p-3 rounded-xl bg-[#F9FAFC] border border-[#E5E7EC]">
+                  <div className="text-[#6F737D]">Legacy Preserved</div>
+                  <div className="text-lg font-bold text-[#2F3033] tabular-nums">
+                    {reconciliation.summary.legacyHistoricalBills}
+                  </div>
+                </div>
+                <div className="p-3 rounded-xl bg-[#F9FAFC] border border-[#E5E7EC]">
+                  <div className="text-[#6F737D]">Duplicates</div>
+                  <div
+                    className={`text-lg font-bold tabular-nums ${
+                      reconciliation.summary.duplicateBillNumbersCount > 0
+                        ? 'text-[#B91C1C]'
+                        : 'text-[#15803D]'
+                    }`}
+                  >
+                    {reconciliation.summary.duplicateBillNumbersCount}
+                  </div>
+                </div>
+                <div className="p-3 rounded-xl bg-[#F9FAFC] border border-[#E5E7EC]">
+                  <div className="text-[#6F737D]">Missing Numbers</div>
+                  <div
+                    className={`text-lg font-bold tabular-nums ${
+                      reconciliation.summary.missingBillNumbersCount > 0
+                        ? 'text-[#B91C1C]'
+                        : 'text-[#15803D]'
+                    }`}
+                  >
+                    {reconciliation.summary.missingBillNumbersCount}
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-4 text-[11px] text-[#6F737D]">
+                <span>
+                  Offline Preallocated Available:{' '}
+                  <strong className="text-[#2F3033] tabular-nums">
+                    {reconciliation.summary.preallocatedAvailableCount}
+                  </strong>
+                </span>
+                <span>
+                  Reserved Pending Finalize:{' '}
+                  <strong className="text-[#2F3033] tabular-nums">
+                    {reconciliation.summary.reservedUnusedCount}
+                  </strong>
+                </span>
+                {reconciliation.branchBreakdown.map((br) => (
+                  <span key={br.branchCode}>
+                    {br.branchName} ({br.branchCode}):{' '}
+                    <strong className="text-[#2F3033] tabular-nums">
+                      {br.centralBills} central
+                    </strong>
+                    {br.legacyBills > 0 ? ` · ${br.legacyBills} legacy` : ''}
+                  </span>
+                ))}
+              </div>
+
+              {reconciliation.duplicates.length > 0 && (
+                <div className="rounded-xl border border-[#FECACA] bg-[#FEF2F2] p-3 text-xs text-[#B91C1C] space-y-1">
+                  <div className="font-bold flex items-center gap-1.5">
+                    <AlertTriangle className="w-4 h-4 shrink-0" />
+                    <span>Duplicate Bill Numbers Detected</span>
+                  </div>
+                  {reconciliation.duplicates.slice(0, 5).map((dup) => (
+                    <div key={dup.billNumber} className="font-mono text-[11px]">
+                      {dup.billNumber} — {dup.occurrences} records ({dup.billIds.join(', ')})
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {reconciliation.missingBillNumbers.length > 0 && (
+                <div className="rounded-xl border border-[#FDE68A] bg-[#FFFBEB] p-3 text-xs text-[#92400E] space-y-1">
+                  <div className="font-bold">Bills Missing Bill Number</div>
+                  {reconciliation.missingBillNumbers.slice(0, 5).map((item) => (
+                    <div key={item.billId} className="text-[11px]">
+                      ID {item.billId} · {item.customerName} · ₹{item.grandTotal}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </Card>
+          )}
         </div>
       )}
 
@@ -673,10 +805,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
                 render: (user) => {
                   const visibleRole = getVisibleRole(user.outletRole || user.displayRole || user.role);
                   return (
-                    <StatusBadge
-                      label={visibleRole}
-                      tone={visibleRole === 'ADMIN' ? 'info' : 'success'}
-                    />
+                    <div className="flex flex-col items-start gap-1">
+                      <StatusBadge
+                        label={visibleRole}
+                        tone={visibleRole === 'ADMIN' ? 'info' : 'success'}
+                      />
+                      {user.sourceDisplayRole && (
+                        <span className="text-[11px] font-medium text-[#6F737D]">
+                          {user.sourceDisplayRole}
+                        </span>
+                      )}
+                    </div>
                   );
                 },
               },
@@ -1006,122 +1145,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
         </div>
       )}
 
-      {/* TAB 4: ORDERS */}
+      {/* TAB 4: TRANSACTION LEDGER (Today's Bills Only, Outlet-Local Timezone) */}
       {activeTab === 'orders' && (
-        <div className="space-y-4">
-          <h3 className="text-sm font-bold text-[#2F3033]">Outlet Transaction Ledger</h3>
-          {reports?.recentBills && reports.recentBills.length > 0 ? (
-            <ResponsiveTable
-              rows={reports.recentBills}
-              keyExtractor={(b: any) => String(b.id)}
-              columns={[
-                {
-                  key: 'bill',
-                  header: 'Bill Number',
-                  render: (b: any) => <span className="font-mono font-semibold">{b.bill_number}</span>,
-                },
-                {
-                  key: 'customer',
-                  header: 'Customer',
-                  render: (b: any) => <span>{b.customer_name || 'Guest'}</span>,
-                },
-                {
-                  key: 'payment',
-                  header: 'Payment',
-                  render: (b: any) => <span className="uppercase text-[#6F737D]">{b.payment_mode}</span>,
-                },
-                {
-                  key: 'amount',
-                  header: 'Amount',
-                  render: (b: any) => (
-                    <span className="font-bold text-[#15803D] tabular-nums">₹{b.grand_total}</span>
-                  ),
-                },
-                {
-                  key: 'status',
-                  header: 'Status',
-                  align: 'right',
-                  render: () => <StatusBadge label="Paid & Synced" tone="success" />,
-                },
-              ]}
-              renderMobileCard={(b: any) => (
-                <div className="flex items-center justify-between gap-2 text-xs">
-                  <div>
-                    <p className="font-mono font-bold text-[#2F3033]">{b.bill_number}</p>
-                    <p className="text-[#6F737D]">
-                      {b.customer_name || 'Guest'} · {String(b.payment_mode || '').toUpperCase()}
-                    </p>
-                  </div>
-                  <div className="text-right">
-                    <p className="font-bold text-[#15803D] tabular-nums">₹{b.grand_total}</p>
-                    <StatusBadge label="Synced" tone="success" />
-                  </div>
-                </div>
-              )}
-            />
-          ) : reports?.recentOrders && reports.recentOrders.length > 0 ? (
-            <ResponsiveTable
-              rows={reports.recentOrders}
-              keyExtractor={(o: any) => String(o.id)}
-              columns={[
-                {
-                  key: 'order',
-                  header: 'Order / Token',
-                  render: (o: any) => (
-                    <span className="font-mono font-semibold">
-                      #{o.token_number} ({o.order_number})
-                    </span>
-                  ),
-                },
-                {
-                  key: 'table',
-                  header: 'Table / Mode',
-                  render: (o: any) => <span>{o.table_or_counter}</span>,
-                },
-                {
-                  key: 'payment',
-                  header: 'Payment',
-                  render: (o: any) => <span className="uppercase text-[#6F737D]">{o.payment_mode}</span>,
-                },
-                {
-                  key: 'amount',
-                  header: 'Amount',
-                  render: (o: any) => (
-                    <span className="font-bold text-[#15803D] tabular-nums">₹{o.grand_total}</span>
-                  ),
-                },
-                {
-                  key: 'status',
-                  header: 'Status',
-                  align: 'right',
-                  render: () => <StatusBadge label="Settled" tone="success" />,
-                },
-              ]}
-              renderMobileCard={(o: any) => (
-                <div className="flex items-center justify-between gap-2 text-xs">
-                  <div>
-                    <p className="font-mono font-bold text-[#2F3033]">
-                      #{o.token_number} ({o.order_number})
-                    </p>
-                    <p className="text-[#6F737D]">
-                      {o.table_or_counter} · {String(o.payment_mode || '').toUpperCase()}
-                    </p>
-                  </div>
-                  <div className="text-right">
-                    <p className="font-bold text-[#15803D] tabular-nums">₹{o.grand_total}</p>
-                    <StatusBadge label="Settled" tone="success" />
-                  </div>
-                </div>
-              )}
-            />
-          ) : (
-            <EmptyState
-              icon={<Receipt className="w-5 h-5" />}
-              title="No transactions recorded today"
-              description="Completed POS bills and kitchen orders will appear here."
-            />
-          )}
-        </div>
+        <TransactionLedger
+          session={session}
+          onLedgerMutated={() => void fetchAdminData()}
+        />
       )}
 
       {/* TAB 5: PRINTER CONFIG */}
@@ -1153,7 +1182,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
                     type="radio"
                     name="paperWidth"
                     checked={printerConfig.paperWidth === 80}
-                    onChange={() => setPrinterConfig({ ...printerConfig, paperWidth: 80 })}
+                    onChange={() => {
+                      setPrinterConfig({ ...printerConfig, paperWidth: 80 });
+                      onChangePaperWidth?.(80);
+                    }}
                     className="accent-[#FF1B7A]"
                   />
                   <span>80mm (Counter)</span>
@@ -1163,7 +1195,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
                     type="radio"
                     name="paperWidth"
                     checked={printerConfig.paperWidth === 58}
-                    onChange={() => setPrinterConfig({ ...printerConfig, paperWidth: 58 })}
+                    onChange={() => {
+                      setPrinterConfig({ ...printerConfig, paperWidth: 58 });
+                      onChangePaperWidth?.(58);
+                    }}
                     className="accent-[#FF1B7A]"
                   />
                   <span>58mm (Compact Belt Clip)</span>
@@ -1196,9 +1231,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
             </FormField>
 
             <Button
-              onClick={() =>
-                setPrinterSavedMessage('Printer preferences saved for this outlet session.')
-              }
+              onClick={() => {
+                onChangePaperWidth?.(printerConfig.paperWidth === 58 ? 58 : 80);
+                setPrinterSavedMessage(
+                  `Printer preferences saved (${printerConfig.paperWidth}mm roll configured).`
+                );
+              }}
             >
               Save Printer Preferences
             </Button>

@@ -8,7 +8,38 @@ import {
 } from './services/saleNotificationDispatcher.ts';
 import { registerCatalogSource, resolveCatalogSource, glossyLooksSource } from './services/catalogSources';
 import { previewCatalogImport, importMissingCatalogItems, type SourceCatalogItem } from './services/catalogImport';
-import { fetchGlossyLooksStaff, isGlossyLooksOutlet, type NormalizedStylist, type SalonStaffFetchResult } from './services/salonStaff';
+import {
+  fetchGlossyLooksStaff,
+  fetchGlossyLooksAuthoritativeUsers,
+  buildAuthoritativeUserRoleIndex,
+  resolveAuthoritativeUserRole,
+  mapAuthoritativeGlossyRoleToSmav,
+  formatAuthoritativeDisplayRole,
+  isGlossyLooksOutlet,
+  type NormalizedStylist,
+  type SalonStaffFetchResult
+} from './services/salonStaff';
+import {
+  DEFAULT_OUTLET_TIMEZONE,
+  canModifyBills,
+  getOutletLocalDayBounds,
+  isTimestampInOutletLocalToday,
+  normalizeLedgerBillRow,
+  recalculateBillTotals,
+  validateBillMutationConflict,
+  type BillEditAuditSnapshot,
+  type TransactionLedgerEntry
+} from './services/billLedger';
+import {
+  CentralBillNumberCoordinator,
+  normalizeGlossyBranchCode,
+  branchNameForCode,
+  resolvePermittedBranchesForUser,
+  normalizeSourceSystem,
+  buildBillNumberReconciliationReport,
+  syncCentralBillNumberToGlossyLooks,
+  isValidCentralBillNumber
+} from './services/centralBillNumbering';
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
@@ -2781,42 +2812,14 @@ function mapGlossyProductionRole(rawRole?: string): {
   edgeRoleHint: 'OWNER' | 'MANAGER' | 'ADMIN' | 'STYLIST' | 'RECEPTIONIST' | 'INVENTORY_STAFF';
   displayTitle: string;
 } {
-  const norm = String(rawRole || '').trim().toUpperCase();
-  if (
-    norm === 'POS_BILLING' ||
-    norm === 'STAFF' ||
-    norm === 'INVENTORY_STAFF' ||
-    norm === 'RECEPTIONIST' ||
-    norm === 'STYLIST'
-  ) {
-    if (norm === 'STYLIST') {
-      return { smavRole: 'STAFF', contractRole: 'POS_BILLING', edgeRoleHint: 'STYLIST', displayTitle: rawRole || 'Salon Stylist' };
-    }
-    if (norm === 'INVENTORY_STAFF') {
-      return { smavRole: 'STAFF', contractRole: 'POS_BILLING', edgeRoleHint: 'INVENTORY_STAFF', displayTitle: rawRole || 'Inventory Staff' };
-    }
-    return { smavRole: 'STAFF', contractRole: 'POS_BILLING', edgeRoleHint: 'RECEPTIONIST', displayTitle: rawRole || 'POS Billing / Receptionist' };
-  }
-  if (
-    norm === 'OWNER' ||
-    norm.includes('OWNER') ||
-    norm.includes('DIRECTOR') ||
-    norm.includes('FOUNDER') ||
-    norm.includes('PARTNER') ||
-    norm.includes('PROPRIETOR')
-  ) {
-    return { smavRole: 'ADMIN', contractRole: 'ADMIN', edgeRoleHint: 'OWNER', displayTitle: rawRole || 'Salon Owner / Director' };
-  }
-  if (norm === 'MANAGER' || norm.includes('MANAGER') || norm === 'ADMIN') {
-    return { smavRole: 'ADMIN', contractRole: 'ADMIN', edgeRoleHint: 'MANAGER', displayTitle: rawRole || 'Salon Branch Manager' };
-  }
-  if (norm.includes('STYLIST') || norm.includes('ARTIST') || norm.includes('BEAUTICIAN')) {
-    return { smavRole: 'STAFF', contractRole: 'POS_BILLING', edgeRoleHint: 'STYLIST', displayTitle: rawRole || 'Salon Stylist' };
-  }
-  if (norm.includes('INVENTORY')) {
-    return { smavRole: 'STAFF', contractRole: 'POS_BILLING', edgeRoleHint: 'INVENTORY_STAFF', displayTitle: rawRole || 'Inventory Staff' };
-  }
-  return { smavRole: 'STAFF', contractRole: 'POS_BILLING', edgeRoleHint: 'RECEPTIONIST', displayTitle: rawRole || 'Salon Receptionist / Cashier' };
+  // Glossy Looks public.users.role is authoritative; never derive access or display role from public.staff.role job titles.
+  const mapped = mapAuthoritativeGlossyRoleToSmav(rawRole);
+  return {
+    smavRole: mapped.smavRole,
+    contractRole: mapped.contractRole,
+    edgeRoleHint: mapped.edgeRoleHint,
+    displayTitle: mapped.displayRole
+  };
 }
 
 async function fetchEnrichedCentralStaff(supabaseJwt: string, outletCode?: string) {
@@ -2900,6 +2903,16 @@ async function fetchEnrichedCentralStaff(supabaseJwt: string, outletCode?: strin
     }
   }
 
+  // Optionally enrich Glossy Looks authoritative public.users.role when Glossy Looks Supabase service key is available
+  const glossyAuthUsers =
+    !outletCode || outletCode.toLowerCase() === 'glossylooks'
+      ? await fetchGlossyLooksAuthoritativeUsers({
+          glossySupabaseUrl: SUPABASE_CONFIG.the_glossy_looks.project_url,
+          timeoutMs: 3000
+        }).catch(() => [])
+      : [];
+  const glossyUserIndex = buildAuthoritativeUserRoleIndex(glossyAuthUsers);
+
   // Group rows by Central Auth UUID (userId) so multi-outlet users render cleanly without losing outlet roles
   const grouped = new Map<string, any>();
 
@@ -2947,6 +2960,34 @@ async function fetchEnrichedCentralStaff(supabaseJwt: string, outletCode?: strin
       isActive: r.isActive !== false
     };
 
+    // Resolve authoritative Glossy Looks public.users.role (never public.staff.role job title)
+    let sourceRole: string | null = null;
+    let sourceDisplayRole: string | null = null;
+    if (String(outletEntry.outletCode || '').toLowerCase() === 'glossylooks') {
+      const resolvedGlossyRole = resolveAuthoritativeUserRole(
+        {
+          id: primaryIdent?.external_id || r.externalStaffId || uid,
+          user_id: uid,
+          email: resolvedEmail,
+          username: resolvedUsername,
+          phone: r.phone || authUser?.user_metadata?.phone || '',
+          full_name: profile?.full_name || r.fullName || '',
+          user_role:
+            authUser?.user_metadata?.source_role ||
+            authUser?.user_metadata?.glossy_user_role ||
+            authUser?.user_metadata?.role_hint ||
+            r.sourceRole ||
+            r.roleHint ||
+            undefined
+        },
+        glossyUserIndex
+      );
+      if (resolvedGlossyRole.canonicalRole && resolvedGlossyRole.displayRole) {
+        sourceRole = resolvedGlossyRole.canonicalRole;
+        sourceDisplayRole = formatAuthoritativeDisplayRole(resolvedGlossyRole.canonicalRole);
+      }
+    }
+
     if (!grouped.has(uid)) {
       const emailCheck = assessEmailQuality(resolvedEmail);
       const isProfileActive = profile ? profile.is_active !== false : r.isActive !== false;
@@ -2971,6 +3012,8 @@ async function fetchEnrichedCentralStaff(supabaseJwt: string, outletCode?: strin
         role: rawOutletRole === 'ADMIN' ? 'admin' : 'staff',
         outletRole: rawOutletRole,
         displayRole: rawOutletRole === 'ADMIN' ? 'ADMIN' : 'POS_BILLING',
+        sourceRole,
+        sourceDisplayRole,
         outletId: outletEntry.outletId,
         outletCode: outletEntry.outletCode,
         outletName: outletEntry.outletName,
@@ -3791,8 +3834,15 @@ async function handleOutletIncomingUserSync(req: express.Request, res: express.R
 
   const idempotencyKey = String(req.headers['x-idempotency-key'] || req.body?.idempotencyKey || '').trim() || undefined;
 
-  // Map role ONLY when provided (or creating a new user). Never silently downgrade an existing ADMIN to STAFF.
-  const rawRoleInput = req.body?.role ?? req.body?.externalRole ?? req.body?.productionRole;
+  // Map role ONLY from authoritative Glossy Looks public.users.role (never public.staff.role job title).
+  // Never silently downgrade an existing ADMIN to STAFF or allow SUPERADMIN modification.
+  const rawRoleInput =
+    req.body?.userRole ??
+    req.body?.user_role ??
+    req.body?.users?.role ??
+    req.body?.role ??
+    req.body?.externalRole ??
+    req.body?.productionRole;
   let normalizedRole: 'ADMIN' | 'STAFF' | undefined;
   if (typeof rawRoleInput === 'string' && rawRoleInput.trim()) {
     const rUpper = rawRoleInput.trim().toUpperCase();
@@ -4902,7 +4952,7 @@ app.get('/api/admin/reports', requireAuth, requireAdmin, async (req, res) => {
       : null);
 
   if (category === 'salon') {
-    let bills = syncedBills.filter(b => b.outlet_id === outletId);
+    let bills = syncedBills.filter(b => b.outlet_id === outletId && !b.is_voided);
     if (reportDb) {
       try {
         const { data: dbBills, error } = await reportDb
@@ -4910,9 +4960,10 @@ app.get('/api/admin/reports', requireAuth, requireAdmin, async (req, res) => {
           .select('*')
           .eq('outlet_id', outletId)
           .order('created_at', { ascending: false })
-          .limit(50);
+          .limit(200);
         if (!error && Array.isArray(dbBills)) {
-          bills = dbBills;
+          // Preserve all historical bills for reports; exclude audited soft-deleted (voided) bills from active sales totals
+          bills = dbBills.filter((b: any) => !b.is_voided);
         }
       } catch (_e) {}
     }
@@ -4927,7 +4978,7 @@ app.get('/api/admin/reports', requireAuth, requireAdmin, async (req, res) => {
       recentBills: bills.slice(0, 20)
     });
   } else if (category === 'restaurant') {
-    let orders = syncedOrders.filter(o => o.outlet_id === outletId);
+    let orders = syncedOrders.filter(o => o.outlet_id === outletId && !o.is_voided);
     if (reportDb) {
       try {
         const { data: dbOrders, error } = await reportDb
@@ -4936,15 +4987,17 @@ app.get('/api/admin/reports', requireAuth, requireAdmin, async (req, res) => {
           .eq('outlet_id', outletId)
           .eq('sale_kind', 'restaurant')
           .order('billed_at', { ascending: false })
-          .limit(50);
+          .limit(200);
         if (!error && Array.isArray(dbOrders)) {
-          orders = dbOrders.map((row: any) => ({
-            ...row,
-            order_number: row.bill_number,
-            token_number: row.details?.token_number || '',
-            table_or_counter: row.details?.table_or_counter || 'Counter',
-            created_at_server: row.billed_at || row.created_at
-          }));
+          orders = dbOrders
+            .filter((row: any) => !row.is_voided)
+            .map((row: any) => ({
+              ...row,
+              order_number: row.bill_number,
+              token_number: row.details?.token_number || '',
+              table_or_counter: row.details?.table_or_counter || 'Counter',
+              created_at_server: row.billed_at || row.created_at
+            }));
         }
       } catch (_e) {}
     }
@@ -4967,18 +5020,19 @@ app.get('/api/admin/reports', requireAuth, requireAdmin, async (req, res) => {
           .select('*')
           .eq('outlet_id', outletId)
           .order('billed_at', { ascending: false })
-          .limit(50);
+          .limit(200);
         if (!error && Array.isArray(dbSales)) {
-          sales = dbSales;
+          sales = dbSales.filter((row: any) => !row.is_voided);
         }
       } catch (_e) {}
     }
     const totalSales = sales.reduce((acc, s) => acc + (Number(s.grand_total) || 0), 0);
+    const totalTax = sales.reduce((acc, s) => acc + (Number(s.total_tax) || 0), 0);
     res.json({
       success: true,
       outletName: session.activeOutlet.name,
       totalSales,
-      totalTax: 0,
+      totalTax,
       totalTransactions: sales.length,
       recentBills: sales.slice(0, 20)
     });
@@ -5029,6 +5083,19 @@ app.get('/api/pos/init', requireAuth, async (req, res) => {
       };
     }
 
+    const serviceDbForBranches = getCentralSupabaseServiceClient();
+    const allBranches = await centralBillNumberCoordinator.listOutletBranches(serviceDbForBranches, outlet.id);
+    const assignedBranchCodes = await centralBillNumberCoordinator.getUserAssignedBranchCodes(
+      serviceDbForBranches,
+      session.userId,
+      outlet.id
+    );
+    const branchResolution = resolvePermittedBranchesForUser({
+      allOutletBranches: allBranches,
+      userRole: session.role,
+      assignedBranchCodes
+    });
+
     res.json({
       success: true,
       outlet,
@@ -5036,6 +5103,9 @@ app.get('/api/pos/init', requireAuth, async (req, res) => {
       revision: salonCatalogRevision,
       services: activeServices,
       stylists: normalizedStylists,
+      branches: branchResolution.branches,
+      autoSelectedBranch: branchResolution.autoSelectedBranch,
+      requiresManualBranchSelection: branchResolution.requiresManualSelection,
       stylistError: staffResult.success
         ? (normalizedStylists.length ? null : 'No active stylists returned for this outlet from the Glossy Looks staff API.')
         : staffResult.message,
@@ -5250,60 +5320,445 @@ app.post('/api/admin/catalog/retail-product', requireAuth, requireAdmin, async (
 });
 
 // -------------------------------------------------------------------------------------------------
-// 5. Offline Sync APIs (Bills & Orders)
+// 5. Centralized GlossyLooks Bill Numbering, Mandatory Branch Enforcement & Offline Preallocation
 // -------------------------------------------------------------------------------------------------
-app.post('/api/pos/salon/next-bill-number', requireAuth, async (req, res) => {
+const centralBillNumberCoordinator = new CentralBillNumberCoordinator();
+
+async function resolveCentralBillAuthContext(
+  req: express.Request,
+  forcedOutletCode?: string
+): Promise<
+  | {
+      ok: true;
+      outlet: { id: string; code: string; name: string; category: string };
+      userId: string | null;
+      userRole: string;
+      assignedBranchCodes: string[];
+      defaultSourceSystem: 'smav_web_pos' | 'smav_android_agent' | 'glossylooks_admin_portal';
+    }
+  | { ok: false; status: number; code: string; message: string }
+> {
+  const serviceDb = getCentralSupabaseServiceClient();
+  const bearerToken = req.headers.authorization?.startsWith('Bearer ')
+    ? req.headers.authorization.split(' ')[1].trim()
+    : '';
+
+  // 1. Authenticated SMAV session (Web POS or Android Print Agent)
+  if (bearerToken) {
+    const session = await smavGateway.validateSession(bearerToken);
+    if (!session) {
+      return { ok: false, status: 401, code: 'UNAUTHORIZED', message: 'Invalid or expired SMAV session token.' };
+    }
+    const requestedOutletId = String(req.body?.outletId || req.query?.outletId || '').trim();
+    if (requestedOutletId && requestedOutletId !== session.activeOutlet.id && session.role !== 'superadmin') {
+      return { ok: false, status: 403, code: 'OUTLET_MISMATCH', message: 'Outlet assignment mismatch.' };
+    }
+    const assignedBranchCodes = await centralBillNumberCoordinator.getUserAssignedBranchCodes(
+      serviceDb,
+      session.userId,
+      session.activeOutlet.id
+    );
+    const ua = String(req.headers['user-agent'] || '').toLowerCase();
+    const isAndroid = ua.includes('okhttp') || ua.includes('android') || Boolean(req.body?.deviceId || req.body?.device_id);
+    return {
+      ok: true,
+      outlet: {
+        id: session.activeOutlet.id,
+        code: session.activeOutlet.code,
+        name: session.activeOutlet.name,
+        category: session.activeOutlet.category
+      },
+      userId: session.userId,
+      userRole: session.role,
+      assignedBranchCodes,
+      defaultSourceSystem: isAndroid ? 'smav_android_agent' : 'smav_web_pos'
+    };
+  }
+
+  // 2. Server-to-server GlossyLooks Admin Portal authentication (X-Integration-Key or HMAC-SHA256)
+  const cleanOutletCode = String(
+    forcedOutletCode || req.body?.outletCode || req.query?.outletCode || req.headers['x-business-source'] || 'glossylooks'
+  )
+    .trim()
+    .toLowerCase();
+  const providedKey = String(req.headers['x-integration-key'] || req.headers['x-smav-gateway-secret'] || '').trim();
+  const configuredKey = outletSyncCoordinator.getOutletIntegrationKey(cleanOutletCode);
+
+  const hmacTimestamp = String(req.headers['x-smav-timestamp'] || '').trim();
+  const hmacSignature = String(req.headers['x-smav-signature'] || '').trim();
+  const hmacSecret = configuredKey || process.env.SMAV_DISPATCH_SECRET?.trim() || '';
+  let hmacValid = false;
+  if (hmacTimestamp && hmacSignature && hmacSecret) {
+    const tsNum = Number(hmacTimestamp);
+    const tsMs = tsNum > 1e12 ? tsNum : tsNum * 1000;
+    const withinWindow = Number.isFinite(tsMs) && Math.abs(Date.now() - tsMs) <= 5 * 60 * 1000;
+    if (withinWindow) {
+      const canonicalBody = typeof (req as any).rawBody === 'string'
+        ? (req as any).rawBody
+        : JSON.stringify(req.body || {});
+      const expectedSig = crypto
+        .createHmac('sha256', hmacSecret)
+        .update(`${hmacTimestamp}.${canonicalBody}`)
+        .digest('hex');
+      hmacValid = timingSafeStringEqual(hmacSignature.replace(/^sha256=/i, '').toLowerCase(), expectedSig.toLowerCase());
+    }
+  }
+
+  const keyValid = Boolean(providedKey && configuredKey && timingSafeStringEqual(providedKey, configuredKey));
+  if (!keyValid && !(hmacValid && configuredKey)) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'UNAUTHORIZED',
+      message: 'Authentication required (SMAV Bearer token, X-Integration-Key, or valid HMAC-SHA256 signature).'
+    };
+  }
+
+  const outlets = await centralOutletRepo.listAllOutlets();
+  let matchedOutlet = outlets.find((o) => o.code.toLowerCase() === cleanOutletCode);
+  if (!matchedOutlet && serviceDb) {
+    const { data: row } = await serviceDb
+      .from('smav_outlets')
+      .select('id, outlet_code, code, outlet_name, name, business_type, category')
+      .or(`outlet_code.eq.${cleanOutletCode},code.eq.${cleanOutletCode}`)
+      .maybeSingle();
+    if (row) {
+      matchedOutlet = {
+        id: String((row as any).id),
+        code: String((row as any).outlet_code || (row as any).code || cleanOutletCode),
+        name: String((row as any).outlet_name || (row as any).name || 'The Glossy Looks'),
+        category: String((row as any).business_type || (row as any).category || 'salon').toLowerCase() as any
+      } as any;
+    }
+  }
+  if (!matchedOutlet) {
+    return { ok: false, status: 404, code: 'OUTLET_NOT_FOUND', message: `Outlet "${cleanOutletCode}" not found.` };
+  }
+
+  const callerRole = String(req.body?.actorRole || req.body?.userRole || 'admin').trim().toLowerCase();
+  const callerAssigned = Array.isArray(req.body?.assignedBranchCodes)
+    ? req.body.assignedBranchCodes.map((v: unknown) => String(v || '').trim().toUpperCase()).filter(Boolean)
+    : [];
+
+  return {
+    ok: true,
+    outlet: {
+      id: matchedOutlet.id,
+      code: matchedOutlet.code,
+      name: matchedOutlet.name,
+      category: matchedOutlet.category
+    },
+    userId: typeof req.body?.actorUserId === 'string' ? req.body.actorUserId.trim() : null,
+    userRole: callerRole,
+    assignedBranchCodes: callerAssigned,
+    defaultSourceSystem: 'glossylooks_admin_portal'
+  };
+}
+
+async function handleGetPermittedBranches(req: express.Request, res: express.Response, forcedOutletCode?: string) {
+  const auth = await resolveCentralBillAuthContext(req, forcedOutletCode);
+  if (!auth.ok) return res.status(auth.status).json({ success: false, code: auth.code, message: auth.message });
+  const serviceDb = getCentralSupabaseServiceClient();
+  const allBranches = await centralBillNumberCoordinator.listOutletBranches(serviceDb, auth.outlet.id);
+  const resolved = resolvePermittedBranchesForUser({
+    allOutletBranches: allBranches,
+    userRole: auth.userRole,
+    assignedBranchCodes: auth.assignedBranchCodes
+  });
+  return res.json({
+    success: true,
+    outletId: auth.outlet.id,
+    outletCode: auth.outlet.code,
+    branches: resolved.branches,
+    autoSelectedBranch: resolved.autoSelectedBranch,
+    requiresManualBranchSelection: resolved.requiresManualSelection
+  });
+}
+
+async function handleReserveCentralBillNumber(req: express.Request, res: express.Response, forcedOutletCode?: string) {
+  try {
+    const auth = await resolveCentralBillAuthContext(req, forcedOutletCode);
+    if (!auth.ok) return res.status(auth.status).json({ success: false, code: auth.code, message: auth.message });
+
+    if (auth.outlet.category !== 'salon') {
+      return res.status(400).json({ success: false, code: 'SALON_OUTLET_REQUIRED', message: 'A salon outlet must be selected.' });
+    }
+
+    const rawBranchInput = req.body?.branchCode ?? req.body?.branch_code ?? req.body?.branchId ?? req.body?.branch_id ?? req.body?.branchName ?? req.body?.branch_name;
+    const canonicalBranch = normalizeGlossyBranchCode(rawBranchInput);
+    if (!canonicalBranch) {
+      return res.status(400).json({
+        success: false,
+        code: 'BRANCH_REQUIRED',
+        message: 'Branch selection is mandatory before generating a bill (choose Gachibowli / GACHI or Kondapur / KONDA).'
+      });
+    }
+
+    const serviceDb = getCentralSupabaseServiceClient();
+    const allBranches = await centralBillNumberCoordinator.listOutletBranches(serviceDb, auth.outlet.id);
+    const permitted = resolvePermittedBranchesForUser({
+      allOutletBranches: allBranches,
+      userRole: auth.userRole,
+      assignedBranchCodes: auth.assignedBranchCodes
+    });
+    const allowedBranch = permitted.branches.find((b) => b.branchCode.toUpperCase() === canonicalBranch);
+    if (!allowedBranch) {
+      return res.status(403).json({
+        success: false,
+        code: 'BRANCH_NOT_PERMITTED',
+        message: `Forbidden: You are not permitted to generate bills for branch "${canonicalBranch}".`
+      });
+    }
+
+    const idempotencyKey = String(
+      req.body?.idempotencyKey || req.body?.idempotency_key || req.headers['x-idempotency-key'] || ''
+    ).trim() || `RES_${auth.outlet.id}_${canonicalBranch}_${crypto.randomUUID()}`;
+
+    const sourceSystem = normalizeSourceSystem(
+      req.body?.sourceSystem || req.body?.source_system || auth.defaultSourceSystem
+    );
+    const deviceId = String(req.body?.deviceId || req.body?.device_id || '').trim() || null;
+
+    const reserved = await centralBillNumberCoordinator.reserveCentralBillNumber({
+      db: serviceDb,
+      outletId: auth.outlet.id,
+      branchCode: canonicalBranch,
+      idempotencyKey,
+      sourceSystem,
+      createdBy: auth.userId,
+      deviceId,
+      billPrefix: allowedBranch.billPrefix || 'TGL'
+    });
+
+    return res.json({
+      success: true,
+      centralBillId: reserved.centralBillId,
+      centralBillNumber: reserved.centralBillNumber,
+      billNumber: reserved.centralBillNumber,
+      outletId: reserved.outletId,
+      branchId: reserved.branchId,
+      branchCode: reserved.branchCode,
+      branchName: reserved.branchName,
+      billingDate: reserved.billingDate,
+      date: reserved.billingDate.replace(/-/g, ''),
+      sequence: reserved.sequenceNumber,
+      sourceSystem: reserved.sourceSystem,
+      status: reserved.status,
+      idempotencyKey: reserved.idempotencyKey,
+      generatedAt: reserved.generatedAt,
+      idempotentReplay: reserved.idempotentReplay,
+      storageMode: reserved.storageMode
+    });
+  } catch (error: any) {
+    const msg = String(error?.message || 'Unable to reserve bill number.');
+    const statusCode = /BRANCH_REQUIRED|IDEMPOTENCY_KEY_REQUIRED|INVALID_BRANCH|INVALID_SOURCE_SYSTEM/i.test(msg)
+      ? 400
+      : /OUTLET_MISMATCH/i.test(msg)
+        ? 403
+        : 503;
+    return res.status(statusCode).json({ success: false, message: msg });
+  }
+}
+
+async function handleFinalizeCentralBillNumber(req: express.Request, res: express.Response, forcedOutletCode?: string) {
+  try {
+    const auth = await resolveCentralBillAuthContext(req, forcedOutletCode);
+    if (!auth.ok) return res.status(auth.status).json({ success: false, code: auth.code, message: auth.message });
+
+    const centralBillNumber = String(
+      req.body?.centralBillNumber || req.body?.central_bill_number || req.body?.billNumber || req.body?.bill_number || ''
+    ).trim().toUpperCase();
+    const idempotencyKey = String(req.body?.idempotencyKey || req.body?.idempotency_key || '').trim() || null;
+    const localBillId = String(req.body?.localBillId || req.body?.local_bill_id || '').trim() || null;
+    const externalOrderId = String(req.body?.externalOrderId || req.body?.external_order_id || '').trim() || null;
+    const sourceSystem = normalizeSourceSystem(req.body?.sourceSystem || req.body?.source_system || auth.defaultSourceSystem);
+
+    if (!centralBillNumber) {
+      return res.status(400).json({ success: false, code: 'CENTRAL_BILL_NUMBER_REQUIRED', message: 'centralBillNumber is required.' });
+    }
+
+    const serviceDb = getCentralSupabaseServiceClient();
+    const finalized = await centralBillNumberCoordinator.finalizeCentralBillNumber({
+      db: serviceDb,
+      outletId: auth.outlet.id,
+      centralBillNumber,
+      idempotencyKey,
+      localBillId,
+      externalOrderId,
+      sourceSystem
+    });
+
+    if (req.body?.syncToGlossyLooks === true) {
+      await syncCentralBillNumberToGlossyLooks({
+        centralBillId: finalized.centralBillId,
+        centralBillNumber: finalized.centralBillNumber,
+        outletId: finalized.outletId,
+        branchCode: finalized.branchCode,
+        branchName: finalized.branchName,
+        idempotencyKey: idempotencyKey || finalized.centralBillNumber,
+        externalOrderId,
+        customerName: req.body?.customerName || null,
+        customerPhone: req.body?.customerPhone || null,
+        paymentMode: req.body?.paymentMode || null,
+        grandTotal: typeof req.body?.grandTotal === 'number' ? req.body.grandTotal : undefined,
+        sourceSystem
+      });
+    }
+
+    return res.json({
+      success: true,
+      centralBillId: finalized.centralBillId,
+      centralBillNumber: finalized.centralBillNumber,
+      billNumber: finalized.centralBillNumber,
+      outletId: finalized.outletId,
+      branchId: finalized.branchId,
+      branchCode: finalized.branchCode,
+      branchName: finalized.branchName,
+      status: finalized.status,
+      finalizedAt: finalized.finalizedAt,
+      storageMode: finalized.storageMode
+    });
+  } catch (error: any) {
+    const msg = String(error?.message || 'Unable to finalize central bill number.');
+    const statusCode = /NOT_FOUND/i.test(msg)
+      ? 404
+      : /VOIDED|IMMUTABLE/i.test(msg)
+        ? 409
+        : /OUTLET_MISMATCH/i.test(msg)
+          ? 403
+          : 400;
+    return res.status(statusCode).json({ success: false, message: msg });
+  }
+}
+
+app.get('/api/pos/branches', (req, res) => handleGetPermittedBranches(req, res));
+app.get('/api/integrations/glossylooks/branches', (req, res) => handleGetPermittedBranches(req, res, 'glossylooks'));
+
+app.post('/api/pos/salon/next-bill-number', (req, res) => handleReserveCentralBillNumber(req, res));
+app.post('/api/central/bill-numbers/reserve', (req, res) => handleReserveCentralBillNumber(req, res));
+app.post('/api/integrations/glossylooks/bill-numbers/reserve', (req, res) =>
+  handleReserveCentralBillNumber(req, res, 'glossylooks')
+);
+
+app.post('/api/central/bill-numbers/finalize', (req, res) => handleFinalizeCentralBillNumber(req, res));
+app.post('/api/integrations/glossylooks/bill-numbers/finalize', (req, res) =>
+  handleFinalizeCentralBillNumber(req, res, 'glossylooks')
+);
+
+// Preallocate a branch-specific range of central bill numbers for offline Android Print Agent devices
+app.post('/api/central/bill-numbers/allocate-range', requireAuth, async (req, res) => {
   try {
     const session: UserSession = (req as any).userSession;
     if (session.activeOutlet.category !== 'salon') {
-      return res.status(400).json({ success: false, message: 'A salon outlet must be selected.' });
+      return res.status(400).json({ success: false, code: 'SALON_OUTLET_REQUIRED', message: 'A salon outlet must be selected.' });
     }
-    if (req.body?.outletId && req.body.outletId !== session.activeOutlet.id) {
-      return res.status(403).json({ success: false, message: 'Outlet assignment mismatch.' });
+    const rawBranch = req.body?.branchCode ?? req.body?.branch_code ?? req.body?.branchId ?? req.body?.branch_id;
+    const canonicalBranch = normalizeGlossyBranchCode(rawBranch);
+    if (!canonicalBranch) {
+      return res.status(400).json({
+        success: false,
+        code: 'BRANCH_REQUIRED',
+        message: 'Valid branchCode (GACHI or KONDA) is required to allocate an offline bill-number range.'
+      });
     }
-
-    const branchCode = salonReceiptBranchCode(session.activeOutlet);
-    const datePart = indiaDatePart();
-    const prefix = `TGL-${branchCode}-${datePart}-`;
-    const reservationKey = `${session.activeOutlet.id}:${datePart}`;
-    let lastSequence = salonBillSequenceReservations.get(reservationKey) || 0;
-
-    // Query outlet-wide sequence via service role (scoped strictly to activeOutlet.id)
-    // so cross-cashier RLS (created_by = auth.uid()) cannot collide on uq_smav_salon_outlet_bill.
-    const queryDb =
-      getCentralSupabaseServiceClient() ||
-      (session.supabaseToken && centralSupabaseConfig.isConfigured
-        ? getCentralSupabaseClient(session.supabaseToken)
-        : null);
-
-    if (queryDb) {
-      const { data, error } = await queryDb
-        .from('smav_salon_bills')
-        .select('bill_number')
-        .eq('outlet_id', session.activeOutlet.id)
-        .like('bill_number', `TGL-%-${datePart}-%`)
-        .limit(2000);
-      if (error) throw new Error(error.message);
-      const dbSequence = Array.isArray(data)
-        ? data.reduce((highest: number, row: any) => {
-            const sequence = Number.parseInt(String(row?.bill_number || '').split('-').pop() || '0', 10);
-            return Number.isFinite(sequence) ? Math.max(highest, sequence) : highest;
-          }, 0)
-        : 0;
-      if (Number.isFinite(dbSequence)) lastSequence = Math.max(lastSequence, dbSequence);
+    const deviceId = String(req.body?.deviceId || req.body?.device_id || '').trim();
+    if (!deviceId) {
+      return res.status(400).json({ success: false, code: 'DEVICE_ID_REQUIRED', message: 'deviceId is required.' });
     }
 
-    const nextSequence = lastSequence + 1;
-    salonBillSequenceReservations.set(reservationKey, nextSequence);
+    const serviceDb = getCentralSupabaseServiceClient();
+    const allBranches = await centralBillNumberCoordinator.listOutletBranches(serviceDb, session.activeOutlet.id);
+    const assignedBranchCodes = await centralBillNumberCoordinator.getUserAssignedBranchCodes(
+      serviceDb,
+      session.userId,
+      session.activeOutlet.id
+    );
+    const permitted = resolvePermittedBranchesForUser({
+      allOutletBranches: allBranches,
+      userRole: session.role,
+      assignedBranchCodes
+    });
+    const allowedBranch = permitted.branches.find((b) => b.branchCode.toUpperCase() === canonicalBranch);
+    if (!allowedBranch) {
+      return res.status(403).json({
+        success: false,
+        code: 'BRANCH_NOT_PERMITTED',
+        message: `Forbidden: Branch "${canonicalBranch}" is not permitted for your account.`
+      });
+    }
+
+    const count = Math.min(100, Math.max(1, Number(req.body?.count || 20)));
+    const allocated = await centralBillNumberCoordinator.allocateOfflineRange({
+      db: serviceDb,
+      outletId: session.activeOutlet.id,
+      branchCode: canonicalBranch,
+      deviceId,
+      count,
+      allocatedBy: session.userId,
+      billPrefix: allowedBranch.billPrefix || 'TGL'
+    });
+
     return res.json({
       success: true,
-      billNumber: `${prefix}${String(nextSequence).padStart(4, '0')}`,
-      branchCode,
-      sequence: nextSequence,
-      date: datePart
+      ...allocated
     });
   } catch (error: any) {
-    return res.status(503).json({ success: false, message: `Unable to reserve bill number: ${error.message}` });
+    return res.status(503).json({ success: false, message: error?.message || 'Unable to allocate offline bill-number range.' });
+  }
+});
+
+// Reconciliation report for duplicate/missing bill numbers (preserves historical legacy records)
+app.get('/api/admin/bill-numbers/reconciliation', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const session: UserSession = (req as any).userSession;
+    const requestedOutletId = String(req.query?.outletId || '').trim();
+    const targetOutletId =
+      session.role === 'superadmin' && requestedOutletId ? requestedOutletId : session.activeOutlet.id;
+    const serviceDb = getCentralSupabaseServiceClient();
+
+    let centralNumbers: Array<{ id: string; central_bill_number: string; branch_code: string; status: string }> = [];
+    let salonBills: Array<{ id: string; bill_number: string; central_bill_number?: string | null; created_at?: string; is_voided?: boolean }> = [];
+
+    if (serviceDb) {
+      const [centralRes, billsRes] = await Promise.all([
+        serviceDb
+          .from('smav_central_bill_numbers')
+          .select('id, central_bill_number, branch_code, status')
+          .eq('outlet_id', targetOutletId)
+          .order('generated_at', { ascending: false })
+          .limit(5000),
+        serviceDb
+          .from('smav_salon_bills')
+          .select('id, bill_number, central_bill_number, created_at, is_voided')
+          .eq('outlet_id', targetOutletId)
+          .order('created_at', { ascending: false })
+          .limit(5000)
+      ]);
+      if (!centralRes.error && Array.isArray(centralRes.data)) {
+        centralNumbers = centralRes.data as any;
+      }
+      if (!billsRes.error && Array.isArray(billsRes.data)) {
+        salonBills = billsRes.data as any;
+      }
+    }
+
+    if (centralNumbers.length === 0) {
+      centralNumbers = centralBillNumberCoordinator.getMemoryRecordsForOutlet(targetOutletId).map((r) => ({
+        id: r.centralBillId,
+        central_bill_number: r.centralBillNumber,
+        branch_code: r.branchCode,
+        status: r.status
+      }));
+    }
+
+    const report = buildBillNumberReconciliationReport({
+      outletId: targetOutletId,
+      centralNumbers,
+      salonBills
+    });
+    return res.json({ success: true, report });
+  } catch (error: any) {
+    return res.status(503).json({ success: false, message: sanitizeErrorMessage(error) });
   }
 });
 
@@ -5534,8 +5989,27 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
       } catch {}
     }
 
+    const allOutletBranches = await centralBillNumberCoordinator.listOutletBranches(serviceDb, session.activeOutlet.id);
+    const assignedBranchCodes = await centralBillNumberCoordinator.getUserAssignedBranchCodes(
+      serviceDb,
+      session.userId,
+      session.activeOutlet.id
+    );
+    const permittedBranches = resolvePermittedBranchesForUser({
+      allOutletBranches,
+      userRole: session.role,
+      assignedBranchCodes
+    });
+
     const syncedIds: string[] = [];
-    const syncedBillsResult: Array<{ local_bill_number: string; canonical_bill_number: string; bill_id: string | null }> = [];
+    const syncedBillsResult: Array<{
+      local_bill_number: string;
+      canonical_bill_number: string;
+      central_bill_id: string | null;
+      branch_code: string;
+      branch_name: string;
+      bill_id: string | null;
+    }> = [];
 
     for (const entry of bills) {
       const { bill, items, idempotency_key } = entry || {};
@@ -5546,20 +6020,61 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
       if (items.some((item: any) => !item.stylistId || !item.serviceId))
         return res.status(400).json({ success: false, message: 'Every salon service must have a selected stylist and service ID' });
 
+      // Mandatory server-side branch validation (frontend validation alone is insufficient)
+      const requestedBranchCode = normalizeGlossyBranchCode(
+        bill.branchCode || bill.branch_code || bill.branchName || bill.branch_name || bill.branchId || bill.branch_id
+      );
+      if (!requestedBranchCode) {
+        return res.status(400).json({
+          success: false,
+          code: 'BRANCH_REQUIRED',
+          message: 'Branch selection is mandatory before generating or saving a bill (Gachibowli / GACHI or Kondapur / KONDA).'
+        });
+      }
+      const allowedBranch = permittedBranches.branches.find((b) => b.branchCode.toUpperCase() === requestedBranchCode);
+      if (!allowedBranch) {
+        return res.status(403).json({
+          success: false,
+          code: 'BRANCH_NOT_PERMITTED',
+          message: `Forbidden: You are not authorized to bill for branch "${requestedBranchCode}".`
+        });
+      }
+
       const cleanIdempotencyKey = String(idempotency_key);
-      let canonicalBillNumber = String(bill.billNumber || '').trim();
+      let canonicalBillNumber = String(bill.centralBillNumber || bill.central_bill_number || bill.billNumber || '').trim().toUpperCase();
+      let centralBillId: string | null = String(bill.centralBillId || bill.central_bill_id || '').trim() || null;
+      const sourceSystem = normalizeSourceSystem(bill.sourceSystem || bill.source_system || 'smav_web_pos');
       let persistedBillId: string | null = null;
+
+      // Validate that a centralized bill number was reserved or preallocated (never invent in frontend/Android)
+      if (!isValidCentralBillNumber(canonicalBillNumber)) {
+        return res.status(400).json({
+          success: false,
+          code: 'CENTRAL_BILL_NUMBER_REQUIRED',
+          message: `Valid central bill number (TGL-${requestedBranchCode}-YYYYMMDD-NNNN) is required before saving.`
+        });
+      }
+      // Verify branch token inside central bill number matches selected branch
+      const billBranchToken = canonicalBillNumber.split('-')[1];
+      if (billBranchToken && billBranchToken !== requestedBranchCode) {
+        return res.status(400).json({
+          success: false,
+          code: 'BRANCH_BILL_NUMBER_MISMATCH',
+          message: `Central bill number "${canonicalBillNumber}" does not match selected branch "${requestedBranchCode}".`
+        });
+      }
 
       // 1. Check for idempotent replay before insert
       const { data: existingByIdem } = await lookupDb
         .from('smav_salon_bills')
-        .select('id, bill_number')
+        .select('id, bill_number, central_bill_id, central_bill_number')
         .eq('idempotency_key', cleanIdempotencyKey)
         .maybeSingle();
 
       if (existingByIdem?.id) {
         persistedBillId = String(existingByIdem.id);
-        canonicalBillNumber = String(existingByIdem.bill_number || canonicalBillNumber);
+        canonicalBillNumber = String((existingByIdem as any).central_bill_number || existingByIdem.bill_number || canonicalBillNumber);
+        centralBillId = (existingByIdem as any).central_bill_id ? String((existingByIdem as any).central_bill_id) : centralBillId;
       } else {
         const normalizedItems = items.map((item: any) => ({
           service_id: item.serviceId,
@@ -5570,7 +6085,14 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
           unit_price: item.price
         }));
 
-        const insertPayload = {
+        const validBranchUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(allowedBranch.id)
+          ? allowedBranch.id
+          : null;
+        const validCentralBillUuid = centralBillId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(centralBillId)
+          ? centralBillId
+          : null;
+
+        const baseInsertPayload = {
           outlet_id: session.activeOutlet.id,
           created_by: session.userId,
           bill_number: canonicalBillNumber,
@@ -5582,25 +6104,47 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
           items: normalizedItems
         };
 
-        const firstInsert = await db
+        const extendedInsertPayload = {
+          ...baseInsertPayload,
+          ...(typeof bill.subtotal === 'number' ? { subtotal: bill.subtotal } : {}),
+          ...(typeof bill.discount === 'number' ? { discount_amount: bill.discount } : {}),
+          ...(typeof bill.tax === 'number' ? { total_tax: bill.tax } : {}),
+          ...(validCentralBillUuid ? { central_bill_id: validCentralBillUuid } : {}),
+          central_bill_number: canonicalBillNumber,
+          ...(validBranchUuid ? { branch_id: validBranchUuid } : {}),
+          branch_code: allowedBranch.branchCode,
+          branch_name: allowedBranch.branchName,
+          source_system: sourceSystem
+        };
+
+        let insertRes = await db
           .from('smav_salon_bills')
-          .insert(insertPayload)
+          .insert(extendedInsertPayload)
           .select('id, bill_number')
           .single();
 
-        if (!firstInsert.error && firstInsert.data) {
-          persistedBillId = String(firstInsert.data.id);
-          canonicalBillNumber = String(firstInsert.data.bill_number || canonicalBillNumber);
-        } else if (firstInsert.error) {
+        // Graceful compatibility if Migration 018/019 columns are not yet applied in a dev DB
+        if (insertRes.error && /column .* does not exist/i.test(insertRes.error.message || '')) {
+          insertRes = await db
+            .from('smav_salon_bills')
+            .insert(baseInsertPayload)
+            .select('id, bill_number')
+            .single();
+        }
+
+        if (!insertRes.error && insertRes.data) {
+          persistedBillId = String(insertRes.data.id);
+          canonicalBillNumber = String(insertRes.data.bill_number || canonicalBillNumber);
+        } else if (insertRes.error) {
           const isUniqueViolation =
-            firstInsert.error.code === '23505' ||
-            /duplicate key|uq_smav_salon_outlet_bill/i.test(firstInsert.error.message);
+            insertRes.error.code === '23505' ||
+            /duplicate key|uq_smav_salon_outlet_bill|uq_smav_salon_bills_central_number/i.test(insertRes.error.message);
 
           if (!isUniqueViolation) {
-            throw new Error(firstInsert.error.message);
+            throw new Error(insertRes.error.message);
           }
 
-          // Check if duplicate idempotency_key raced concurrently
+          // Idempotent concurrent retry check — NEVER rewrite an assigned central bill number
           const { data: racedByIdem } = await lookupDb
             .from('smav_salon_bills')
             .select('id, bill_number')
@@ -5611,46 +6155,34 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
             persistedBillId = String(racedByIdem.id);
             canonicalBillNumber = String(racedByIdem.bill_number || canonicalBillNumber);
           } else {
-            // Collision on (outlet_id, bill_number) across offline terminals: allocate next sequential bill_number
-            const branchCode = salonReceiptBranchCode(session.activeOutlet);
-            const datePart = indiaDatePart();
-            const prefix = `TGL-${branchCode}-${datePart}-`;
-            const { data: seqRows } = await lookupDb
-              .from('smav_salon_bills')
-              .select('bill_number')
-              .eq('outlet_id', session.activeOutlet.id)
-              .like('bill_number', `TGL-%-${datePart}-%`)
-              .limit(2000);
-            const maxSeq = Array.isArray(seqRows)
-              ? seqRows.reduce((highest: number, row: any) => {
-                  const seq = Number.parseInt(String(row?.bill_number || '').split('-').pop() || '0', 10);
-                  return Number.isFinite(seq) ? Math.max(highest, seq) : highest;
-                }, salonBillSequenceReservations.get(`${session.activeOutlet.id}:${datePart}`) || 0)
-              : 0;
-            const nextSeq = maxSeq + 1;
-            salonBillSequenceReservations.set(`${session.activeOutlet.id}:${datePart}`, nextSeq);
-            canonicalBillNumber = `${prefix}${String(nextSeq).padStart(4, '0')}`;
-
-            const retryInsert = await db
-              .from('smav_salon_bills')
-              .insert({ ...insertPayload, bill_number: canonicalBillNumber })
-              .select('id, bill_number')
-              .single();
-
-            if (retryInsert.error || !retryInsert.data) {
-              throw new Error(retryInsert.error?.message || 'Bill sequence conflict recovery failed');
-            }
-            persistedBillId = String(retryInsert.data.id);
-            canonicalBillNumber = String(retryInsert.data.bill_number || canonicalBillNumber);
+            return res.status(409).json({
+              success: false,
+              code: 'DUPLICATE_CENTRAL_BILL_NUMBER',
+              message: `Conflict: Central bill number "${canonicalBillNumber}" is already assigned to another transaction and cannot be reused.`
+            });
           }
         }
       }
 
-      // Register notification jobs via serviceDb (post-authorization) so RLS never blocks queueing.
+      // Finalize central bill number record (idempotent; marks RESERVED / PREALLOCATED -> FINALIZED)
+      try {
+        const finalized = await centralBillNumberCoordinator.finalizeCentralBillNumber({
+          db: serviceDb,
+          outletId: session.activeOutlet.id,
+          centralBillNumber: canonicalBillNumber,
+          idempotencyKey: cleanIdempotencyKey,
+          localBillId: persistedBillId,
+          sourceSystem
+        });
+        centralBillId = finalized.centralBillId;
+      } catch {
+        // Non-fatal if pre-migration 019 DB doesn't have smav_central_bill_numbers yet
+      }
+
+      // Register notification jobs via serviceDb (post-authorization) using exact central_bill_number and selected branch
       const saleTime = parseSaleTimestampIso(bill.createdAt);
       const sendReceipts = outletRoute ? Boolean(outletRoute.send_receipts) : true;
       const sendFeedback = outletRoute ? Boolean(outletRoute.send_feedback) : true;
-      const resolvedBranchCode = String(bill.branchCode || salonReceiptBranchCode(session.activeOutlet)).trim();
 
       await enqueueSaleNotificationJobs({
         db: serviceDb || db,
@@ -5659,12 +6191,14 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
           id: session.activeOutlet.id,
           code: session.activeOutlet.code,
           name: session.activeOutlet.name,
-          branchCode: resolvedBranchCode
+          branchCode: allowedBranch.branchCode,
+          branchName: allowedBranch.branchName
         },
         sourceType: 'salon',
         sourceKey: cleanIdempotencyKey,
         billId: persistedBillId,
         billNumber: canonicalBillNumber,
+        centralBillId,
         customerName: bill.customerName,
         customerPhone: bill.customerPhone,
         paymentMode: bill.paymentMode,
@@ -5678,11 +6212,30 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
         sendFeedback
       });
 
+      // Best-effort sync of central_bill_number back to GlossyLooks orders/payments
+      void syncCentralBillNumberToGlossyLooks({
+        centralBillId,
+        centralBillNumber: canonicalBillNumber,
+        outletId: session.activeOutlet.id,
+        branchCode: allowedBranch.branchCode,
+        branchName: allowedBranch.branchName,
+        idempotencyKey: cleanIdempotencyKey,
+        customerName: bill.customerName,
+        customerPhone: bill.customerPhone,
+        paymentMode: bill.paymentMode,
+        grandTotal: Number(bill.grandTotal),
+        billedAt: saleTime,
+        sourceSystem
+      });
+
       // Preserve local Room billNumber in synced_ids so Android DAO marks the local bill SYNCED.
       syncedIds.push(bill.billNumber || canonicalBillNumber);
       syncedBillsResult.push({
         local_bill_number: String(bill.billNumber || canonicalBillNumber),
         canonical_bill_number: canonicalBillNumber,
+        central_bill_id: centralBillId,
+        branch_code: allowedBranch.branchCode,
+        branch_name: allowedBranch.branchName,
         bill_id: persistedBillId
       });
     }
@@ -5811,6 +6364,610 @@ app.post('/api/mobile/sync/orders', requireAuth, async (req, res) => {
     res.status(503).json({ success: false, message: `Central order persistence failed: ${error.message}` });
   }
 });
+
+// -------------------------------------------------------------------------------------------------
+// 4B. Today-Only Outlet-Local Transaction Ledger, Audited Edit & Soft-Delete (Void)
+// -------------------------------------------------------------------------------------------------
+function getLedgerDbClient(session: UserSession) {
+  return (
+    getCentralSupabaseServiceClient() ||
+    (session.supabaseToken && centralSupabaseConfig.isConfigured
+      ? getCentralSupabaseClient(session.supabaseToken)
+      : null)
+  );
+}
+
+async function locateOutletBillRecord(
+  session: UserSession,
+  billIdentifier: string
+): Promise<{
+  found: boolean;
+  sourceTable: 'smav_salon_bills' | 'smav_central_sales' | 'memory';
+  row: any;
+  memoryList?: any[];
+  memoryIndex?: number;
+}> {
+  const outletId = session.activeOutlet.id;
+  const category = session.activeOutlet.category;
+  const db = getLedgerDbClient(session);
+  const cleanId = String(billIdentifier || '').trim();
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cleanId);
+
+  if (db) {
+    const primaryTable: 'smav_salon_bills' | 'smav_central_sales' =
+      category === 'salon' ? 'smav_salon_bills' : 'smav_central_sales';
+    const secondaryTable: 'smav_salon_bills' | 'smav_central_sales' =
+      primaryTable === 'smav_salon_bills' ? 'smav_central_sales' : 'smav_salon_bills';
+
+    for (const table of [primaryTable, secondaryTable]) {
+      try {
+        if (isUuid) {
+          const { data } = await db
+            .from(table)
+            .select('*')
+            .eq('outlet_id', outletId)
+            .eq('id', cleanId)
+            .maybeSingle();
+          if (data) return { found: true, sourceTable: table, row: data };
+        }
+        const { data: byBillNo } = await db
+          .from(table)
+          .select('*')
+          .eq('outlet_id', outletId)
+          .eq('bill_number', cleanId)
+          .maybeSingle();
+        if (byBillNo) return { found: true, sourceTable: table, row: byBillNo };
+
+        const { data: byIdem } = await db
+          .from(table)
+          .select('*')
+          .eq('outlet_id', outletId)
+          .eq('idempotency_key', cleanId)
+          .maybeSingle();
+        if (byIdem) return { found: true, sourceTable: table, row: byIdem };
+      } catch (_e) {
+        // Continue checking fallback table / memory
+      }
+    }
+  }
+
+  const billIdx = syncedBills.findIndex(
+    (b) =>
+      b.outlet_id === outletId &&
+      (String(b.id) === cleanId || String(b.bill_number) === cleanId || String(b.idempotency_key) === cleanId)
+  );
+  if (billIdx >= 0) {
+    return { found: true, sourceTable: 'memory', row: syncedBills[billIdx], memoryList: syncedBills, memoryIndex: billIdx };
+  }
+
+  const orderIdx = syncedOrders.findIndex(
+    (o) =>
+      o.outlet_id === outletId &&
+      (String(o.id) === cleanId || String(o.order_number) === cleanId || String(o.bill_number) === cleanId || String(o.idempotency_key) === cleanId)
+  );
+  if (orderIdx >= 0) {
+    return { found: true, sourceTable: 'memory', row: syncedOrders[orderIdx], memoryList: syncedOrders, memoryIndex: orderIdx };
+  }
+
+  return { found: false, sourceTable: 'memory', row: null };
+}
+
+app.get('/api/pos/ledger/today', requireAuth, async (req, res) => {
+  const session: UserSession = (req as any).userSession;
+  const outletId = session.activeOutlet.id;
+  const category = session.activeOutlet.category;
+  const requestedTz =
+    typeof req.query.timezone === 'string' && req.query.timezone.trim()
+      ? req.query.timezone.trim()
+      : DEFAULT_OUTLET_TIMEZONE;
+  const bounds = getOutletLocalDayBounds(requestedTz, new Date());
+  const db = getLedgerDbClient(session);
+
+  const entries: TransactionLedgerEntry[] = [];
+  const seenKeys = new Set<string>();
+
+  const pushIfTodayAndActive = (entry: TransactionLedgerEntry) => {
+    if (entry.isVoided) return;
+    if (entry.outletId !== outletId) return;
+    if (!isTimestampInOutletLocalToday(entry.createdAt, bounds.timezone)) return;
+    const dedupeKey = (entry.billNumber || entry.idempotencyKey || entry.id).toLowerCase();
+    if (seenKeys.has(dedupeKey)) return;
+    seenKeys.add(dedupeKey);
+    entries.push(entry);
+  };
+
+  if (db) {
+    try {
+      if (category === 'salon') {
+        const { data, error } = await db
+          .from('smav_salon_bills')
+          .select('*')
+          .eq('outlet_id', outletId)
+          .gte('created_at', bounds.startIso)
+          .lte('created_at', bounds.endIso)
+          .order('created_at', { ascending: false })
+          .limit(300);
+        if (!error && Array.isArray(data)) {
+          for (const row of data) {
+            pushIfTodayAndActive(normalizeLedgerBillRow(row, 'smav_salon_bills', outletId));
+          }
+        }
+      } else {
+        const query = db
+          .from('smav_central_sales')
+          .select('*')
+          .eq('outlet_id', outletId)
+          .gte('billed_at', bounds.startIso)
+          .lte('billed_at', bounds.endIso)
+          .order('billed_at', { ascending: false })
+          .limit(300);
+        const { data, error } = await query;
+        if (!error && Array.isArray(data)) {
+          for (const row of data) {
+            pushIfTodayAndActive(normalizeLedgerBillRow(row, 'smav_central_sales', outletId));
+          }
+        }
+      }
+    } catch (_err) {
+      // Fallback to in-memory records below
+    }
+  }
+
+  // Merge in-memory bills for the active outlet (deduplicated by billNumber)
+  const memSource = category === 'salon' ? syncedBills : [...syncedOrders, ...syncedBills];
+  for (const row of memSource) {
+    if (row.outlet_id !== outletId) continue;
+    pushIfTodayAndActive(normalizeLedgerBillRow(row, 'memory', outletId));
+  }
+
+  entries.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+  return res.json({
+    success: true,
+    outletId,
+    outletName: session.activeOutlet.name,
+    timezone: bounds.timezone,
+    dateKey: bounds.dateKey,
+    canModifyBills: canModifyBills(session),
+    count: entries.length,
+    totalAmount: Math.round(entries.reduce((acc, e) => acc + e.grandTotal, 0) * 100) / 100,
+    bills: entries
+  });
+});
+
+app.patch('/api/pos/bills/:billId', requireAuth, async (req, res) => {
+  const session: UserSession = (req as any).userSession;
+  if (!canModifyBills(session)) {
+    return res.status(403).json({
+      success: false,
+      code: 'FORBIDDEN_BILL_MODIFICATION',
+      message: 'Forbidden: Only SUPERADMIN, ADMIN, or authorized MANAGER can edit bills. POS_BILLING cannot modify bills.'
+    });
+  }
+
+  const billId = String(req.params.billId || '').trim();
+  const reason = String(req.body?.reason || '').trim();
+  if (reason.length < 5) {
+    return res.status(400).json({
+      success: false,
+      message: 'An edit reason of at least 5 characters is required for audit compliance.'
+    });
+  }
+
+  const located = await locateOutletBillRecord(session, billId);
+  if (!located.found || !located.row) {
+    return res.status(404).json({
+      success: false,
+      message: 'Bill not found in the active outlet.'
+    });
+  }
+
+  if (String(located.row.outlet_id) !== session.activeOutlet.id) {
+    return res.status(403).json({
+      success: false,
+      message: 'Forbidden: Cross-outlet bill modification is blocked.'
+    });
+  }
+
+  const currentEntry = normalizeLedgerBillRow(located.row, located.sourceTable, session.activeOutlet.id);
+  const conflictCheck = validateBillMutationConflict({
+    currentIsVoided: currentEntry.isVoided,
+    currentEditVersion: currentEntry.editVersion,
+    expectedEditVersion: req.body?.expectedEditVersion ?? req.body?.expected_edit_version
+  });
+  if (conflictCheck.conflict) {
+    return res.status(409).json({
+      success: false,
+      code: conflictCheck.code,
+      message: conflictCheck.message,
+      currentVersion: currentEntry.editVersion,
+      isVoided: currentEntry.isVoided
+    });
+  }
+
+  const rawItems = Array.isArray(req.body?.items) && req.body.items.length > 0 ? req.body.items : currentEntry.items;
+  let recalculated;
+  try {
+    recalculated = recalculateBillTotals({
+      businessType: session.activeOutlet.category,
+      items: rawItems.map((it: any) => ({
+        id: it.id || it.service_id || it.serviceId,
+        name: it.name || it.service_name || it.serviceName,
+        quantity: Number(it.quantity ?? it.qty ?? 1),
+        unitPrice: Number(it.unitPrice ?? it.unit_price ?? it.price ?? 0),
+        stylistId: it.stylistId ?? it.stylist_id ?? null,
+        stylistName: it.stylistName ?? it.stylist_name ?? null,
+        discountPercent: it.discountPercent ?? it.discount_percent,
+        gstPercent: it.gstPercent ?? it.gst_percent,
+        variantName: it.variantName ?? it.variant_name ?? null
+      })),
+      discountAmount:
+        req.body?.discountAmount !== undefined
+          ? Number(req.body.discountAmount)
+          : currentEntry.discountAmount
+    });
+  } catch (err: any) {
+    return res.status(400).json({
+      success: false,
+      message: err?.message || 'Invalid edited bill items.'
+    });
+  }
+
+  const nextCustomerName =
+    typeof req.body?.customerName === 'string' && req.body.customerName.trim()
+      ? req.body.customerName.trim()
+      : currentEntry.customerName;
+  const nextCustomerPhone =
+    typeof req.body?.customerPhone === 'string' ? req.body.customerPhone.trim() : currentEntry.customerPhone;
+  const nextPaymentMode =
+    typeof req.body?.paymentMode === 'string' && req.body.paymentMode.trim()
+      ? req.body.paymentMode.trim().toLowerCase()
+      : currentEntry.paymentMode;
+
+  const nowIso = new Date().toISOString();
+  const nextVersion = currentEntry.editVersion + 1;
+  const auditSnapshot: BillEditAuditSnapshot = {
+    version: currentEntry.editVersion,
+    editedAt: nowIso,
+    editedBy: session.userId,
+    editedByName: session.fullName || session.email || session.userId,
+    reason,
+    previousPaymentMode: currentEntry.paymentMode,
+    previousGrandTotal: currentEntry.grandTotal,
+    previousSubtotal: currentEntry.subtotal,
+    previousDiscountAmount: currentEntry.discountAmount,
+    previousTotalTax: currentEntry.totalTax,
+    previousItemCount: currentEntry.items.length,
+    previousItems: currentEntry.items
+  };
+  const nextHistory = [...(currentEntry.editHistory || []), auditSnapshot];
+
+  const serializedItems = recalculated.items.map((it) => ({
+    service_id: it.id || null,
+    service_name: it.name,
+    name: it.name,
+    quantity: it.quantity,
+    unit_price: it.unitPrice,
+    line_total: it.lineTotal,
+    stylist_id: it.stylistId || null,
+    stylist_name: it.stylistName || null,
+    discount_percent: it.discountPercent || 0,
+    gst_percent: it.gstPercent ?? null,
+    variant_name: it.variantName || null
+  }));
+
+  const db = getLedgerDbClient(session);
+  const actorUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(session.userId)
+    ? session.userId
+    : null;
+
+  if (db && located.sourceTable !== 'memory') {
+    const fullPatch: Record<string, any> = {
+      customer_name: nextCustomerName,
+      customer_phone: nextCustomerPhone || null,
+      payment_mode: nextPaymentMode,
+      grand_total: recalculated.grandTotal,
+      items: serializedItems,
+      subtotal: recalculated.subtotal,
+      discount_amount: recalculated.discountAmount,
+      total_tax: recalculated.totalTax,
+      edited_at: nowIso,
+      edited_by: actorUuid,
+      edit_reason: reason,
+      edit_version: nextVersion,
+      edit_history: nextHistory,
+      updated_at: nowIso
+    };
+    if (located.sourceTable === 'smav_central_sales') {
+      fullPatch.details = {
+        ...(located.row.details && typeof located.row.details === 'object' ? located.row.details : {}),
+        subtotal: recalculated.subtotal,
+        discount: recalculated.discountAmount,
+        total_tax: recalculated.totalTax,
+        edit_version: nextVersion,
+        edit_reason: reason,
+        edit_history: nextHistory
+      };
+    }
+
+    let updateRes = await db
+      .from(located.sourceTable)
+      .update(fullPatch)
+      .eq('id', located.row.id)
+      .eq('outlet_id', session.activeOutlet.id)
+      .select('*')
+      .maybeSingle();
+
+    // Graceful fallback if Migration 018 columns are not yet applied in the target database
+    if (updateRes.error && /column .* does not exist/i.test(updateRes.error.message || '')) {
+      const legacyPatch: Record<string, any> = {
+        customer_name: nextCustomerName,
+        customer_phone: nextCustomerPhone || null,
+        payment_mode: nextPaymentMode,
+        grand_total: recalculated.grandTotal,
+        items: serializedItems
+      };
+      if (located.sourceTable === 'smav_central_sales') {
+        legacyPatch.details = fullPatch.details;
+      }
+      updateRes = await db
+        .from(located.sourceTable)
+        .update(legacyPatch)
+        .eq('id', located.row.id)
+        .eq('outlet_id', session.activeOutlet.id)
+        .select('*')
+        .maybeSingle();
+    }
+
+    if (updateRes.error) {
+      return res.status(500).json({
+        success: false,
+        message: `Failed to save edited bill: ${updateRes.error.message}`
+      });
+    }
+
+    located.row = {
+      ...(updateRes.data || located.row),
+      subtotal: recalculated.subtotal,
+      discount_amount: recalculated.discountAmount,
+      total_tax: recalculated.totalTax,
+      edited_at: nowIso,
+      edit_reason: reason,
+      edit_version: nextVersion,
+      edit_history: nextHistory
+    };
+  }
+
+  // Keep in-memory cache synchronized as well
+  for (const list of [syncedBills, syncedOrders]) {
+    const idx = list.findIndex(
+      (r) =>
+        r.outlet_id === session.activeOutlet.id &&
+        (String(r.id) === String(located.row.id) || String(r.bill_number || r.order_number) === currentEntry.billNumber)
+    );
+    if (idx >= 0) {
+      list[idx] = {
+        ...list[idx],
+        customer_name: nextCustomerName,
+        customer_phone: nextCustomerPhone,
+        payment_mode: nextPaymentMode,
+        subtotal: recalculated.subtotal,
+        discount_amount: recalculated.discountAmount,
+        total_tax: recalculated.totalTax,
+        grand_total: recalculated.grandTotal,
+        items: serializedItems,
+        edited_at: nowIso,
+        edit_reason: reason,
+        edit_version: nextVersion,
+        edit_history: nextHistory
+      };
+    }
+  }
+
+  const updatedEntry = normalizeLedgerBillRow(located.row, located.sourceTable, session.activeOutlet.id);
+
+  auditLogger.log({
+    eventType: 'BILL_EDITED',
+    actorId: session.userId,
+    actorEmail: session.email,
+    outletId: session.activeOutlet.id,
+    details: {
+      role: session.role,
+      billId: updatedEntry.id,
+      billNumber: updatedEntry.billNumber,
+      reason,
+      previousGrandTotal: currentEntry.grandTotal,
+      newGrandTotal: updatedEntry.grandTotal,
+      previousPaymentMode: currentEntry.paymentMode,
+      newPaymentMode: updatedEntry.paymentMode,
+      editVersion: updatedEntry.editVersion
+    }
+  });
+
+  await writeTrustedServerAuditLog({
+    userId: session.userId,
+    userEmail: session.email,
+    outletId: session.activeOutlet.id,
+    action: 'BILL_EDITED',
+    entityType: 'bill',
+    entityId: updatedEntry.billNumber || updatedEntry.id,
+    details: {
+      actor_role: session.role,
+      bill_id: updatedEntry.id,
+      bill_number: updatedEntry.billNumber,
+      reason,
+      previous_snapshot: auditSnapshot,
+      new_grand_total: updatedEntry.grandTotal,
+      new_payment_mode: updatedEntry.paymentMode,
+      edit_version: updatedEntry.editVersion
+    }
+  });
+
+  return res.json({
+    success: true,
+    message: `Bill ${updatedEntry.billNumber} updated (v${updatedEntry.editVersion}).`,
+    bill: updatedEntry
+  });
+});
+
+async function handleVoidBillRequest(req: express.Request, res: express.Response) {
+  const session: UserSession = (req as any).userSession;
+  if (!canModifyBills(session)) {
+    return res.status(403).json({
+      success: false,
+      code: 'FORBIDDEN_BILL_MODIFICATION',
+      message: 'Forbidden: Only SUPERADMIN, ADMIN, or authorized MANAGER can void bills. POS_BILLING cannot delete or void bills.'
+    });
+  }
+
+  const billId = String(req.params.billId || '').trim();
+  const reason = String(req.body?.reason || req.query?.reason || '').trim();
+  if (reason.length < 5) {
+    return res.status(400).json({
+      success: false,
+      message: 'A void reason of at least 5 characters is required for audited soft-delete.'
+    });
+  }
+
+  const located = await locateOutletBillRecord(session, billId);
+  if (!located.found || !located.row) {
+    return res.status(404).json({
+      success: false,
+      message: 'Bill not found in the active outlet.'
+    });
+  }
+
+  if (String(located.row.outlet_id) !== session.activeOutlet.id) {
+    return res.status(403).json({
+      success: false,
+      message: 'Forbidden: Cross-outlet bill void is blocked.'
+    });
+  }
+
+  const currentEntry = normalizeLedgerBillRow(located.row, located.sourceTable, session.activeOutlet.id);
+  const conflictCheck = validateBillMutationConflict({
+    currentIsVoided: currentEntry.isVoided,
+    currentEditVersion: currentEntry.editVersion,
+    expectedEditVersion: req.body?.expectedEditVersion ?? req.body?.expected_edit_version
+  });
+  if (conflictCheck.conflict) {
+    return res.status(409).json({
+      success: false,
+      code: conflictCheck.code,
+      message: conflictCheck.message,
+      currentVersion: currentEntry.editVersion,
+      isVoided: currentEntry.isVoided
+    });
+  }
+
+  const nowIso = new Date().toISOString();
+  const actorUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(session.userId)
+    ? session.userId
+    : null;
+  const db = getLedgerDbClient(session);
+
+  if (db && located.sourceTable !== 'memory') {
+    const voidPatch: Record<string, any> = {
+      is_voided: true,
+      voided_at: nowIso,
+      voided_by: actorUuid,
+      void_reason: reason,
+      updated_at: nowIso
+    };
+    if (located.sourceTable === 'smav_central_sales') {
+      voidPatch.details = {
+        ...(located.row.details && typeof located.row.details === 'object' ? located.row.details : {}),
+        is_voided: true,
+        voided_at: nowIso,
+        voided_by: session.userId,
+        void_reason: reason
+      };
+    }
+
+    const updateRes = await db
+      .from(located.sourceTable)
+      .update(voidPatch)
+      .eq('id', located.row.id)
+      .eq('outlet_id', session.activeOutlet.id);
+
+    if (updateRes.error) {
+      if (/column .*is_voided.* does not exist/i.test(updateRes.error.message || '')) {
+        return res.status(409).json({
+          success: false,
+          code: 'MIGRATION_018_REQUIRED',
+          message: 'Audited soft-delete requires Migration 018 (is_voided columns) to be applied on Central Supabase. Hard delete is disabled to preserve financial history.'
+        });
+      }
+      return res.status(500).json({
+        success: false,
+        message: `Failed to void bill: ${updateRes.error.message}`
+      });
+    }
+  }
+
+  for (const list of [syncedBills, syncedOrders]) {
+    const idx = list.findIndex(
+      (r) =>
+        r.outlet_id === session.activeOutlet.id &&
+        (String(r.id) === String(located.row.id) || String(r.bill_number || r.order_number) === currentEntry.billNumber)
+    );
+    if (idx >= 0) {
+      list[idx] = {
+        ...list[idx],
+        is_voided: true,
+        voided_at: nowIso,
+        voided_by: session.userId,
+        void_reason: reason
+      };
+    }
+  }
+
+  auditLogger.log({
+    eventType: 'BILL_VOIDED',
+    actorId: session.userId,
+    actorEmail: session.email,
+    outletId: session.activeOutlet.id,
+    details: {
+      role: session.role,
+      billId: currentEntry.id,
+      billNumber: currentEntry.billNumber,
+      grandTotal: currentEntry.grandTotal,
+      paymentMode: currentEntry.paymentMode,
+      reason,
+      voidedAt: nowIso
+    }
+  });
+
+  await writeTrustedServerAuditLog({
+    userId: session.userId,
+    userEmail: session.email,
+    outletId: session.activeOutlet.id,
+    action: 'BILL_VOIDED',
+    entityType: 'bill',
+    entityId: currentEntry.billNumber || currentEntry.id,
+    details: {
+      actor_role: session.role,
+      bill_id: currentEntry.id,
+      bill_number: currentEntry.billNumber,
+      grand_total: currentEntry.grandTotal,
+      payment_mode: currentEntry.paymentMode,
+      items_preserved: currentEntry.items,
+      reason,
+      voided_at: nowIso
+    }
+  });
+
+  return res.json({
+    success: true,
+    message: `Bill ${currentEntry.billNumber} has been voided (audited soft-delete).`,
+    billId: currentEntry.id,
+    billNumber: currentEntry.billNumber,
+    voidedAt: nowIso
+  });
+}
+
+app.post('/api/pos/bills/:billId/void', requireAuth, handleVoidBillRequest);
+app.delete('/api/pos/bills/:billId', requireAuth, handleVoidBillRequest);
 
 app.get('/api/salon/services', requireAuth, (req, res) => {
   res.json({ business_id: 'the_glossy_looks', current_revision: salonCatalogRevision, services: salonServices.filter(s => !s.isDeleted && s.isActive) });

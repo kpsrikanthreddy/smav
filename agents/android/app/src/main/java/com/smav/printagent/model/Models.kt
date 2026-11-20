@@ -130,6 +130,23 @@ data class Outlet(
     val businessType: BusinessType get() = BusinessType.fromRawCategory(category)
 }
 
+data class BranchOption(
+    val id: String,
+    val branchCode: String,
+    val branchName: String,
+    val billPrefix: String = "TGL"
+) {
+    companion object {
+        fun displayNameForCode(code: String?): String {
+            return when ((code ?: "").trim().uppercase(Locale.ENGLISH)) {
+                "GACHI" -> "Gachibowli"
+                "KONDA" -> "Kondapur"
+                else -> (code ?: "").trim()
+            }
+        }
+    }
+}
+
 data class SalonService(
     val id: String,
     val name: String,

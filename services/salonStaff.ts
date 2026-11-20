@@ -2,9 +2,21 @@ export interface NormalizedStylist {
   id: string;
   name: string;
   role: string;
+  sourceRole?: CanonicalGlossyUserRole;
+  smavRole?: 'ADMIN' | 'POS_BILLING';
   outletId: string;
   available: boolean;
 }
+
+export type CanonicalGlossyUserRole =
+  | 'OWNER'
+  | 'MANAGER'
+  | 'ADMIN'
+  | 'STYLIST'
+  | 'RECEPTIONIST'
+  | 'INVENTORY_STAFF'
+  | 'POS_BILLING'
+  | 'STAFF';
 
 export type StaffDiagnosticCode =
   | 'OK'
@@ -32,12 +44,29 @@ export interface SalonStaffFetchResult {
   message: string | null;
 }
 
+export interface AuthoritativeGlossyUserRecord {
+  id?: string | null;
+  user_id?: string | null;
+  staff_id?: string | null;
+  email?: string | null;
+  username?: string | null;
+  phone?: string | null;
+  full_name?: string | null;
+  name?: string | null;
+  role?: string | null;
+  is_active?: boolean | null;
+}
+
 export interface FetchGlossyLooksStaffOptions {
   outlet: OutletMatchTarget;
   staffApiUrl?: string;
   integrationKey?: string;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  /** Optional authoritative Glossy Looks public.users rows used to override public.staff.role job titles */
+  authoritativeUsers?: AuthoritativeGlossyUserRecord[];
+  glossySupabaseUrl?: string;
+  glossySupabaseServiceKey?: string;
 }
 
 const DEFAULT_GLOSSY_LOOKS_STAFF_URL = 'https://www.glossylooks.in/api/staff';
@@ -54,11 +83,20 @@ const INACTIVE_STATUS_TOKENS = new Set([
   'terminated',
   'archived',
   'suspended',
-  'on_leave'
+  'on_leave',
 ]);
 
-const SALON_ROLE_PATTERN =
-  /\b(stylist|beautician|therapist|barber|technician|salon[\s_-]*staff|hair[\s_-]*dresser|hair[\s_-]*stylist)\b/i;
+const CANONICAL_USER_ROLE_SET = new Set<string>([
+  'OWNER',
+  'MANAGER',
+  'ADMIN',
+  'STYLIST',
+  'RECEPTIONIST',
+  'INVENTORY_STAFF',
+  'POS_BILLING',
+  'STAFF',
+  'SUPERADMIN',
+]);
 
 function firstNonEmptyString(...values: unknown[]): string {
   for (const val of values) {
@@ -80,6 +118,12 @@ function combineNameParts(first: unknown, last: unknown): string {
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function normalizePhoneLookupKey(phone: unknown): string {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (digits.length >= 10) return digits.slice(-10);
+  return digits;
 }
 
 function parseStatusFlag(value: unknown): 'active' | 'inactive' | 'unknown' {
@@ -105,7 +149,7 @@ export function isStaffRecordActive(record: Record<string, unknown>): boolean {
   }
 
   const boolCandidates = [record.is_active, record.isActive, record.active].filter(
-    v => v !== undefined && v !== null && String(v).trim() !== ''
+    (v) => v !== undefined && v !== null && String(v).trim() !== ''
   );
 
   for (const candidate of boolCandidates) {
@@ -126,24 +170,332 @@ export function isStaffRecordActive(record: Record<string, unknown>): boolean {
   return true;
 }
 
-export function normalizeSalonRole(record: Record<string, unknown>): { accepted: boolean; role: string } {
-  const rawRole = firstNonEmptyString(
-    record.role,
-    record.designation,
-    record.jobTitle,
-    record.job_title,
-    record.specialty
-  );
-  if (!rawRole) {
-    return { accepted: true, role: 'Salon Staff' };
+/**
+ * Normalizes a raw authoritative `public.users.role` token into a canonical Glossy Looks role.
+ * NEVER falls back to free-text job titles from `public.staff.role`.
+ */
+export function parseCanonicalGlossyUserRole(rawValue: unknown): CanonicalGlossyUserRole | 'SUPERADMIN' | null {
+  const token = String(rawValue || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[\s-]+/g, '_');
+  if (!token) return null;
+  if (CANONICAL_USER_ROLE_SET.has(token)) {
+    return token as CanonicalGlossyUserRole | 'SUPERADMIN';
   }
-  if (!SALON_ROLE_PATTERN.test(rawRole)) {
-    return { accepted: false, role: rawRole };
-  }
-  return { accepted: true, role: rawRole };
+  return null;
 }
 
-export function extractStaffCollection(payload: unknown): { ok: true; rows: unknown[] } | { ok: false } {
+export function formatAuthoritativeDisplayRole(canonicalRole: CanonicalGlossyUserRole | null | undefined): string {
+  switch (canonicalRole) {
+    case 'STYLIST':
+      return 'Stylist';
+    case 'RECEPTIONIST':
+      return 'Receptionist';
+    case 'INVENTORY_STAFF':
+      return 'Inventory Staff';
+    case 'MANAGER':
+      return 'Manager';
+    case 'OWNER':
+      return 'Owner';
+    case 'ADMIN':
+      return 'Admin';
+    case 'POS_BILLING':
+    case 'STAFF':
+      return 'POS Billing';
+    default:
+      return 'POS Billing';
+  }
+}
+
+export function mapAuthoritativeGlossyRoleToSmav(rawRole: unknown): {
+  canonicalRole: CanonicalGlossyUserRole;
+  displayRole: string;
+  smavRole: 'ADMIN' | 'STAFF';
+  contractRole: 'ADMIN' | 'POS_BILLING';
+  edgeRoleHint: 'OWNER' | 'MANAGER' | 'ADMIN' | 'STYLIST' | 'RECEPTIONIST' | 'INVENTORY_STAFF';
+  isProtectedSuperadmin: boolean;
+} {
+  const parsed = parseCanonicalGlossyUserRole(rawRole);
+  if (parsed === 'SUPERADMIN') {
+    return {
+      canonicalRole: 'ADMIN',
+      displayRole: 'Admin',
+      smavRole: 'ADMIN',
+      contractRole: 'ADMIN',
+      edgeRoleHint: 'ADMIN',
+      isProtectedSuperadmin: true,
+    };
+  }
+
+  switch (parsed) {
+    case 'OWNER':
+      return {
+        canonicalRole: 'OWNER',
+        displayRole: 'Owner',
+        smavRole: 'ADMIN',
+        contractRole: 'ADMIN',
+        edgeRoleHint: 'OWNER',
+        isProtectedSuperadmin: false,
+      };
+    case 'MANAGER':
+      return {
+        canonicalRole: 'MANAGER',
+        displayRole: 'Manager',
+        smavRole: 'ADMIN',
+        contractRole: 'ADMIN',
+        edgeRoleHint: 'MANAGER',
+        isProtectedSuperadmin: false,
+      };
+    case 'ADMIN':
+      return {
+        canonicalRole: 'ADMIN',
+        displayRole: 'Admin',
+        smavRole: 'ADMIN',
+        contractRole: 'ADMIN',
+        edgeRoleHint: 'ADMIN',
+        isProtectedSuperadmin: false,
+      };
+    case 'STYLIST':
+      return {
+        canonicalRole: 'STYLIST',
+        displayRole: 'Stylist',
+        smavRole: 'STAFF',
+        contractRole: 'POS_BILLING',
+        edgeRoleHint: 'STYLIST',
+        isProtectedSuperadmin: false,
+      };
+    case 'INVENTORY_STAFF':
+      return {
+        canonicalRole: 'INVENTORY_STAFF',
+        displayRole: 'Inventory Staff',
+        smavRole: 'STAFF',
+        contractRole: 'POS_BILLING',
+        edgeRoleHint: 'INVENTORY_STAFF',
+        isProtectedSuperadmin: false,
+      };
+    case 'RECEPTIONIST':
+      return {
+        canonicalRole: 'RECEPTIONIST',
+        displayRole: 'Receptionist',
+        smavRole: 'STAFF',
+        contractRole: 'POS_BILLING',
+        edgeRoleHint: 'RECEPTIONIST',
+        isProtectedSuperadmin: false,
+      };
+    case 'POS_BILLING':
+    case 'STAFF':
+    default:
+      return {
+        canonicalRole: parsed || 'POS_BILLING',
+        displayRole: formatAuthoritativeDisplayRole(parsed || 'POS_BILLING'),
+        smavRole: 'STAFF',
+        contractRole: 'POS_BILLING',
+        edgeRoleHint: 'RECEPTIONIST',
+        isProtectedSuperadmin: false,
+      };
+  }
+}
+
+export interface AuthoritativeUserRoleIndex {
+  byId: Map<string, AuthoritativeGlossyUserRecord>;
+  byEmail: Map<string, AuthoritativeGlossyUserRecord>;
+  byUsername: Map<string, AuthoritativeGlossyUserRecord>;
+  byPhone: Map<string, AuthoritativeGlossyUserRecord>;
+  byName: Map<string, AuthoritativeGlossyUserRecord>;
+}
+
+export function buildAuthoritativeUserRoleIndex(
+  users?: AuthoritativeGlossyUserRecord[]
+): AuthoritativeUserRoleIndex | null {
+  if (!Array.isArray(users) || users.length === 0) return null;
+  const byId = new Map<string, AuthoritativeGlossyUserRecord>();
+  const byEmail = new Map<string, AuthoritativeGlossyUserRecord>();
+  const byUsername = new Map<string, AuthoritativeGlossyUserRecord>();
+  const byPhone = new Map<string, AuthoritativeGlossyUserRecord>();
+  const byName = new Map<string, AuthoritativeGlossyUserRecord>();
+
+  for (const u of users) {
+    if (!u || typeof u !== 'object') continue;
+    for (const idCandidate of [u.id, u.user_id, u.staff_id]) {
+      const cleanId = firstNonEmptyString(idCandidate).toLowerCase();
+      if (cleanId) byId.set(cleanId, u);
+    }
+    const email = firstNonEmptyString(u.email).toLowerCase();
+    if (email) byEmail.set(email, u);
+    const username = firstNonEmptyString(u.username).toLowerCase();
+    if (username) byUsername.set(username, u);
+    const phoneKey = normalizePhoneLookupKey(u.phone);
+    if (phoneKey) byPhone.set(phoneKey, u);
+    const nameKey = firstNonEmptyString(u.full_name, u.name).toLowerCase();
+    if (nameKey) byName.set(nameKey, u);
+  }
+
+  return { byId, byEmail, byUsername, byPhone, byName };
+}
+
+function findAuthoritativeUserMatch(
+  record: Record<string, unknown>,
+  index: AuthoritativeUserRoleIndex | null
+): AuthoritativeGlossyUserRecord | null {
+  if (!index) return null;
+
+  const idCandidates = [
+    record.user_id,
+    record.userId,
+    record.auth_user_id,
+    record.authUserId,
+    record.staff_id,
+    record.staffId,
+    record.id,
+  ];
+  for (const cand of idCandidates) {
+    const key = firstNonEmptyString(cand).toLowerCase();
+    if (key && index.byId.has(key)) return index.byId.get(key)!;
+  }
+
+  const email = firstNonEmptyString(record.email, record.user_email, record.userEmail).toLowerCase();
+  if (email && index.byEmail.has(email)) return index.byEmail.get(email)!;
+
+  const username = firstNonEmptyString(record.username, record.user_name, record.userName).toLowerCase();
+  if (username && index.byUsername.has(username)) return index.byUsername.get(username)!;
+
+  const phoneKey = normalizePhoneLookupKey(record.phone ?? record.mobile);
+  if (phoneKey && index.byPhone.has(phoneKey)) return index.byPhone.get(phoneKey)!;
+
+  const nameKey = firstNonEmptyString(
+    record.name,
+    record.fullName,
+    record.full_name,
+    record.displayName,
+    combineNameParts(record.firstName ?? record.first_name, record.lastName ?? record.last_name)
+  ).toLowerCase();
+  if (nameKey && index.byName.has(nameKey)) return index.byName.get(nameKey)!;
+
+  return null;
+}
+
+/**
+ * Resolves authoritative `public.users.role` for a Glossy Looks staff record.
+ * Priority:
+ *  1. Direct match in authoritative `public.users` lookup index (if provided)
+ *  2. Nested `users.role` / `user.role` from joined API payload
+ *  3. Explicit user-role fields (`user_role`, `userRole`, `account_role`, `accountRole`, `auth_role`, `system_role`)
+ *  4. `record.role` ONLY when it is a canonical `public.users.role` value (NOT a free-text `public.staff.role` job title)
+ *
+ * Explicitly ignores `staff_role`, `staffRole`, `jobTitle`, `job_title`, `designation`, and `specialty`.
+ */
+export function resolveAuthoritativeUserRole(
+  record: Record<string, unknown>,
+  userIndex: AuthoritativeUserRoleIndex | null = null
+): {
+  canonicalRole: CanonicalGlossyUserRole | null;
+  displayRole: string | null;
+  smavRole: 'ADMIN' | 'POS_BILLING';
+  userIsActive: boolean | null;
+} {
+  const matchedUser = findAuthoritativeUserMatch(record, userIndex);
+  const nestedUser = isPlainRecord(record.users)
+    ? record.users
+    : isPlainRecord(record.user)
+      ? record.user
+      : null;
+
+  const userIsActive =
+    matchedUser && typeof matchedUser.is_active === 'boolean'
+      ? matchedUser.is_active
+      : nestedUser && typeof nestedUser.is_active === 'boolean'
+        ? nestedUser.is_active
+        : null;
+
+  const explicitUserRoleRaw = firstNonEmptyString(
+    matchedUser?.role,
+    nestedUser?.role,
+    record.user_role,
+    record.userRole,
+    record.public_user_role,
+    record.publicUserRole,
+    record.account_role,
+    record.accountRole,
+    record.auth_role,
+    record.authRole,
+    record.system_role,
+    record.systemRole
+  );
+
+  if (explicitUserRoleRaw) {
+    const parsed = parseCanonicalGlossyUserRole(explicitUserRoleRaw);
+    if (parsed && parsed !== 'SUPERADMIN') {
+      const mapped = mapAuthoritativeGlossyRoleToSmav(parsed);
+      return {
+        canonicalRole: mapped.canonicalRole,
+        displayRole: mapped.displayRole,
+        smavRole: mapped.contractRole,
+        userIsActive,
+      };
+    }
+  }
+
+  // Only inspect `record.role` if it is NOT flagged as a `public.staff` job title AND parses as a canonical `public.users.role`.
+  const roleSource = firstNonEmptyString(record.role_source, record.roleSource).toLowerCase();
+  if (roleSource !== 'staff' && roleSource !== 'job_title') {
+    const fallbackCanonical = parseCanonicalGlossyUserRole(record.role);
+    if (fallbackCanonical && fallbackCanonical !== 'SUPERADMIN') {
+      const mapped = mapAuthoritativeGlossyRoleToSmav(fallbackCanonical);
+      return {
+        canonicalRole: mapped.canonicalRole,
+        displayRole: mapped.displayRole,
+        smavRole: mapped.contractRole,
+        userIsActive,
+      };
+    }
+  }
+
+  return {
+    canonicalRole: null,
+    displayRole: null,
+    smavRole: 'POS_BILLING',
+    userIsActive,
+  };
+}
+
+/**
+ * Determines whether a staff record is an eligible POS stylist based strictly on authoritative `public.users.role`.
+ * Never uses `public.staff.role` (job title) for access or display role.
+ */
+export function normalizeSalonRole(
+  record: Record<string, unknown>,
+  userIndex: AuthoritativeUserRoleIndex | null = null
+): {
+  accepted: boolean;
+  role: string;
+  sourceRole?: CanonicalGlossyUserRole;
+  smavRole: 'ADMIN' | 'POS_BILLING';
+} {
+  const resolved = resolveAuthoritativeUserRole(record, userIndex);
+  if (!resolved.canonicalRole || !resolved.displayRole) {
+    return { accepted: false, role: '', smavRole: 'POS_BILLING' };
+  }
+
+  // Only users whose authoritative public.users.role is STYLIST are selectable as POS stylists.
+  if (resolved.canonicalRole === 'STYLIST') {
+    return {
+      accepted: true,
+      role: resolved.displayRole, // Always "Stylist"
+      sourceRole: resolved.canonicalRole,
+      smavRole: resolved.smavRole,
+    };
+  }
+
+  return {
+    accepted: false,
+    role: resolved.displayRole,
+    sourceRole: resolved.canonicalRole,
+    smavRole: resolved.smavRole,
+  };
+}
+
+export function extractStaffCollection(payload: unknown): { ok: true; rows: unknown[]; users?: AuthoritativeGlossyUserRecord[] } | { ok: false } {
   if (Array.isArray(payload)) {
     return { ok: true, rows: payload };
   }
@@ -151,11 +503,17 @@ export function extractStaffCollection(payload: unknown): { ok: true; rows: unkn
     return { ok: false };
   }
 
+  const embeddedUsers = Array.isArray(payload.users)
+    ? (payload.users as AuthoritativeGlossyUserRecord[])
+    : isPlainRecord(payload.data) && Array.isArray(payload.data.users)
+      ? (payload.data.users as AuthoritativeGlossyUserRecord[])
+      : undefined;
+
   const directKeys = ['staff', 'stylists', 'employees', 'users', 'data'] as const;
   for (const key of directKeys) {
     const candidate = payload[key];
     if (Array.isArray(candidate)) {
-      return { ok: true, rows: candidate };
+      return { ok: true, rows: candidate, users: key === 'users' ? undefined : embeddedUsers };
     }
   }
 
@@ -164,7 +522,7 @@ export function extractStaffCollection(payload: unknown): { ok: true; rows: unkn
     for (const key of ['staff', 'stylists', 'employees', 'users'] as const) {
       const nested = payload.data[key];
       if (Array.isArray(nested)) {
-        return { ok: true, rows: nested };
+        return { ok: true, rows: nested, users: key === 'users' ? undefined : embeddedUsers };
       }
     }
   }
@@ -211,7 +569,7 @@ export function matchStaffOutlet(
     firstNonEmptyString(record.branchId, record.branch_id),
     firstNonEmptyString(record.outletId, record.outlet_id),
     firstNonEmptyString(record.outletCode, record.outlet_code),
-    firstNonEmptyString(record.centralOutletCode, record.central_outlet_code)
+    firstNonEmptyString(record.centralOutletCode, record.central_outlet_code),
   ].filter(Boolean);
 
   if (candidates.length === 0) {
@@ -230,7 +588,8 @@ export function matchStaffOutlet(
 
 export function normalizeUpstreamStaffPayload(
   payload: unknown,
-  outlet: OutletMatchTarget
+  outlet: OutletMatchTarget,
+  authoritativeUsers?: AuthoritativeGlossyUserRecord[]
 ): SalonStaffFetchResult {
   const extracted = extractStaffCollection(payload);
   if (!extracted.ok) {
@@ -239,9 +598,15 @@ export function normalizeUpstreamStaffPayload(
       stylists: [],
       upstreamStatus: 200,
       diagnosticCode: 'STAFF_MAPPING_ERROR',
-      message: 'Upstream Glossy Looks staff response could not be mapped to a staff list.'
+      message: 'Upstream Glossy Looks staff response could not be mapped to a staff list.',
     };
   }
+
+  const mergedAuthUsers = [
+    ...(Array.isArray(authoritativeUsers) ? authoritativeUsers : []),
+    ...(Array.isArray(extracted.users) ? extracted.users : []),
+  ];
+  const userIndex = buildAuthoritativeUserRoleIndex(mergedAuthUsers);
 
   if (extracted.rows.length === 0) {
     return {
@@ -249,7 +614,7 @@ export function normalizeUpstreamStaffPayload(
       stylists: [],
       upstreamStatus: 200,
       diagnosticCode: 'NO_ACTIVE_STAFF',
-      message: 'No active stylists returned for this outlet from the Glossy Looks staff API.'
+      message: 'No active stylists returned for this outlet from the Glossy Looks staff API.',
     };
   }
 
@@ -274,7 +639,10 @@ export function normalizeUpstreamStaffPayload(
 
     if (!isStaffRecordActive(row)) continue;
 
-    const roleCheck = normalizeSalonRole(row);
+    const resolvedAuth = resolveAuthoritativeUserRole(row, userIndex);
+    if (resolvedAuth.userIsActive === false) continue;
+
+    const roleCheck = normalizeSalonRole(row, userIndex);
     if (!roleCheck.accepted) continue;
 
     const outletMatch = matchStaffOutlet(row, outlet);
@@ -287,8 +655,10 @@ export function normalizeUpstreamStaffPayload(
       id,
       name,
       role: roleCheck.role,
+      sourceRole: roleCheck.sourceRole,
+      smavRole: roleCheck.smavRole,
       outletId: outletMatch.outletId,
-      available: true
+      available: true,
     });
   }
 
@@ -298,7 +668,7 @@ export function normalizeUpstreamStaffPayload(
       stylists: [],
       upstreamStatus: 200,
       diagnosticCode: 'STAFF_MAPPING_ERROR',
-      message: 'Upstream Glossy Looks staff records could not be mapped (missing ID or name fields).'
+      message: 'Upstream Glossy Looks staff records could not be mapped (missing ID or name fields).',
     };
   }
 
@@ -308,7 +678,7 @@ export function normalizeUpstreamStaffPayload(
       stylists: [],
       upstreamStatus: 200,
       diagnosticCode: 'NO_ACTIVE_STAFF',
-      message: 'No active stylists returned for this outlet from the Glossy Looks staff API.'
+      message: 'No active stylists returned for this outlet from the Glossy Looks staff API.',
     };
   }
 
@@ -317,8 +687,52 @@ export function normalizeUpstreamStaffPayload(
     stylists,
     upstreamStatus: 200,
     diagnosticCode: 'OK',
-    message: null
+    message: null,
   };
+}
+
+/**
+ * Fetches authoritative `public.users` rows from Glossy Looks Supabase when configured.
+ * Fails gracefully (returns empty list) if Glossy Looks Supabase service key is not present.
+ */
+export async function fetchGlossyLooksAuthoritativeUsers(options: {
+  glossySupabaseUrl?: string;
+  glossySupabaseServiceKey?: string;
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
+}): Promise<AuthoritativeGlossyUserRecord[]> {
+  const url = (
+    options.glossySupabaseUrl ||
+    process.env.GLOSSYLOOKS_SUPABASE_URL ||
+    ''
+  ).trim().replace(/\/+$/, '');
+  const key = (
+    options.glossySupabaseServiceKey ||
+    process.env.GLOSSYLOOKS_SUPABASE_SERVICE_ROLE_KEY ||
+    ''
+  ).trim();
+  const fetchImpl = options.fetchImpl || fetch;
+  const timeoutMs = options.timeoutMs ?? 4500;
+
+  if (!url || !key) return [];
+
+  try {
+    const endpoint = `${url}/rest/v1/users?select=id,email,username,phone,full_name,name,role,is_active`;
+    const res = await fetchImpl(endpoint, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        apikey: key,
+        Authorization: `Bearer ${key}`,
+      },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data) ? (data as AuthoritativeGlossyUserRecord[]) : [];
+  } catch {
+    return [];
+  }
 }
 
 export async function fetchGlossyLooksStaff(
@@ -329,7 +743,10 @@ export async function fetchGlossyLooksStaff(
     staffApiUrl = DEFAULT_GLOSSY_LOOKS_STAFF_URL,
     integrationKey = process.env.GLOSSYLOOKS_INTEGRATION_KEY?.trim() || '',
     timeoutMs = 8000,
-    fetchImpl = fetch
+    fetchImpl = fetch,
+    authoritativeUsers,
+    glossySupabaseUrl,
+    glossySupabaseServiceKey,
   } = options;
 
   if (!isGlossyLooksOutlet(outlet)) {
@@ -338,7 +755,7 @@ export async function fetchGlossyLooksStaff(
       stylists: [],
       upstreamStatus: null,
       diagnosticCode: 'STAFF_CONFIG_ERROR',
-      message: `No upstream salon staff adapter is configured for outlet "${outlet.code || outlet.id}".`
+      message: `No upstream salon staff adapter is configured for outlet "${outlet.code || outlet.id}".`,
     };
   }
 
@@ -351,7 +768,7 @@ export async function fetchGlossyLooksStaff(
         stylists: [],
         upstreamStatus: null,
         diagnosticCode: 'STAFF_CONFIG_ERROR',
-        message: 'Upstream salon staff API URL configuration is invalid (HTTPS required).'
+        message: 'Upstream salon staff API URL configuration is invalid (HTTPS required).',
       };
     }
   } catch {
@@ -360,23 +777,33 @@ export async function fetchGlossyLooksStaff(
       stylists: [],
       upstreamStatus: null,
       diagnosticCode: 'STAFF_CONFIG_ERROR',
-      message: 'Upstream salon staff API URL is not configured.'
+      message: 'Upstream salon staff API URL is not configured.',
     };
   }
 
   const headers: Record<string, string> = {
-    Accept: 'application/json'
+    Accept: 'application/json',
   };
   if (integrationKey) {
     headers['X-Integration-Key'] = integrationKey;
   }
+
+  const authUsersPromise =
+    authoritativeUsers && authoritativeUsers.length > 0
+      ? Promise.resolve(authoritativeUsers)
+      : fetchGlossyLooksAuthoritativeUsers({
+          glossySupabaseUrl: glossySupabaseUrl || outlet.supabaseUrl,
+          glossySupabaseServiceKey,
+          timeoutMs: Math.min(timeoutMs, 4500),
+          fetchImpl,
+        });
 
   let response: Response;
   try {
     response = await fetchImpl(parsedUrl.toString(), {
       method: 'GET',
       headers,
-      signal: AbortSignal.timeout(timeoutMs)
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err: any) {
     const errName = String(err?.name || '');
@@ -395,7 +822,7 @@ export async function fetchGlossyLooksStaff(
       diagnosticCode: isTimeout ? 'STAFF_UPSTREAM_TIMEOUT' : 'STAFF_UPSTREAM_NETWORK_ERROR',
       message: isTimeout
         ? 'Upstream Glossy Looks staff API timed out. Please retry.'
-        : 'Could not connect to the upstream Glossy Looks staff API.'
+        : 'Could not connect to the upstream Glossy Looks staff API.',
     };
   }
 
@@ -406,7 +833,7 @@ export async function fetchGlossyLooksStaff(
         stylists: [],
         upstreamStatus: response.status,
         diagnosticCode: 'STAFF_CONFIG_ERROR',
-        message: `Glossy Looks integration key is missing or unauthorized (upstream HTTP ${response.status}). Configure GLOSSYLOOKS_INTEGRATION_KEY.`
+        message: `Glossy Looks integration key is missing or unauthorized (upstream HTTP ${response.status}). Configure GLOSSYLOOKS_INTEGRATION_KEY.`,
       };
     }
     return {
@@ -414,7 +841,7 @@ export async function fetchGlossyLooksStaff(
       stylists: [],
       upstreamStatus: response.status,
       diagnosticCode: 'STAFF_UPSTREAM_AUTH_ERROR',
-      message: `Upstream Glossy Looks staff API rejected authorization (HTTP ${response.status}). Verify integration key permissions.`
+      message: `Upstream Glossy Looks staff API rejected authorization (HTTP ${response.status}). Verify integration key permissions.`,
     };
   }
 
@@ -424,7 +851,7 @@ export async function fetchGlossyLooksStaff(
       stylists: [],
       upstreamStatus: response.status,
       diagnosticCode: 'STAFF_UPSTREAM_HTTP_ERROR',
-      message: `Upstream Glossy Looks staff API failed with HTTP ${response.status}.`
+      message: `Upstream Glossy Looks staff API failed with HTTP ${response.status}.`,
     };
   }
 
@@ -437,9 +864,10 @@ export async function fetchGlossyLooksStaff(
       stylists: [],
       upstreamStatus: response.status,
       diagnosticCode: 'STAFF_INVALID_JSON',
-      message: `Upstream Glossy Looks staff API returned invalid JSON (HTTP ${response.status}).`
+      message: `Upstream Glossy Looks staff API returned invalid JSON (HTTP ${response.status}).`,
     };
   }
 
-  return normalizeUpstreamStaffPayload(payload, outlet);
+  const resolvedAuthUsers = await authUsersPromise;
+  return normalizeUpstreamStaffPayload(payload, outlet, resolvedAuthUsers);
 }

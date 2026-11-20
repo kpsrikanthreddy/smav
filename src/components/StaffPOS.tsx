@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import {
   Appointment,
+  OutletBranchOption,
   RestaurantCartItem,
   RestaurantMenuItem,
   RestaurantTable,
@@ -27,8 +28,10 @@ import {
   SalonCartItem,
   SalonService,
   Stylist,
+  TransactionLedgerEntry,
   UserSession,
 } from '../types';
+import { TransactionLedger } from './TransactionLedger';
 import {
   BASE_INPUT_CLASS,
   Button,
@@ -54,6 +57,8 @@ interface StaffPOSProps {
   serverRevision: number;
   localRevision: number;
   onPerformDeltaSync: () => void;
+  onCartSummaryChange?: (summary: { itemCount: number; grandTotal: number }) => void;
+  openCartSignal?: number;
 }
 
 const normalizeGroup = (value?: string | null) => (value || '').trim() || 'General';
@@ -79,29 +84,18 @@ const salonSubcategoryLabel = (item: Pick<SalonService, 'name' | 'subcategory'>)
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 };
 
-const salonBranchCode = (outlet: UserSession['activeOutlet']) => {
-  const source = `${outlet.code} ${outlet.name} ${outlet.address}`.toLowerCase();
-  if (source.includes('kondapur') || /(^|\W)konda?(\W|$)/.test(source)) return 'KONDA';
-  if (source.includes('gachibowli') || /(^|\W)gachi?(\W|$)/.test(source)) return 'GACHI';
-  return outlet.code.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 5) || 'GACHI';
+const branchNameFromCode = (code?: string | null): string => {
+  const normalized = (code || '').trim().toUpperCase();
+  if (normalized === 'GACHI') return 'Gachibowli';
+  if (normalized === 'KONDA') return 'Kondapur';
+  return normalized || '';
 };
 
-const indiaDatePart = () => {
-  const parts = new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit',
-  }).formatToParts(new Date());
-  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-  return `${values.year}${values.month}${values.day}`;
-};
-
-const nextOfflineSalonBillNumber = (outlet: UserSession['activeOutlet']) => {
-  const branch = salonBranchCode(outlet);
-  const datePart = indiaDatePart();
-  const key = `smav:salon-sequence:${outlet.id}:${datePart}`;
-  const previous = Number.parseInt(window.localStorage.getItem(key) || '0', 10);
-  const next = (Number.isFinite(previous) ? previous : 0) + 1;
-  window.localStorage.setItem(key, String(next));
-  return `TGL-${branch}-${datePart}-${String(next).padStart(4, '0')}`;
+const createCheckoutAttemptId = (): string => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `web-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 };
 
 export const StaffPOS: React.FC<StaffPOSProps> = ({
@@ -111,16 +105,23 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
   isPrinterConnected,
   onTogglePrinter,
   paperWidthMm,
-  onChangePaperWidth,
   localRevision,
+  onCartSummaryChange,
+  openCartSignal = 0,
 }) => {
   const category = session.activeOutlet.category;
-  const [activePosView, setActivePosView] = useState<'billing' | 'catalog' | 'secondary'>('billing');
+  const [activePosView, setActivePosView] = useState<'billing' | 'catalog' | 'secondary' | 'ledger'>('billing');
+  const [ledgerRefreshTick, setLedgerRefreshTick] = useState<number>(0);
+  const cartSectionRef = useRef<HTMLDivElement | null>(null);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [isCatalogLoading, setIsCatalogLoading] = useState<boolean>(true);
 
   // Salon Data
   const [salonServices, setSalonServices] = useState<SalonService[]>([]);
+  const [permittedBranches, setPermittedBranches] = useState<OutletBranchOption[]>([]);
+  const [selectedBranchCode, setSelectedBranchCode] = useState<string>('');
+  const [isLoadingBranches, setIsLoadingBranches] = useState<boolean>(false);
+  const [branchError, setBranchError] = useState<string | null>(null);
   const [stylists, setStylists] = useState<Stylist[]>([]);
   const [isLoadingStylists, setIsLoadingStylists] = useState(false);
   const [stylistError, setStylistError] = useState<string | null>(null);
@@ -140,7 +141,11 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
   const prevOutletIdRef = useRef(session.activeOutlet.id);
   const pendingCheckoutRef = useRef<{
     fingerprint: string;
+    centralBillId: string;
     billNumber: string;
+    branchId: string;
+    branchCode: string;
+    branchName: string;
     idempotencyKey: string;
   } | null>(null);
 
@@ -244,6 +249,9 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       setBillSaveError(null);
       setBillSuccessMessage(null);
       setMissingStylistIdx(null);
+      setPermittedBranches([]);
+      setSelectedBranchCode('');
+      setBranchError(null);
       pendingCheckoutRef.current = null;
       try {
         const raw = window.localStorage.getItem(`smav:offline-queue:${session.activeOutlet.id}`);
@@ -405,6 +413,49 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
     });
   }, [category, isLoadingStylists, stylistError, stylists]);
 
+  const applyBranchSelectionRules = useCallback(
+    (branchesList: OutletBranchOption[], autoBranch?: OutletBranchOption | null) => {
+      setPermittedBranches(branchesList);
+      setBranchError(null);
+      // Preselect branch ONLY when authenticated user has exactly 1 assigned branch; otherwise require manual selection.
+      if (branchesList.length === 1) {
+        setSelectedBranchCode((autoBranch?.branchCode || branchesList[0].branchCode).toUpperCase());
+      } else {
+        setSelectedBranchCode((prev) =>
+          branchesList.some((b) => b.branchCode === prev) ? prev : ''
+        );
+      }
+    },
+    []
+  );
+
+  const loadPermittedBranches = useCallback(async () => {
+    if (category !== 'salon') {
+      setPermittedBranches([]);
+      setSelectedBranchCode('');
+      setBranchError(null);
+      return;
+    }
+    setIsLoadingBranches(true);
+    setBranchError(null);
+    try {
+      const res = await fetch('/api/pos/branches', {
+        headers: { Authorization: `Bearer ${session.token}` },
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.success) {
+        setBranchError(data?.message || 'Could not load permitted branches.');
+        return;
+      }
+      const list: OutletBranchOption[] = Array.isArray(data.branches) ? data.branches : [];
+      applyBranchSelectionRules(list, data.autoSelectedBranch || null);
+    } catch {
+      setBranchError('Could not load permitted branches from central SMAV server.');
+    } finally {
+      setIsLoadingBranches(false);
+    }
+  }, [category, session.token, applyBranchSelectionRules]);
+
   const loadPosData = useCallback(async () => {
     setIsCatalogLoading(true);
     try {
@@ -422,6 +473,11 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       if (data.category === 'salon') {
         setSalonServices(data.services || []);
         setAppointments(data.appointments || []);
+        if (Array.isArray(data.branches) && data.branches.length > 0) {
+          applyBranchSelectionRules(data.branches, data.autoSelectedBranch || null);
+        } else {
+          void loadPermittedBranches();
+        }
       } else if (data.category === 'restaurant') {
         setRestaurantMenu(data.menu || []);
         setRestaurantTables(data.tables || []);
@@ -434,12 +490,17 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
     } finally {
       setIsCatalogLoading(false);
     }
-  }, [session.token]);
+  }, [session.token, applyBranchSelectionRules, loadPermittedBranches]);
 
   useEffect(() => {
     void loadPosData();
     void loadStylists();
   }, [session.activeOutlet.id, loadPosData, loadStylists]);
+
+  const selectedBranch = useMemo(
+    () => permittedBranches.find((b) => b.branchCode === selectedBranchCode) || null,
+    [permittedBranches, selectedBranchCode]
+  );
 
   // Cart Quantity Helpers
   const salonQtyById = useMemo(() => {
@@ -634,10 +695,21 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
     }
   };
 
-  // Print Salon Bill (validation, idempotency, persistence preserved identically)
+  // Print Salon Bill (mandatory branch selection + central SMAV bill numbering, never client-generated)
   const handlePrintSalonBill = async () => {
     if (isSubmittingBillRef.current || isProcessingBill) return;
     if (salonCart.length === 0) return;
+
+    if (!selectedBranch || !selectedBranchCode) {
+      setBillSaveError('Branch selection is mandatory before generating a bill.');
+      document.getElementById('pos-salon-branch')?.focus();
+      return;
+    }
+
+    if (!isOnline) {
+      setBillSaveError('Connect to internet to obtain a valid bill number.');
+      return;
+    }
 
     if (!customerName.trim()) {
       setBillSaveError('Customer name is required.');
@@ -683,6 +755,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
     try {
       const fingerprint = JSON.stringify({
         outletId: session.activeOutlet.id,
+        branchCode: selectedBranch.branchCode,
         customerName: customerName.trim(),
         customerPhone: customerPhone.trim(),
         paymentMode,
@@ -696,42 +769,59 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       });
 
       if (!pendingCheckoutRef.current || pendingCheckoutRef.current.fingerprint !== fingerprint) {
-        let billNumber: string;
-        if (isOnline) {
-          const numberResponse = await fetch('/api/pos/salon/next-bill-number', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${session.token}`,
-            },
-            body: JSON.stringify({ outletId: session.activeOutlet.id }),
-          });
-          const numberResult = await numberResponse.json().catch(() => null);
-          if (!numberResponse.ok || !numberResult?.billNumber) {
-            throw new Error(numberResult?.message || 'Could not reserve the next bill number.');
-          }
-          billNumber = numberResult.billNumber;
-        } else {
-          billNumber = nextOfflineSalonBillNumber(session.activeOutlet);
+        const idempotencyKey = `WEB_${selectedBranch.branchCode}_${createCheckoutAttemptId()}`;
+        const numberResponse = await fetch('/api/central/bill-numbers/reserve', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${session.token}`,
+          },
+          body: JSON.stringify({
+            outletId: session.activeOutlet.id,
+            branchCode: selectedBranch.branchCode,
+            branchName: selectedBranch.branchName,
+            sourceSystem: 'smav_web_pos',
+            idempotencyKey,
+          }),
+        });
+        const numberResult = await numberResponse.json().catch(() => null);
+        if (!numberResponse.ok || !numberResult?.centralBillNumber) {
+          throw new Error(
+            numberResult?.message || 'Connect to internet to obtain a valid bill number.'
+          );
         }
         pendingCheckoutRef.current = {
           fingerprint,
-          billNumber,
-          idempotencyKey: `IDEM_${billNumber}`,
+          centralBillId: numberResult.centralBillId,
+          billNumber: numberResult.centralBillNumber,
+          branchId: numberResult.branchId || selectedBranch.id,
+          branchCode: numberResult.branchCode || selectedBranch.branchCode,
+          branchName: numberResult.branchName || selectedBranch.branchName,
+          idempotencyKey: numberResult.idempotencyKey || idempotencyKey,
         };
       }
 
-      const { billNumber, idempotencyKey } = pendingCheckoutRef.current;
+      const {
+        centralBillId,
+        billNumber,
+        branchId,
+        branchCode,
+        branchName,
+        idempotencyKey,
+      } = pendingCheckoutRef.current;
       const createdAtIso = new Date().toISOString();
       const bill = {
         billNumber,
+        centralBillId,
+        centralBillNumber: billNumber,
         outletName: session.activeOutlet.name,
-        outletAddress: session.activeOutlet.address,
         outletPhone: session.activeOutlet.phone,
-        outletGstin: session.activeOutlet.gstin,
         receiptHeader: session.activeOutlet.receiptHeader,
         receiptFooter: session.activeOutlet.receiptFooter,
-        branchCode: salonBranchCode(session.activeOutlet),
+        branchId,
+        branchCode,
+        branchName,
+        sourceSystem: 'smav_web_pos',
         businessType: 'salon',
         customerName: customerName.trim() || 'Walk-in Customer',
         customerPhone: customerPhone.trim(),
@@ -769,24 +859,17 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
         ],
       };
 
-      if (isOnline) {
-        const response = await fetch('/api/mobile/sync/bills', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${session.token}`,
-          },
-          body: JSON.stringify(payload),
-        });
-        const result = await response.json().catch(() => null);
-        if (!response.ok || !result?.success) {
-          throw new Error(result?.message || `Bill could not be saved (HTTP ${response.status})`);
-        }
-      } else {
-        setOfflineQueue((prev) => [
-          ...prev,
-          { kind: 'bills', outletId: session.activeOutlet.id, payload },
-        ]);
+      const response = await fetch('/api/mobile/sync/bills', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.token}`,
+        },
+        body: JSON.stringify(payload),
+      });
+      const result = await response.json().catch(() => null);
+      if (!response.ok || !result?.success) {
+        throw new Error(result?.message || `Bill could not be saved (HTTP ${response.status})`);
       }
 
       pendingCheckoutRef.current = null;
@@ -794,17 +877,17 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       setSalonCart([]);
       setCustomerName('');
       setCustomerPhone('');
+      setLedgerRefreshTick((prev) => prev + 1);
       setBillSuccessMessage(
-        isOnline
-          ? `Bill ${bill.billNumber} saved. Opening ${paperWidthMm}mm browser print dialog.`
-          : `Bill ${bill.billNumber} queued locally offline. Opening ${paperWidthMm}mm browser print dialog.`
+        `Bill ${bill.billNumber} (${branchName}) saved. Opening ${paperWidthMm}mm browser print dialog.`
       );
       openBrowserPrintDialog();
     } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
       setBillSaveError(
-        `Bill not saved to database: ${
-          error instanceof Error ? error.message : 'Unknown error'
-        }. Retry without changing cart to avoid duplicates.`
+        msg === 'Connect to internet to obtain a valid bill number.'
+          ? msg
+          : `Bill not saved to database: ${msg}. Retry without changing cart to keep the same reserved bill number.`
       );
     } finally {
       isSubmittingBillRef.current = false;
@@ -898,6 +981,8 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       setRestaurantCart([]);
       setCustomerName('');
       setCustomerPhone('');
+      setLedgerRefreshTick((prev) => prev + 1);
+      openBrowserPrintDialog();
     } catch (error) {
       setBillSaveError(
         `Order sync error: ${error instanceof Error ? error.message : 'Unknown error'}`
@@ -939,6 +1024,66 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
     }
 
     setActiveReceiptPreview(bill);
+    setRetailCart([]);
+    setCustomerName('');
+    setCustomerPhone('');
+    setLedgerRefreshTick((prev) => prev + 1);
+    setBillSuccessMessage(`Bill ${billNumber} generated. Opening ${paperWidthMm}mm browser print dialog.`);
+    openBrowserPrintDialog();
+  };
+
+  const handleClearBillingForm = () => {
+    setSalonCart([]);
+    setRestaurantCart([]);
+    setRetailCart([]);
+    setCustomerName('');
+    setCustomerPhone('');
+    setMissingStylistIdx(null);
+    setBillSaveError(null);
+    setBillSuccessMessage(null);
+    setActiveReceiptPreview(null);
+    setActiveKotPreview(null);
+    pendingCheckoutRef.current = null;
+  };
+
+  const handlePrintLedgerCopy = (entry: TransactionLedgerEntry) => {
+    const resolvedBranchCode = entry.branchCode || null;
+    const resolvedBranchName =
+      entry.branchName || (resolvedBranchCode ? branchNameFromCode(resolvedBranchCode) : null);
+    const reprintReceipt = {
+      billNumber: entry.centralBillNumber || entry.billNumber,
+      centralBillNumber: entry.centralBillNumber || entry.billNumber,
+      businessType: category,
+      branchCode: resolvedBranchCode,
+      branchName: resolvedBranchName,
+      outletName: session.activeOutlet.name,
+      outletAddress: category === 'salon' ? undefined : session.activeOutlet.address,
+      outletPhone: session.activeOutlet.phone,
+      outletGstin: category === 'salon' ? undefined : session.activeOutlet.gstin,
+      receiptHeader: session.activeOutlet.receiptHeader,
+      receiptFooter: session.activeOutlet.receiptFooter,
+      customerName: entry.customerName,
+      customerPhone: entry.customerPhone,
+      paymentMode: entry.paymentMode,
+      items: entry.items.map((it) => ({
+        name: it.name,
+        price: it.unitPrice,
+        quantity: it.quantity,
+        discountPercent: it.discountPercent,
+        stylist: it.stylistName || undefined,
+        variant: it.variantName || undefined,
+      })),
+      subtotal: entry.subtotal,
+      discount: entry.discountAmount,
+      tax: entry.totalTax,
+      grandTotal: entry.grandTotal,
+      paperWidth: paperWidthMm,
+      timestamp: new Date(entry.createdAt).toLocaleString(),
+    };
+    setActiveReceiptPreview(reprintReceipt);
+    window.setTimeout(() => {
+      openBrowserPrintDialog();
+    }, 60);
   };
 
   const activeCartCount =
@@ -947,6 +1092,29 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       : category === 'restaurant'
         ? restaurantCart.reduce((s, i) => s + i.quantity, 0)
         : retailCart.reduce((s, i) => s + i.quantity, 0);
+
+  const activeCartGrandTotal =
+    category === 'salon'
+      ? salonGrandTotal
+      : category === 'restaurant'
+        ? restGrandTotal
+        : retailGrandTotal;
+
+  useEffect(() => {
+    onCartSummaryChange?.({
+      itemCount: activeCartCount,
+      grandTotal: activeCartGrandTotal,
+    });
+  }, [activeCartCount, activeCartGrandTotal, onCartSummaryChange]);
+
+  useEffect(() => {
+    if (openCartSignal > 0) {
+      setActivePosView('billing');
+      window.setTimeout(() => {
+        cartSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 60);
+    }
+  }, [openCartSignal]);
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
@@ -960,8 +1128,8 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
         </div>
       )}
 
-      {/* Left 7 Cols: Counter POS Terminal */}
-      <Card padding="none" className="lg:col-span-7 overflow-hidden flex flex-col">
+      {/* Counter POS Terminal (Full Width — inline 80mm/58mm selector & large preview hidden) */}
+      <Card padding="none" className="lg:col-span-12 overflow-hidden flex flex-col">
         {/* Hardware & Connectivity Toolbar */}
         <div className="bg-[#F9FAFC] px-4 py-2.5 border-b border-[#E5E7EC] flex flex-wrap items-center justify-between gap-2.5 text-xs">
           <div className="flex flex-wrap items-center gap-2">
@@ -988,26 +1156,8 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
               }`}
             >
               <Printer className="w-3.5 h-3.5" />
-              <span>{isPrinterConnected ? `Print Ready (${paperWidthMm}mm)` : 'Print Standby'}</span>
+              <span>{isPrinterConnected ? 'Print Ready' : 'Print Standby'}</span>
             </button>
-          </div>
-
-          <div className="flex items-center gap-1 bg-white rounded-xl p-1 border border-[#E5E7EC]">
-            <span className="text-[11px] font-medium text-[#6F737D] px-1.5">Roll</span>
-            {([80, 58] as const).map((width) => (
-              <button
-                key={width}
-                type="button"
-                onClick={() => onChangePaperWidth(width)}
-                className={`min-h-[28px] px-2.5 rounded-lg text-[11px] font-bold transition cursor-pointer ${
-                  paperWidthMm === width
-                    ? 'bg-[#2F3033] text-white'
-                    : 'text-[#6F737D] hover:text-[#2F3033]'
-                }`}
-              >
-                {width}mm
-              </button>
-            ))}
           </div>
         </div>
 
@@ -1079,6 +1229,18 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                 Tables &amp; Seating
               </button>
             )}
+            <button
+              type="button"
+              onClick={() => setActivePosView('ledger')}
+              className={`min-h-[38px] shrink-0 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition cursor-pointer inline-flex items-center gap-1.5 ${
+                activePosView === 'ledger'
+                  ? 'bg-[#2F3033] text-white shadow-xs'
+                  : 'bg-[#F5F6FA] text-[#6F737D] hover:text-[#2F3033]'
+              }`}
+            >
+              <Receipt className="w-3.5 h-3.5" />
+              <span>Today&apos;s Ledger</span>
+            </button>
           </div>
 
           <span className="hidden sm:inline-block text-[11px] font-medium text-[#6F737D] tabular-nums shrink-0">
@@ -1086,8 +1248,41 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
           </span>
         </div>
 
+        {/* Post-Billing Action Bar (Print Copy + Clear, shown cleanly after successful billing) */}
+        {activeReceiptPreview && (
+          <div className="bg-[#ECFDF5] border-b border-[#BBF7D0] px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <CheckCircle2 className="w-4 h-4 text-[#15803D] shrink-0" />
+              <div className="text-xs min-w-0">
+                <p className="font-bold text-[#14532D] truncate">
+                  Saved Bill {activeReceiptPreview.billNumber || activeReceiptPreview.orderNumber} · ₹
+                  {Number(activeReceiptPreview.grandTotal || 0).toFixed(2)}
+                </p>
+                <p className="text-[11px] text-[#15803D] truncate">
+                  {activeReceiptPreview.customerName || 'Walk-in Guest'} ·{' '}
+                  {String(activeReceiptPreview.paymentMode || 'cash').toUpperCase()}
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <Button
+                variant="success"
+                size="sm"
+                onClick={openBrowserPrintDialog}
+                disabled={isPrinterBusy}
+                leftIcon={<Printer className="w-3.5 h-3.5" />}
+              >
+                Print Copy
+              </Button>
+              <Button variant="secondary" size="sm" onClick={handleClearBillingForm}>
+                Clear
+              </Button>
+            </div>
+          </div>
+        )}
+
         {/* Body Content */}
-        <div className="p-4 sm:p-5 space-y-4 flex-1 bg-white">
+        <div ref={cartSectionRef} className="p-4 sm:p-5 space-y-4 flex-1 bg-white">
           {/* VIEW 1: ACTIVE CART */}
           {activePosView === 'billing' && (
             <div className="space-y-4">
@@ -1218,7 +1413,32 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                     </div>
                   )}
 
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                    <FormField label="Branch *" htmlFor="pos-salon-branch">
+                      <select
+                        id="pos-salon-branch"
+                        value={selectedBranchCode}
+                        onChange={(e) => {
+                          setSelectedBranchCode(e.target.value);
+                          setBillSaveError(null);
+                          pendingCheckoutRef.current = null;
+                        }}
+                        disabled={isLoadingBranches || permittedBranches.length === 1}
+                        required
+                        className={`${BASE_INPUT_CLASS} ${
+                          !selectedBranchCode ? 'border-[#F59E0B] bg-[#FFFBEB]/40' : ''
+                        }`}
+                      >
+                        {permittedBranches.length !== 1 && (
+                          <option value="">Select branch (required)</option>
+                        )}
+                        {permittedBranches.map((branch) => (
+                          <option key={branch.branchCode} value={branch.branchCode}>
+                            {branch.branchName} ({branch.branchCode})
+                          </option>
+                        ))}
+                      </select>
+                    </FormField>
                     <FormField label="Customer Name *" htmlFor="pos-customer-name">
                       <input
                         id="pos-customer-name"
@@ -1255,6 +1475,19 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                     </FormField>
                   </div>
 
+                  {branchError && (
+                    <div className="rounded-xl border border-[#FECACA] bg-[#FEF2F2] px-3.5 py-2 text-xs text-[#B91C1C] flex items-center justify-between gap-2">
+                      <span>{branchError}</span>
+                      <button
+                        type="button"
+                        onClick={() => void loadPermittedBranches()}
+                        className="underline font-semibold cursor-pointer shrink-0"
+                      >
+                        Retry
+                      </button>
+                    </div>
+                  )}
+
                   <CartSummary
                     lines={[
                       { label: 'Subtotal', value: `₹${salonSubtotal}` },
@@ -1262,9 +1495,21 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                       { label: 'GST (18%)', value: `₹${salonTax}` },
                     ]}
                     grandTotalValue={`₹${salonGrandTotal}`}
-                    itemCountLabel={`${activeCartCount} service${activeCartCount === 1 ? '' : 's'}`}
+                    itemCountLabel={`${activeCartCount} service${activeCartCount === 1 ? '' : 's'}${
+                      selectedBranch ? ` · ${selectedBranch.branchName}` : ''
+                    }`}
                     action={
                       <div className="space-y-2">
+                        {!selectedBranchCode && (
+                          <p className="text-[11px] text-[#B45309] font-medium">
+                            Select a branch (Gachibowli or Kondapur) before generating a bill.
+                          </p>
+                        )}
+                        {!isOnline && (
+                          <p className="text-[11px] text-[#B91C1C] font-medium">
+                            Connect to internet to obtain a valid bill number.
+                          </p>
+                        )}
                         {salonCart.length > 0 &&
                           (isLoadingStylists || Boolean(stylistError) || stylists.length === 0) && (
                             <p className="text-[11px] text-[#B45309] font-medium">
@@ -1279,6 +1524,8 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                           onClick={() => void handlePrintSalonBill()}
                           disabled={
                             salonCart.length === 0 ||
+                            !selectedBranchCode ||
+                            !isOnline ||
                             isLoadingStylists ||
                             Boolean(stylistError) ||
                             stylists.length === 0 ||
@@ -1288,8 +1535,8 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                           leftIcon={<Printer className="w-4 h-4" />}
                         >
                           {isProcessingBill
-                            ? 'Saving Bill & Opening Print Dialog...'
-                            : 'Print Salon Receipt (Browser Print)'}
+                            ? 'Reserving Central Bill No & Opening Print Dialog...'
+                            : 'Generate & Print Salon Bill'}
                         </Button>
                       </div>
                     }
@@ -1779,72 +2026,37 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
               )}
             </div>
           )}
+          {activePosView === 'ledger' && (
+            <TransactionLedger
+              session={session}
+              refreshTrigger={ledgerRefreshTick}
+              stylists={stylists}
+              onPrintCopy={handlePrintLedgerCopy}
+              compact
+            />
+          )}
         </div>
       </Card>
 
-      {/* Right 5 Cols: Thermal Receipt & KOT Preview */}
-      <div className="lg:col-span-5 space-y-4">
-        {activeReceiptPreview ? (
-          <Card padding="md">
-            <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-[#E5E7EC]">
-              <span className="text-xs font-bold text-[#2F3033] flex items-center gap-1.5">
-                <Receipt className="w-4 h-4 text-[#15803D]" />
-                <span>Thermal Receipt Preview ({paperWidthMm}mm)</span>
-              </span>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="success"
-                  size="sm"
-                  onClick={openBrowserPrintDialog}
-                  disabled={isPrinterBusy}
-                  leftIcon={<Printer className="w-3.5 h-3.5" />}
-                >
-                  Print Copy
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setActiveReceiptPreview(null)}
-                >
-                  Clear
-                </Button>
-              </div>
-            </div>
-
-            <ThermalReceiptSlip receipt={activeReceiptPreview} paperWidthMm={paperWidthMm} />
-          </Card>
-        ) : (
-          <Card padding="lg" className="text-center space-y-2.5">
-            <div className="w-11 h-11 rounded-2xl bg-[#F5F6FA] border border-[#E5E7EC] flex items-center justify-center mx-auto text-[#6F737D]">
-              <Printer className="w-5 h-5" />
-            </div>
-            <p className="text-sm font-bold text-[#2F3033]">
-              Thermal Receipt Preview ({paperWidthMm}mm)
-            </p>
-            <p className="text-xs text-[#6F737D] leading-relaxed max-w-sm mx-auto">
-              When a bill is created, a {paperWidthMm}mm print-ready receipt renders here and opens the browser print dialog. Native Bluetooth ESC/POS printing runs in the Android app.
-            </p>
-          </Card>
+      {/* Print-only Portal (PRESERVED IDENTICALLY for automatic & Print Copy browser/Windows printing) */}
+      {activeReceiptPreview &&
+        typeof document !== 'undefined' &&
+        createPortal(
+          <div
+            id="smav-print-portal"
+            className={paperWidthMm === 58 ? 'paper-58mm' : 'paper-80mm'}
+          >
+            <ThermalReceiptSlip
+              receipt={activeReceiptPreview}
+              paperWidthMm={paperWidthMm}
+              printOnly
+            />
+          </div>,
+          document.body
         )}
 
-        {/* Print-only Portal (PRESERVED IDENTICALLY) */}
-        {activeReceiptPreview &&
-          typeof document !== 'undefined' &&
-          createPortal(
-            <div
-              id="smav-print-portal"
-              className={paperWidthMm === 58 ? 'paper-58mm' : 'paper-80mm'}
-            >
-              <ThermalReceiptSlip
-                receipt={activeReceiptPreview}
-                paperWidthMm={paperWidthMm}
-                printOnly
-              />
-            </div>,
-            document.body
-          )}
-
-        {activeKotPreview && (
+      {activeKotPreview && (
+        <div className="lg:col-span-12">
           <Card padding="md">
             <span className="text-xs font-bold text-[#2F3033] flex items-center gap-1.5 mb-3">
               <ChefHat className="w-4 h-4 text-[#D97706]" />
@@ -1870,8 +2082,8 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
               </p>
             </div>
           </Card>
-        )}
-      </div>
+        </div>
+      )}
     </div>
   );
 };
@@ -1909,22 +2121,29 @@ const ThermalReceiptSlip: React.FC<ThermalReceiptSlipProps> = ({
       </p>
       {receipt.businessType === 'salon' ? (
         <>
-          <p className="text-[10px] text-[#374151]">Professional Womens Salon</p>
+          <p className="text-[10px] text-[#374151]">Professional Women&apos;s Salon</p>
           <p className="text-[9px] text-[#111827] inline-flex items-center justify-center gap-1">
             <WhatsAppMark />
             <span>9966970003 (G) · 9154744608 (K)</span>
           </p>
         </>
-      ) : receipt.receiptHeader ? (
-        <p className="text-[10px] text-[#374151]">{receipt.receiptHeader}</p>
-      ) : null}
-      {receipt.outletAddress && <p className="text-[10px] text-[#4B5563]">{receipt.outletAddress}</p>}
-      {receipt.businessType !== 'salon' && receipt.outletPhone && (
-        <p className="text-[10px] text-[#4B5563]">Tel: {receipt.outletPhone}</p>
+      ) : (
+        <>
+          {receipt.receiptHeader && <p className="text-[10px] text-[#374151]">{receipt.receiptHeader}</p>}
+          {receipt.outletAddress && <p className="text-[10px] text-[#4B5563]">{receipt.outletAddress}</p>}
+          {receipt.outletPhone && <p className="text-[10px] text-[#4B5563]">Tel: {receipt.outletPhone}</p>}
+          {receipt.outletGstin && <p className="text-[10px] text-[#4B5563]">GSTIN: {receipt.outletGstin}</p>}
+        </>
       )}
-      {receipt.outletGstin && <p className="text-[10px] text-[#4B5563]">GSTIN: {receipt.outletGstin}</p>}
       <p className="text-[10px] text-[#4B5563] pt-1">Date: {receipt.timestamp}</p>
-      <p className="font-bold text-[10px]">Bill No: {receipt.billNumber || receipt.orderNumber}</p>
+      {(receipt.branchName || receipt.branchCode) && (
+        <p className="font-semibold text-[10px] text-[#111827]">
+          Branch: {receipt.branchName || branchNameFromCode(receipt.branchCode)}
+        </p>
+      )}
+      <p className="font-bold text-[10px]">
+        Bill No: {receipt.centralBillNumber || receipt.billNumber || receipt.orderNumber}
+      </p>
       {receipt.paymentMode && <p className="text-[10px] uppercase">Mode: {receipt.paymentMode}</p>}
     </div>
 

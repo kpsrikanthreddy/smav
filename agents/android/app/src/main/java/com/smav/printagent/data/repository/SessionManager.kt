@@ -8,6 +8,7 @@ import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import com.smav.printagent.BuildConfig
 import com.smav.printagent.model.AvailableBusinessOption
+import com.smav.printagent.model.BranchOption
 import com.smav.printagent.model.BusinessType
 import com.smav.printagent.model.PaperWidth
 import com.smav.printagent.model.PrinterPurpose
@@ -211,6 +212,22 @@ class SessionManager(context: Context) {
 
     fun getReceiptFooter(outletId: String, fallback: String): String =
         prefs.getString("receipt_footer_$outletId", null)?.takeIf { it.isNotBlank() } ?: fallback
+
+    fun savePermittedBranches(outletId: String, branches: List<BranchOption>) {
+        if (outletId.isBlank()) return
+        prefs.edit().putString("permitted_branches_$outletId", gson.toJson(branches)).apply()
+    }
+
+    fun getPermittedBranches(outletId: String): List<BranchOption> {
+        if (outletId.isBlank()) return emptyList()
+        val raw = prefs.getString("permitted_branches_$outletId", null) ?: return emptyList()
+        val type = object : TypeToken<List<BranchOption>>() {}.type
+        return try {
+            gson.fromJson(raw, type) ?: emptyList()
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
 
     fun getServerUrl(): String {
         val defaultUrl = BuildConfig.DEFAULT_SERVER_URL.trim().trimEnd('/')

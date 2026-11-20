@@ -116,6 +116,9 @@ fun SmavAppScaffold(
     onNavigate: (SmavRoute) -> Unit,
     onOpenOutletSwitcher: (() -> Unit)?,
     onSignOutConfirmed: () -> Unit,
+    cartItemCount: Int = 0,
+    cartTotalAmount: Double = 0.0,
+    onOpenSelectedCart: (() -> Unit)? = null,
     content: @Composable (PaddingValues) -> Unit
 ) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
@@ -319,6 +322,44 @@ fun SmavAppScaffold(
                             }
                         },
                         actions = {
+                            if (onOpenSelectedCart != null) {
+                                Surface(
+                                    color = if (cartItemCount > 0) SmavColors.AccentPink.copy(alpha = 0.12f) else SmavColors.Background,
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (cartItemCount > 0) SmavColors.AccentPink.copy(alpha = 0.45f) else SmavColors.Border
+                                    ),
+                                    modifier = Modifier
+                                        .padding(end = 4.dp)
+                                        .clickable { onOpenSelectedCart() }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.ShoppingCart,
+                                            contentDescription = "Selected Cart",
+                                            tint = SmavColors.AccentPink,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Text(
+                                            text = "$cartItemCount",
+                                            color = SmavColors.AccentPink,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 12.sp
+                                        )
+                                        Text(
+                                            text = "₹${Math.round(cartTotalAmount)}",
+                                            color = SmavColors.TextPrimary,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 12.sp
+                                        )
+                                    }
+                                }
+                            }
                             if (currentRoute != homeRoute) {
                                 IconButton(
                                     onClick = { onNavigate(homeRoute) },
@@ -506,7 +547,7 @@ fun SummaryStatCard(
 @Composable
 fun <T> FilterFlowRow(
     items: List<T>,
-    selected: T,
+    selected: T?,
     labelOf: (T) -> String,
     onSelect: (T) -> Unit
 ) {

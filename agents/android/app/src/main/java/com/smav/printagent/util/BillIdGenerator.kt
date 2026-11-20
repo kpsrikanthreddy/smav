@@ -1,6 +1,7 @@
 package com.smav.printagent.util
 
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
@@ -19,6 +20,37 @@ object BillIdGenerator {
         val sdf = SimpleDateFormat("yyyyMMdd", Locale.ENGLISH)
         sdf.timeZone = kolkataTimeZone
         return sdf.format(Date(timestamp))
+    }
+
+    fun getIndiaIsoDate(timestamp: Long = System.currentTimeMillis()): String {
+        val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH)
+        sdf.timeZone = kolkataTimeZone
+        return sdf.format(Date(timestamp))
+    }
+
+    fun getStartOfTodayMillis(
+        nowMs: Long = System.currentTimeMillis(),
+        timeZoneId: String = "Asia/Kolkata"
+    ): Long {
+        val tz = runCatching { TimeZone.getTimeZone(timeZoneId) }.getOrDefault(kolkataTimeZone)
+        val cal = Calendar.getInstance(tz).apply {
+            timeInMillis = nowMs
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
+        return cal.timeInMillis
+    }
+
+    fun isSameOutletLocalDay(
+        timestampMs: Long,
+        nowMs: Long = System.currentTimeMillis(),
+        timeZoneId: String = "Asia/Kolkata"
+    ): Boolean {
+        val start = getStartOfTodayMillis(nowMs, timeZoneId)
+        val end = start + 24L * 60L * 60L * 1000L
+        return timestampMs in start until end
     }
 
     fun getFormattedDateTime(timestamp: Long = System.currentTimeMillis()): String {

@@ -42,7 +42,33 @@ export default function App() {
 
   const [isOnline, setIsOnline] = useState<boolean>(true);
   const [isPrinterConnected, setIsPrinterConnected] = useState<boolean>(true);
-  const [paperWidthMm, setPaperWidthMm] = useState<58 | 80>(80);
+  const [paperWidthMm, setPaperWidthMm] = useState<58 | 80>(() => {
+    try {
+      const stored = window.localStorage.getItem('smav_paper_width_mm');
+      return stored === '58' ? 58 : 80;
+    } catch {
+      return 80;
+    }
+  });
+  const [cartSummary, setCartSummary] = useState<{ itemCount: number; grandTotal: number }>({
+    itemCount: 0,
+    grandTotal: 0,
+  });
+  const [openCartSignal, setOpenCartSignal] = useState<number>(0);
+
+  const handleChangePaperWidth = (width: 58 | 80) => {
+    setPaperWidthMm(width);
+    try {
+      window.localStorage.setItem('smav_paper_width_mm', String(width));
+    } catch {
+      // Ignore storage restrictions
+    }
+  };
+
+  const handleOpenSelectedCart = () => {
+    setActiveTab('pos');
+    setOpenCartSignal((prev) => prev + 1);
+  };
 
   const [serverCatalogRevision, setServerCatalogRevision] = useState<number>(101);
   const [localCatalogRevision, setLocalCatalogRevision] = useState<number>(101);
@@ -318,6 +344,9 @@ export default function App() {
       onOutletChange={handleSwitchAssignedOutlet}
       isSwitchingOutlet={isSwitchingOutlet}
       onLogout={handleLogout}
+      cartItemCount={cartSummary.itemCount}
+      cartTotalAmount={cartSummary.grandTotal}
+      onOpenSelectedCart={handleOpenSelectedCart}
       bannerError={outletSwitchError}
     >
       <Suspense fallback={<LoadingState title="Loading workspace…" />}>
@@ -338,6 +367,8 @@ export default function App() {
             session={session}
             onOpenPos={() => setActiveTab('pos')}
             onLogout={handleLogout}
+            paperWidthMm={paperWidthMm}
+            onChangePaperWidth={handleChangePaperWidth}
           />
         )}
 
@@ -349,10 +380,12 @@ export default function App() {
             isPrinterConnected={isPrinterConnected}
             onTogglePrinter={() => setIsPrinterConnected((prev) => !prev)}
             paperWidthMm={paperWidthMm}
-            onChangePaperWidth={setPaperWidthMm}
+            onChangePaperWidth={handleChangePaperWidth}
             serverRevision={serverCatalogRevision}
             localRevision={localCatalogRevision}
             onPerformDeltaSync={() => {}}
+            onCartSummaryChange={setCartSummary}
+            openCartSignal={openCartSignal}
           />
         )}
 

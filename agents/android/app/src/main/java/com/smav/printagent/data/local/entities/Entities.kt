@@ -42,7 +42,18 @@ data class SalonBillEntity(
     val syncStatus: String = "PENDING", // PENDING, SYNCING, SYNCED, FAILED
     val syncError: String? = null,
     val createdAtLocal: Long = System.currentTimeMillis(),
-    val createdAtServer: Long? = null
+    val createdAtServer: Long? = null,
+    val isVoided: Boolean = false,
+    val voidReason: String? = null,
+    val voidedAtLocal: Long? = null,
+    val voidedBy: String? = null,
+    val editVersion: Int = 1,
+    val editReason: String? = null,
+    val updatedAtLocal: Long? = null,
+    val conflictMessage: String? = null,
+    val centralBillId: String? = null,
+    val branchName: String? = null,
+    val sourceSystem: String = "smav_android_agent"
 )
 
 @Entity(
@@ -114,7 +125,15 @@ data class RestaurantOrderEntity(
     val syncStatus: String = "PENDING",
     val syncError: String? = null,
     val createdAtLocal: Long = System.currentTimeMillis(),
-    val createdAtServer: Long? = null
+    val createdAtServer: Long? = null,
+    val isVoided: Boolean = false,
+    val voidReason: String? = null,
+    val voidedAtLocal: Long? = null,
+    val voidedBy: String? = null,
+    val editVersion: Int = 1,
+    val editReason: String? = null,
+    val updatedAtLocal: Long? = null,
+    val conflictMessage: String? = null
 )
 
 @Entity(
@@ -277,7 +296,15 @@ data class RetailBillEntity(
     val syncStatus: String = "PENDING",
     val syncError: String? = null,
     val createdAtLocal: Long = System.currentTimeMillis(),
-    val createdAtServer: Long? = null
+    val createdAtServer: Long? = null,
+    val isVoided: Boolean = false,
+    val voidReason: String? = null,
+    val voidedAtLocal: Long? = null,
+    val voidedBy: String? = null,
+    val editVersion: Int = 1,
+    val editReason: String? = null,
+    val updatedAtLocal: Long? = null,
+    val conflictMessage: String? = null
 )
 
 @Entity(
@@ -305,4 +332,29 @@ data class RetailBillItemEntity(
     val gstPercent: Double,
     val gstAmount: Double,
     val totalAmount: Double
+)
+
+@Entity(
+    tableName = "preallocated_bill_numbers",
+    indices = [
+        Index(value = ["centralBillNumber"], unique = true),
+        Index(value = ["outletId", "branchCode", "billingDate", "status"])
+    ]
+)
+data class PreallocatedBillNumberEntity(
+    @PrimaryKey
+    val centralBillId: String,
+    val centralBillNumber: String,
+    val outletId: String,
+    val branchId: String,
+    val branchCode: String,
+    val branchName: String,
+    val billingDate: String, // YYYY-MM-DD in Asia/Kolkata
+    val sequenceNumber: Int,
+    val batchId: String,
+    val idempotencyKey: String,
+    val status: String = "AVAILABLE", // AVAILABLE, CONSUMED, EXPIRED
+    val consumedAtLocal: Long? = null,
+    val consumedByBillId: String? = null,
+    val createdAtLocal: Long = System.currentTimeMillis()
 )

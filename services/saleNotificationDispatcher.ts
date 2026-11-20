@@ -652,11 +652,12 @@ async function upsertNotificationJobRow(
 export async function enqueueSaleNotificationJobs(params: {
   db: SupabaseClient;
   logDb?: SupabaseClient | null;
-  outlet: { id: string; code: string; name: string; branchCode?: string | null };
+  outlet: { id: string; code: string; name: string; branchCode?: string | null; branchName?: string | null };
   sourceType: 'salon' | 'restaurant' | 'retail';
   sourceKey: string;
   billId: string | null;
   billNumber: string;
+  centralBillId?: string | null;
   customerName?: string | null;
   customerPhone?: string | null;
   paymentMode?: string | null;
@@ -685,6 +686,7 @@ export async function enqueueSaleNotificationJobs(params: {
     sourceKey,
     billId,
     billNumber,
+    centralBillId = null,
     customerName,
     customerPhone,
     paymentMode,
@@ -703,6 +705,7 @@ export async function enqueueSaleNotificationJobs(params: {
   const cleanName = String(customerName || '').trim();
   const cleanPaymentMode = String(paymentMode || '').trim().toLowerCase() || null;
   const branchCode = String(outlet.branchCode || outlet.code || '').trim() || null;
+  const branchName = String(outlet.branchName || '').trim() || null;
   const maskedPhone = maskPhone(cleanPhone);
 
   if (!cleanPhone) {
@@ -741,10 +744,13 @@ export async function enqueueSaleNotificationJobs(params: {
   const basePayload: Record<string, unknown> = {
     bill_id: billId,
     bill_number: billNumber,
+    central_bill_number: billNumber,
+    ...(centralBillId ? { central_bill_id: centralBillId } : {}),
     outlet_id: outlet.id,
     outlet_code: outlet.code,
     outlet_name: outlet.name,
     ...(branchCode ? { branch_code: branchCode } : {}),
+    ...(branchName ? { branch_name: branchName } : {}),
     customer_name: cleanName,
     customer_phone: cleanPhone,
     payment_mode: cleanPaymentMode,

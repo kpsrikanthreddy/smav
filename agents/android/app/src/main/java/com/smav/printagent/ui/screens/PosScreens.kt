@@ -20,8 +20,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.smav.printagent.data.local.AppDatabase
 import com.smav.printagent.data.local.entities.RestaurantOrderEntity
+import com.smav.printagent.data.local.entities.RestaurantOrderItemEntity
 import com.smav.printagent.data.local.entities.RetailBillEntity
+import com.smav.printagent.data.local.entities.RetailBillItemEntity
 import com.smav.printagent.data.local.entities.SalonBillEntity
+import com.smav.printagent.data.local.entities.SalonBillItemEntity
 import com.smav.printagent.data.repository.*
 import com.smav.printagent.model.*
 import com.smav.printagent.network.SmavApiClient
@@ -75,9 +78,12 @@ fun PosBillingRouterScreen(
     onOpenOutletSwitcher: () -> Unit,
     onOpenRecentBills: () -> Unit,
     onOpenPrinterSettings: () -> Unit,
-    onUnauthorized: (String) -> Unit
+    onUnauthorized: (String) -> Unit,
+    onCartSummaryChange: (Int, Double) -> Unit = { _, _ -> },
+    openCartSignal: Int = 0
 ) {
     if (session.businessType == BusinessType.OTHER) {
+        LaunchedEffect(Unit) { onCartSummaryChange(0, 0.0) }
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -143,7 +149,9 @@ fun PosBillingRouterScreen(
             onRefresh = { loadCatalog() },
             billingRepo = billingRepo,
             onOpenRecentBills = onOpenRecentBills,
-            onOpenPrinterSettings = onOpenPrinterSettings
+            onOpenPrinterSettings = onOpenPrinterSettings,
+            onCartSummaryChange = onCartSummaryChange,
+            openCartSignal = openCartSignal
         )
 
         BusinessType.RESTAURANT -> RestaurantPosScreen(
@@ -155,7 +163,9 @@ fun PosBillingRouterScreen(
             onRefresh = { loadCatalog() },
             billingRepo = billingRepo,
             onOpenRecentBills = onOpenRecentBills,
-            onOpenPrinterSettings = onOpenPrinterSettings
+            onOpenPrinterSettings = onOpenPrinterSettings,
+            onCartSummaryChange = onCartSummaryChange,
+            openCartSignal = openCartSignal
         )
 
         BusinessType.RETAIL -> RetailPosScreen(
@@ -167,7 +177,9 @@ fun PosBillingRouterScreen(
             onRefresh = { loadCatalog() },
             billingRepo = billingRepo,
             onOpenRecentBills = onOpenRecentBills,
-            onOpenPrinterSettings = onOpenPrinterSettings
+            onOpenPrinterSettings = onOpenPrinterSettings,
+            onCartSummaryChange = onCartSummaryChange,
+            openCartSignal = openCartSignal
         )
 
         BusinessType.OTHER -> Unit
@@ -188,7 +200,9 @@ private fun SalonPosScreen(
     onRefresh: () -> Unit,
     billingRepo: BillingRepository,
     onOpenRecentBills: () -> Unit,
-    onOpenPrinterSettings: () -> Unit
+    onOpenPrinterSettings: () -> Unit,
+    onCartSummaryChange: (Int, Double) -> Unit = { _, _ -> },
+    openCartSignal: Int = 0
 ) {
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
@@ -211,9 +225,24 @@ private fun SalonPosScreen(
     var billingError by remember { mutableStateOf<String?>(null) }
     var completedBill by remember { mutableStateOf<SalonBillEntity?>(null) }
     var printFeedback by remember { mutableStateOf<String?>(null) }
+    var selectedBranch by remember(branch.id) { mutableStateOf<BranchOption?>(null) }
+    var checkoutAttemptFingerprint by remember(branch.id) { mutableStateOf<String?>(null) }
+    var checkoutAttemptId by remember(branch.id) { mutableStateOf(java.util.UUID.randomUUID().toString()) }
 
     val services = bundle?.salonServices.orEmpty()
     val stylists = bundle?.stylists.orEmpty()
+    val permittedBranches = bundle?.branches.orEmpty()
+    val offlinePoolCounts = bundle?.offlinePreallocatedCounts.orEmpty()
+
+    // Preselect branch ONLY when authenticated user has exactly 1 assigned branch; otherwise require manual selection.
+    LaunchedEffect(permittedBranches) {
+        selectedBranch = when {
+            permittedBranches.size == 1 -> permittedBranches.first()
+            selectedBranch != null && permittedBranches.any { it.branchCode == selectedBranch?.branchCode } -> selectedBranch
+            else -> null
+        }
+    }
+
     val stylistWarning = bundle?.stylistWarning
         ?: if (!loading && bundle != null && stylists.isEmpty()) {
             "No active stylists returned for this outlet. Tap Retry to reload."
@@ -254,6 +283,14 @@ private fun SalonPosScreen(
     val grandTotal = remember(effectiveCart) {
         Math.round(effectiveCart.sumOf { it.totalAmount }).toDouble()
     }
+    val cartCount = remember(cart) { cart.sumOf { it.quantity } }
+
+    LaunchedEffect(cartCount, grandTotal) {
+        onCartSummaryChange(cartCount, grandTotal)
+    }
+    LaunchedEffect(openCartSignal) {
+        if (openCartSignal > 0) showCartSheet = true
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
@@ -280,7 +317,7 @@ private fun SalonPosScreen(
                         )
                     }
                     SmavSecondaryButton(
-                        text = "Recent Bills",
+                        text = "Today's Ledger",
                         icon = Icons.Default.ReceiptLong,
                         onClick = onOpenRecentBills
                     )
@@ -289,7 +326,62 @@ private fun SalonPosScreen(
 
             if (bundle?.fromCache == true) {
                 item {
-                    SmavWarningBannerCard("Using offline cached catalog (${services.size} services).")
+                    val selectedOfflineCount = selectedBranch?.let { offlinePoolCounts[it.branchCode] ?: 0 }
+                    val offlineNote = if (selectedOfflineCount != null) {
+                        "Using offline cached catalog (${services.size} services). Preallocated numbers for ${selectedBranch?.branchName}: $selectedOfflineCount."
+                    } else {
+                        "Using offline cached catalog (${services.size} services). Select a branch to check preallocated offline bill numbers."
+                    }
+                    SmavWarningBannerCard(offlineNote)
+                }
+            }
+
+            if (permittedBranches.isNotEmpty()) {
+                item {
+                    SmavCard {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Branch * (Required before billing)",
+                                    color = SmavColors.TextPrimary,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                selectedBranch?.let { br ->
+                                    Text(
+                                        text = "${br.branchName} (${br.branchCode})",
+                                        color = SmavColors.StepperGreen,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                            }
+                            FilterFlowRow(
+                                items = permittedBranches,
+                                selected = selectedBranch,
+                                labelOf = { "${it.branchName} (${it.branchCode})" },
+                                onSelect = { chosen ->
+                                    if (permittedBranches.size > 1 || selectedBranch == null) {
+                                        selectedBranch = chosen
+                                        billingError = null
+                                        checkoutAttemptFingerprint = null
+                                    }
+                                }
+                            )
+                            if (selectedBranch == null) {
+                                Text(
+                                    text = "Select Gachibowli or Kondapur to enable bill generation.",
+                                    color = SmavColors.WarningText,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                        }
+                    }
                 }
             }
 
@@ -383,10 +475,10 @@ private fun SalonPosScreen(
         }
 
         SmavCheckoutBottomBar(
-            countLabel = "${cart.sumOf { it.quantity }} service(s) in cart",
+            countLabel = "${cart.sumOf { it.quantity }} service(s)" + (selectedBranch?.let { " • ${it.branchName}" } ?: " • Select Branch"),
             totalAmount = grandTotal,
             ctaText = "Review & Bill",
-            ctaEnabled = cart.isNotEmpty(),
+            ctaEnabled = cart.isNotEmpty() && selectedBranch != null,
             ctaIcon = Icons.Default.ShoppingCartCheckout,
             onCtaClick = { showCartSheet = true }
         )
@@ -476,11 +568,13 @@ private fun SalonPosScreen(
             title = "Finalize Salon Bill",
             onDismiss = { showCartSheet = false },
             confirmText = "Generate & Print Bill",
-            confirmEnabled = effectiveCart.isNotEmpty() && !busyBilling && stylists.isNotEmpty() && effectiveCart.none { it.stylist == null || it.stylist.id.isBlank() },
+            confirmEnabled = effectiveCart.isNotEmpty() && selectedBranch != null && !busyBilling && stylists.isNotEmpty() && effectiveCart.none { it.stylist == null || it.stylist.id.isBlank() },
             isSaving = busyBilling,
             onConfirm = {
                 if (!busyBilling) {
-                    if (customerName.isBlank()) {
+                    if (selectedBranch == null) {
+                        billingError = "Branch selection is mandatory before generating a bill."
+                    } else if (customerName.isBlank()) {
                         billingError = "Customer name is required."
                     } else if (customerPhone.isBlank()) {
                         billingError = "Customer phone is required."
@@ -489,6 +583,14 @@ private fun SalonPosScreen(
                     } else {
                         busyBilling = true
                         billingError = null
+                        val activeBranch = selectedBranch!!
+                        val fingerprint = "${branch.id}|${activeBranch.branchCode}|${customerName.trim()}|${customerPhone.trim()}|$paymentMode|" +
+                            effectiveCart.joinToString(",") { "${it.service.id}:${it.quantity}:${it.stylist?.id}:${it.discountPercent}" }
+                        if (checkoutAttemptFingerprint != fingerprint) {
+                            checkoutAttemptFingerprint = fingerprint
+                            checkoutAttemptId = java.util.UUID.randomUUID().toString()
+                        }
+                        val attemptId = checkoutAttemptId
                         scope.launch {
                             val res = billingRepo.createSalonBill(
                                 cartItems = effectiveCart,
@@ -496,11 +598,15 @@ private fun SalonPosScreen(
                                 customerPhone = customerPhone,
                                 paymentMode = paymentMode,
                                 branch = branch,
+                                selectedBranch = activeBranch,
                                 cashierName = session.userName,
+                                checkoutAttemptId = attemptId,
                                 shouldPrint = false
                             )
                             res.onSuccess { bill ->
                                 completedBill = bill
+                                checkoutAttemptFingerprint = null
+                                checkoutAttemptId = java.util.UUID.randomUUID().toString()
                                 cart = emptyList()
                                 customerName = ""
                                 customerPhone = ""
@@ -509,8 +615,8 @@ private fun SalonPosScreen(
 
                                 val printRes = billingRepo.reprintSalonBill(bill.id, branch, session.userName)
                                 printFeedback = printRes.fold(
-                                    { "Bill ${bill.billNumber} saved and printed via Bluetooth ESC/POS." },
-                                    { err -> "Bill ${bill.billNumber} saved, but Bluetooth print failed (${err.message ?: "Printer unavailable"}). Tap Reprint after connecting printer." }
+                                    { "Bill ${bill.billNumber} (${activeBranch.branchName}) saved and printed via Bluetooth ESC/POS." },
+                                    { err -> "Bill ${bill.billNumber} (${activeBranch.branchName}) saved, but Bluetooth print failed (${err.message ?: "Printer unavailable"}). Tap Print Copy after connecting printer." }
                                 )
                             }.onFailure { err ->
                                 billingError = err.message ?: "Failed to generate bill."
@@ -521,6 +627,24 @@ private fun SalonPosScreen(
                 }
             }
         ) {
+            if (permittedBranches.isNotEmpty()) {
+                Text("Branch *", color = SmavColors.TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                FilterFlowRow(
+                    items = permittedBranches,
+                    selected = selectedBranch,
+                    labelOf = { "${it.branchName} (${it.branchCode})" },
+                    onSelect = { chosen ->
+                        if (permittedBranches.size > 1 || selectedBranch == null) {
+                            selectedBranch = chosen
+                            billingError = null
+                            checkoutAttemptFingerprint = null
+                        }
+                    }
+                )
+            }
+            if (billingError != null) {
+                ErrorBannerCard(billingError!!)
+            }
             effectiveCart.forEachIndexed { idx, item ->
                 SmavCard {
                     Row(
@@ -601,7 +725,12 @@ private fun SalonPosScreen(
             containerColor = SmavColors.Surface,
             title = { Text("Bill Generated", color = SmavColors.StepperGreen, fontWeight = FontWeight.Bold) },
             text = {
+                val resolvedBranchName = bill.branchName?.takeIf { it.isNotBlank() }
+                    ?: BranchOption.displayNameForCode(bill.branchCode)
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (resolvedBranchName.isNotBlank()) {
+                        Text("Branch: $resolvedBranchName (${bill.branchCode})", color = SmavColors.TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    }
                     Text("Bill No: ${bill.billNumber}", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold)
                     Text("Amount: Rs. ${String.format(Locale.ENGLISH, "%.2f", bill.grandTotal)}", style = SmavNumericStyles.Price, color = SmavColors.StepperGreen)
                     Text("Payment: ${bill.paymentMode.uppercase(Locale.ENGLISH)}", color = SmavColors.TextSecondary)
@@ -614,18 +743,25 @@ private fun SalonPosScreen(
                         scope.launch {
                             val res = billingRepo.reprintSalonBill(bill.id, branch, session.userName)
                             printFeedback = res.fold(
-                                { "Receipt reprinted via Bluetooth." },
+                                { "Print Copy sent via Bluetooth ESC/POS." },
                                 { "Printer unavailable (${it.message}). Check Printer Settings." }
                             )
                         }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = SmavColors.AccentPink, contentColor = Color.White)
-                ) { Text("Reprint", fontWeight = FontWeight.Bold) }
+                ) { Text("Print Copy", fontWeight = FontWeight.Bold) }
             },
             dismissButton = {
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     TextButton(onClick = onOpenPrinterSettings) { Text("Printers", color = SmavColors.InfoText) }
-                    TextButton(onClick = { completedBill = null }) { Text("Done", color = SmavColors.TextSecondary) }
+                    TextButton(onClick = {
+                        cart = emptyList()
+                        customerName = ""
+                        customerPhone = ""
+                        discountPercentText = "0"
+                        completedBill = null
+                        printFeedback = null
+                    }) { Text("Clear", color = SmavColors.TextSecondary, fontWeight = FontWeight.SemiBold) }
                 }
             }
         )
@@ -646,7 +782,9 @@ private fun RestaurantPosScreen(
     onRefresh: () -> Unit,
     billingRepo: BillingRepository,
     onOpenRecentBills: () -> Unit,
-    onOpenPrinterSettings: () -> Unit
+    onOpenPrinterSettings: () -> Unit,
+    onCartSummaryChange: (Int, Double) -> Unit = { _, _ -> },
+    openCartSignal: Int = 0
 ) {
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
@@ -692,6 +830,14 @@ private fun RestaurantPosScreen(
 
     val subtotal = cart.sumOf { it.subtotal }
     val estimatedGrandTotal = Math.round(subtotal * 1.05).toDouble()
+    val cartCount = cart.sumOf { it.quantity }
+
+    LaunchedEffect(cartCount, estimatedGrandTotal) {
+        onCartSummaryChange(cartCount, estimatedGrandTotal)
+    }
+    LaunchedEffect(openCartSignal) {
+        if (openCartSignal > 0) showCartSheet = true
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
@@ -711,7 +857,7 @@ private fun RestaurantPosScreen(
                         onClick = onRefresh
                     )
                     SmavSecondaryButton(
-                        text = "Orders & Reprint",
+                        text = "Today's Ledger",
                         icon = Icons.Default.ReceiptLong,
                         onClick = onOpenRecentBills
                     )
@@ -959,17 +1105,24 @@ private fun RestaurantPosScreen(
                         onClick = {
                             scope.launch {
                                 val r = billingRepo.reprintRestaurantBill(ord.id, branch)
-                                printFeedback = r.fold({ "Bill reprinted." }, { "Bill printer offline: ${it.message}" })
+                                printFeedback = r.fold({ "Print Copy sent." }, { "Bill printer offline: ${it.message}" })
                             }
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = SmavColors.AccentPink, contentColor = Color.White)
-                    ) { Text("Reprint Bill") }
+                    ) { Text("Print Copy") }
                 }
             },
             dismissButton = {
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     TextButton(onClick = onOpenPrinterSettings) { Text("Printers", color = SmavColors.InfoText) }
-                    TextButton(onClick = { completedOrder = null }) { Text("Done", color = SmavColors.TextSecondary) }
+                    TextButton(onClick = {
+                        cart = emptyList()
+                        specialInstructions = ""
+                        customerName = ""
+                        customerPhone = ""
+                        completedOrder = null
+                        printFeedback = null
+                    }) { Text("Clear", color = SmavColors.TextSecondary, fontWeight = FontWeight.SemiBold) }
                 }
             }
         )
@@ -989,7 +1142,9 @@ private fun RetailPosScreen(
     onRefresh: () -> Unit,
     billingRepo: BillingRepository,
     onOpenRecentBills: () -> Unit,
-    onOpenPrinterSettings: () -> Unit
+    onOpenPrinterSettings: () -> Unit,
+    onCartSummaryChange: (Int, Double) -> Unit = { _, _ -> },
+    openCartSignal: Int = 0
 ) {
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
@@ -1018,6 +1173,14 @@ private fun RetailPosScreen(
         cart.associate { it.product.id to it.quantity }
     }
     val grandTotal = Math.round(cart.sumOf { it.totalAmount }).toDouble()
+    val cartCount = cart.sumOf { it.quantity }
+
+    LaunchedEffect(cartCount, grandTotal) {
+        onCartSummaryChange(cartCount, grandTotal)
+    }
+    LaunchedEffect(openCartSignal) {
+        if (openCartSignal > 0) showCheckout = true
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
@@ -1035,7 +1198,7 @@ private fun RetailPosScreen(
                         onClick = onRefresh
                     )
                     SmavSecondaryButton(
-                        text = "Recent Bills",
+                        text = "Today's Ledger",
                         icon = Icons.Default.ReceiptLong,
                         onClick = onOpenRecentBills
                     )
@@ -1142,12 +1305,18 @@ private fun RetailPosScreen(
                 Button(
                     onClick = { scope.launch { billingRepo.reprintRetailBill(b.id, branch, session.userName) } },
                     colors = ButtonDefaults.buttonColors(containerColor = SmavColors.AccentPink, contentColor = Color.White)
-                ) { Text("Reprint") }
+                ) { Text("Print Copy") }
             },
             dismissButton = {
                 Row {
                     TextButton(onClick = onOpenPrinterSettings) { Text("Printers", color = SmavColors.InfoText) }
-                    TextButton(onClick = { completedBill = null }) { Text("Done", color = SmavColors.TextSecondary) }
+                    TextButton(onClick = {
+                        cart = emptyList()
+                        customerName = ""
+                        customerPhone = ""
+                        completedBill = null
+                        msg = null
+                    }) { Text("Clear", color = SmavColors.TextSecondary, fontWeight = FontWeight.SemiBold) }
                 }
             }
         )
@@ -1155,8 +1324,26 @@ private fun RetailPosScreen(
 }
 
 // -------------------------------------------------------------------------------------------------
-// 4. RECENT BILLS & REPRINT SCREEN (BRANCH-ISOLATED)
+// 4. TODAY'S TRANSACTION LEDGER (OUTLET-LOCAL TODAY ONLY, NO STATUS COLUMN, ROLE-GATED EDIT/VOID)
 // -------------------------------------------------------------------------------------------------
+private data class LedgerDetailDialogState(
+    val billNumber: String,
+    val customerName: String,
+    val customerPhone: String,
+    val paymentMode: String,
+    val amount: Double,
+    val dateTime: String,
+    val lines: List<LedgerDetailLine>
+)
+
+private data class LedgerDetailLine(
+    val name: String,
+    val quantity: Int,
+    val unitPrice: Double,
+    val totalAmount: Double,
+    val stylistName: String?
+)
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun RecentBillsScreen(
@@ -1168,10 +1355,67 @@ fun RecentBillsScreen(
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
     var feedback by remember { mutableStateOf<String?>(null) }
+    var errorBanner by remember { mutableStateOf<String?>(null) }
+    var detailDialog by remember { mutableStateOf<LedgerDetailDialogState?>(null) }
 
-    val salonBills by database.salonBillDao().getBillsForBranch(session.businessId).collectAsState(initial = emptyList())
-    val restOrders by database.restaurantOrderDao().getOrdersForBranch(session.businessId).collectAsState(initial = emptyList())
-    val retailBills by database.retailBillDao().getBillsForOutlet(session.businessId).collectAsState(initial = emptyList())
+    val canModify = remember(session.role) { session.role.isAdminOrAbove() }
+    val startOfTodayMs = remember(session.businessId) { BillIdGenerator.getStartOfTodayMillis() }
+
+    val salonBills by database.salonBillDao()
+        .getTodayActiveBillsForBranch(session.businessId, startOfTodayMs)
+        .collectAsState(initial = emptyList())
+    val restOrders by database.restaurantOrderDao()
+        .getTodayActiveOrdersForBranch(session.businessId, startOfTodayMs)
+        .collectAsState(initial = emptyList())
+    val retailBills by database.retailBillDao()
+        .getTodayActiveBillsForOutlet(session.businessId, startOfTodayMs)
+        .collectAsState(initial = emptyList())
+
+    var salonItemsByBill by remember { mutableStateOf<Map<String, List<SalonBillItemEntity>>>(emptyMap()) }
+    var restItemsByOrder by remember { mutableStateOf<Map<String, List<RestaurantOrderItemEntity>>>(emptyMap()) }
+    var retailItemsByBill by remember { mutableStateOf<Map<String, List<RetailBillItemEntity>>>(emptyMap()) }
+
+    LaunchedEffect(salonBills) {
+        val loaded = mutableMapOf<String, List<SalonBillItemEntity>>()
+        salonBills.forEach { bill ->
+            loaded[bill.id] = database.salonBillDao().getItemsForBill(bill.id)
+        }
+        salonItemsByBill = loaded
+    }
+
+    LaunchedEffect(restOrders) {
+        val loaded = mutableMapOf<String, List<RestaurantOrderItemEntity>>()
+        restOrders.forEach { ord ->
+            loaded[ord.id] = database.restaurantOrderDao().getItemsForOrder(ord.id)
+        }
+        restItemsByOrder = loaded
+    }
+
+    LaunchedEffect(retailBills) {
+        val loaded = mutableMapOf<String, List<RetailBillItemEntity>>()
+        retailBills.forEach { b ->
+            loaded[b.id] = database.retailBillDao().getItemsForBill(b.id)
+        }
+        retailItemsByBill = loaded
+    }
+
+    // Role-gated Edit & Void dialog state (only reachable by SUPERADMIN / ADMIN / authorized MANAGER)
+    var editingSalonBill by remember { mutableStateOf<SalonBillEntity?>(null) }
+    var editCustomerName by remember { mutableStateOf("") }
+    var editCustomerPhone by remember { mutableStateOf("") }
+    var editPaymentMode by remember { mutableStateOf("upi") }
+    var editDiscountText by remember { mutableStateOf("0") }
+    var editReason by remember { mutableStateOf("") }
+    var editItems by remember { mutableStateOf<List<SalonBillItemEntity>>(emptyList()) }
+    var editConfirmed by remember { mutableStateOf(false) }
+    var editSaving by remember { mutableStateOf(false) }
+
+    var voidTargetId by remember { mutableStateOf<String?>(null) }
+    var voidTargetNumber by remember { mutableStateOf("") }
+    var voidTargetType by remember { mutableStateOf(BusinessType.SALON) }
+    var voidReason by remember { mutableStateOf("") }
+    var voidConfirmed by remember { mutableStateOf(false) }
+    var voidSaving by remember { mutableStateOf(false) }
 
     val branch = remember(session) {
         Outlet(
@@ -1193,51 +1437,168 @@ fun RecentBillsScreen(
         contentPadding = PaddingValues(vertical = 14.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        if (feedback != null) {
-            item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = SmavColors.InfoBg),
-                    border = BorderStroke(1.dp, SmavColors.InfoBorder),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Text(feedback!!, color = SmavColors.InfoText, fontSize = 13.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(12.dp))
-                }
+        item {
+            SmavCard {
+                Text(
+                    text = "Today's Transaction Ledger (${BillIdGenerator.getTodayDateString()})",
+                    color = SmavColors.TextPrimary,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp
+                )
+                Text(
+                    text = "Showing today's active bills in outlet-local time (IST). Older bills remain preserved for reports.",
+                    color = SmavColors.TextSecondary,
+                    fontSize = 12.sp
+                )
             }
+        }
+
+        if (feedback != null) {
+            item { SmavSuccessBannerCard(feedback!!) }
+        }
+        if (errorBanner != null) {
+            item { ErrorBannerCard(errorBanner!!) }
         }
 
         when (session.businessType) {
             BusinessType.SALON -> {
                 if (salonBills.isEmpty()) {
-                    item { EmptyStateCard("No Salon Bills Yet", "Bills generated on this device for ${session.businessName} appear here.") }
+                    item {
+                        EmptyStateCard(
+                            "No Bills Today",
+                            "Today's active bills for ${session.businessName} will appear here automatically after billing."
+                        )
+                    }
                 } else {
                     items(salonBills, key = { it.id }) { bill ->
+                        val lineItems = salonItemsByBill[bill.id].orEmpty()
+                        val stylistNames = lineItems
+                            .mapNotNull { it.stylistName?.trim()?.takeIf { s -> s.isNotBlank() } }
+                            .distinct()
+                            .joinToString(", ")
+                            .ifBlank { "—" }
+                        val itemSummary = if (lineItems.isEmpty()) {
+                            "View services"
+                        } else {
+                            lineItems.joinToString(", ") { "${it.serviceName} ×${it.quantity}" }
+                        }
+
                         SmavCard {
-                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                Text(bill.billNumber, color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold)
-                                StatusBadgeChip(bill.syncStatus, if (bill.syncStatus == "SYNCED") SmavColors.StepperGreen else SmavColors.WarningText)
-                            }
-                            Text(
-                                "${bill.customerName ?: "Walk-in Guest"} • ${BillIdGenerator.getFormattedDateTime(bill.createdAtLocal)}",
-                                color = SmavColors.TextSecondary,
-                                fontSize = 12.sp
-                            )
-                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(bill.billNumber, color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                    val resolvedBranch = bill.branchName?.takeIf { it.isNotBlank() }
+                                        ?: BranchOption.displayNameForCode(bill.branchCode)
+                                    if (resolvedBranch.isNotBlank()) {
+                                        Text("Branch: $resolvedBranch", color = SmavColors.TextSecondary, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                                    }
+                                }
                                 Text(
-                                    text = "Rs. ${String.format(Locale.ENGLISH, "%.2f", bill.grandTotal)} (${bill.paymentMode.uppercase(Locale.ENGLISH)})",
+                                    text = "Rs. ${String.format(Locale.ENGLISH, "%.2f", bill.grandTotal)}",
                                     style = SmavNumericStyles.Price,
                                     color = SmavColors.StepperGreen
                                 )
+                            }
+                            Text(
+                                text = "Customer: ${bill.customerName ?: "Walk-in Guest"} • Phone: ${bill.customerPhone?.ifBlank { "—" } ?: "—"}",
+                                color = SmavColors.TextPrimary,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Text(
+                                text = "Payment: ${bill.paymentMode.uppercase(Locale.ENGLISH)} • ${BillIdGenerator.getFormattedDateTime(bill.createdAtLocal)}",
+                                color = SmavColors.TextSecondary,
+                                fontSize = 12.sp
+                            )
+                            Text(
+                                text = "Stylists: $stylistNames",
+                                color = SmavColors.InfoText,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            TextButton(
+                                onClick = {
+                                    detailDialog = LedgerDetailDialogState(
+                                        billNumber = bill.billNumber,
+                                        customerName = bill.customerName ?: "Walk-in Guest",
+                                        customerPhone = bill.customerPhone ?: "—",
+                                        paymentMode = bill.paymentMode.uppercase(Locale.ENGLISH),
+                                        amount = bill.grandTotal,
+                                        dateTime = BillIdGenerator.getFormattedDateTime(bill.createdAtLocal),
+                                        lines = lineItems.map {
+                                            LedgerDetailLine(
+                                                name = it.serviceName,
+                                                quantity = it.quantity,
+                                                unitPrice = it.unitPrice,
+                                                totalAmount = it.totalAmount,
+                                                stylistName = it.stylistName
+                                            )
+                                        }
+                                    )
+                                },
+                                contentPadding = PaddingValues(horizontal = 0.dp, vertical = 2.dp)
+                            ) {
+                                Icon(Icons.Default.Visibility, contentDescription = null, tint = SmavColors.AccentPink, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    text = "Services/Items (${lineItems.size}): $itemSummary",
+                                    color = SmavColors.AccentPink,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+
+                            if (!bill.conflictMessage.isNullOrBlank()) {
+                                SmavWarningBannerCard("Sync conflict: ${bill.conflictMessage}")
+                            }
+
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
                                 SmavSecondaryButton(
-                                    text = "Reprint",
+                                    text = "Print Copy",
                                     icon = Icons.Default.Print,
                                     onClick = {
                                         scope.launch {
+                                            errorBanner = null
                                             val r = billingRepo.reprintSalonBill(bill.id, branch, session.userName)
-                                            feedback = r.fold({ "Reprinted ${bill.billNumber}" }, { "Print failed: ${it.message}" })
+                                            feedback = r.fold({ "Printed copy for ${bill.billNumber}" }, { null })
+                                            if (r.isFailure) errorBanner = "Print failed: ${r.exceptionOrNull()?.message}"
                                         }
                                     }
                                 )
+                                if (canModify) {
+                                    SmavSecondaryButton(
+                                        text = "Edit",
+                                        icon = Icons.Default.Edit,
+                                        onClick = {
+                                            editingSalonBill = bill
+                                            editCustomerName = bill.customerName.orEmpty()
+                                            editCustomerPhone = bill.customerPhone.orEmpty()
+                                            editPaymentMode = bill.paymentMode.lowercase(Locale.ENGLISH)
+                                            editDiscountText = String.format(Locale.ENGLISH, "%.2f", bill.discountAmount)
+                                            editItems = lineItems
+                                            editReason = ""
+                                            editConfirmed = false
+                                        }
+                                    )
+                                    SmavSecondaryButton(
+                                        text = "Void",
+                                        icon = Icons.Default.Delete,
+                                        onClick = {
+                                            voidTargetId = bill.id
+                                            voidTargetNumber = bill.billNumber
+                                            voidTargetType = BusinessType.SALON
+                                            voidReason = ""
+                                            voidConfirmed = false
+                                        }
+                                    )
+                                }
                             }
                         }
                     }
@@ -1246,39 +1607,90 @@ fun RecentBillsScreen(
 
             BusinessType.RESTAURANT -> {
                 if (restOrders.isEmpty()) {
-                    item { EmptyStateCard("No Restaurant Orders Yet", "Orders generated on this device for ${session.businessName} appear here.") }
+                    item { EmptyStateCard("No Orders Today", "Today's active orders for ${session.businessName} appear here.") }
                 } else {
                     items(restOrders, key = { it.id }) { ord ->
+                        val lineItems = restItemsByOrder[ord.id].orEmpty()
+                        val itemSummary = if (lineItems.isEmpty()) "View items" else lineItems.joinToString(", ") { "${it.itemName} ×${it.quantity}" }
                         SmavCard {
                             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                Text("${ord.orderNumber} (Token #${ord.tokenNumber})", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold)
-                                StatusBadgeChip(ord.syncStatus, if (ord.syncStatus == "SYNCED") SmavColors.StepperGreen else SmavColors.WarningText)
+                                Text("${ord.orderNumber} (#${ord.tokenNumber})", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold)
+                                Text(
+                                    text = "Rs. ${String.format(Locale.ENGLISH, "%.2f", ord.grandTotal)}",
+                                    style = SmavNumericStyles.Price,
+                                    color = SmavColors.StepperGreen
+                                )
                             }
-                            Text("${ord.tableOrCounter} • ${BillIdGenerator.getFormattedDateTime(ord.createdAtLocal)}", color = SmavColors.TextSecondary, fontSize = 12.sp)
                             Text(
-                                text = "Rs. ${String.format(Locale.ENGLISH, "%.2f", ord.grandTotal)}",
-                                style = SmavNumericStyles.Price,
-                                color = SmavColors.StepperGreen
+                                text = "Customer: ${ord.customerName ?: ord.tableOrCounter} • Phone: ${ord.customerPhone?.ifBlank { "—" } ?: "—"}",
+                                color = SmavColors.TextPrimary,
+                                fontSize = 12.sp
                             )
+                            Text(
+                                text = "Payment: ${ord.paymentMode.uppercase(Locale.ENGLISH)} • ${BillIdGenerator.getFormattedDateTime(ord.createdAtLocal)}",
+                                color = SmavColors.TextSecondary,
+                                fontSize = 12.sp
+                            )
+                            TextButton(
+                                onClick = {
+                                    detailDialog = LedgerDetailDialogState(
+                                        billNumber = ord.orderNumber,
+                                        customerName = ord.customerName ?: ord.tableOrCounter,
+                                        customerPhone = ord.customerPhone ?: "—",
+                                        paymentMode = ord.paymentMode.uppercase(Locale.ENGLISH),
+                                        amount = ord.grandTotal,
+                                        dateTime = BillIdGenerator.getFormattedDateTime(ord.createdAtLocal),
+                                        lines = lineItems.map {
+                                            LedgerDetailLine(
+                                                name = it.itemName + (it.variantName?.let { v -> " [$v]" } ?: ""),
+                                                quantity = it.quantity,
+                                                unitPrice = it.unitPrice,
+                                                totalAmount = it.totalPrice,
+                                                stylistName = null
+                                            )
+                                        }
+                                    )
+                                },
+                                contentPadding = PaddingValues(horizontal = 0.dp, vertical = 2.dp)
+                            ) {
+                                Text("Items (${lineItems.size}): $itemSummary", color = SmavColors.AccentPink, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                            if (!ord.conflictMessage.isNullOrBlank()) {
+                                SmavWarningBannerCard("Sync conflict: ${ord.conflictMessage}")
+                            }
                             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 SmavSecondaryButton(
-                                    text = "Reprint KOT",
+                                    text = "Print KOT",
                                     onClick = {
                                         scope.launch {
                                             val r = billingRepo.reprintRestaurantKot(ord.id)
-                                            feedback = r.fold({ "KOT reprinted for ${ord.orderNumber}" }, { "KOT print failed: ${it.message}" })
+                                            feedback = r.fold({ "KOT printed for ${ord.orderNumber}" }, { "KOT print failed: ${it.message}" })
                                         }
                                     }
                                 )
                                 SmavSecondaryButton(
-                                    text = "Reprint Bill",
+                                    text = "Print Copy",
+                                    icon = Icons.Default.Print,
                                     onClick = {
                                         scope.launch {
                                             val r = billingRepo.reprintRestaurantBill(ord.id, branch)
-                                            feedback = r.fold({ "Bill reprinted for ${ord.orderNumber}" }, { "Bill print failed: ${it.message}" })
+                                            feedback = r.fold({ "Printed copy for ${ord.orderNumber}" }, { "Bill print failed: ${it.message}" })
                                         }
                                     }
                                 )
+                                if (canModify) {
+                                    SmavSecondaryButton(
+                                        text = "Void",
+                                        icon = Icons.Default.Delete,
+                                        onClick = {
+                                            voidTargetId = ord.id
+                                            voidTargetNumber = ord.orderNumber
+                                            voidTargetType = BusinessType.RESTAURANT
+                                            voidReason = ""
+                                            voidConfirmed = false
+                                        }
+                                    )
+                                }
                             }
                         }
                     }
@@ -1287,36 +1699,300 @@ fun RecentBillsScreen(
 
             BusinessType.RETAIL -> {
                 if (retailBills.isEmpty()) {
-                    item { EmptyStateCard("No Retail Bills Yet", "Retail receipts generated on this device appear here.") }
+                    item { EmptyStateCard("No Retail Bills Today", "Today's active retail receipts appear here.") }
                 } else {
                     items(retailBills, key = { it.id }) { b ->
+                        val lineItems = retailItemsByBill[b.id].orEmpty()
+                        val itemSummary = if (lineItems.isEmpty()) "View items" else lineItems.joinToString(", ") { "${it.productName} ×${it.quantity}" }
                         SmavCard {
                             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                                 Text(b.billNumber, color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold)
-                                StatusBadgeChip(b.syncStatus, if (b.syncStatus == "SYNCED") SmavColors.StepperGreen else SmavColors.WarningText)
+                                Text(
+                                    text = "Rs. ${String.format(Locale.ENGLISH, "%.2f", b.grandTotal)}",
+                                    style = SmavNumericStyles.Price,
+                                    color = SmavColors.StepperGreen
+                                )
                             }
                             Text(
-                                text = "Rs. ${String.format(Locale.ENGLISH, "%.2f", b.grandTotal)}",
-                                style = SmavNumericStyles.Price,
-                                color = SmavColors.StepperGreen
+                                text = "Customer: ${b.customerName ?: "Walk-in Guest"} • Phone: ${b.customerPhone?.ifBlank { "—" } ?: "—"}",
+                                color = SmavColors.TextPrimary,
+                                fontSize = 12.sp
                             )
-                            SmavSecondaryButton(
-                                text = "Reprint Receipt",
-                                icon = Icons.Default.Print,
+                            Text(
+                                text = "Payment: ${b.paymentMode.uppercase(Locale.ENGLISH)} • ${BillIdGenerator.getFormattedDateTime(b.createdAtLocal)}",
+                                color = SmavColors.TextSecondary,
+                                fontSize = 12.sp
+                            )
+                            TextButton(
                                 onClick = {
-                                    scope.launch {
-                                        val r = billingRepo.reprintRetailBill(b.id, branch, session.userName)
-                                        feedback = r.fold({ "Reprinted ${b.billNumber}" }, { "Print failed: ${it.message}" })
+                                    detailDialog = LedgerDetailDialogState(
+                                        billNumber = b.billNumber,
+                                        customerName = b.customerName ?: "Walk-in Guest",
+                                        customerPhone = b.customerPhone ?: "—",
+                                        paymentMode = b.paymentMode.uppercase(Locale.ENGLISH),
+                                        amount = b.grandTotal,
+                                        dateTime = BillIdGenerator.getFormattedDateTime(b.createdAtLocal),
+                                        lines = lineItems.map {
+                                            LedgerDetailLine(
+                                                name = it.productName,
+                                                quantity = it.quantity,
+                                                unitPrice = it.unitPrice,
+                                                totalAmount = it.totalAmount,
+                                                stylistName = null
+                                            )
+                                        }
+                                    )
+                                },
+                                contentPadding = PaddingValues(horizontal = 0.dp, vertical = 2.dp)
+                            ) {
+                                Text("Items (${lineItems.size}): $itemSummary", color = SmavColors.AccentPink, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                SmavSecondaryButton(
+                                    text = "Print Copy",
+                                    icon = Icons.Default.Print,
+                                    onClick = {
+                                        scope.launch {
+                                            val r = billingRepo.reprintRetailBill(b.id, branch, session.userName)
+                                            feedback = r.fold({ "Printed copy for ${b.billNumber}" }, { "Print failed: ${it.message}" })
+                                        }
                                     }
+                                )
+                                if (canModify) {
+                                    SmavSecondaryButton(
+                                        text = "Void",
+                                        icon = Icons.Default.Delete,
+                                        onClick = {
+                                            voidTargetId = b.id
+                                            voidTargetNumber = b.billNumber
+                                            voidTargetType = BusinessType.RETAIL
+                                            voidReason = ""
+                                            voidConfirmed = false
+                                        }
+                                    )
                                 }
-                            )
+                            }
                         }
                     }
                 }
             }
 
             BusinessType.OTHER -> {
-                item { EmptyStateCard("No Active POS Outlet", "Switch to an outlet to inspect local device bills.") }
+                item { EmptyStateCard("No Active POS Outlet", "Switch to an outlet to inspect today's transaction ledger.") }
+            }
+        }
+    }
+
+    // Clickable Services / Items Details Dialog
+    detailDialog?.let { detail ->
+        AlertDialog(
+            onDismissRequest = { detailDialog = null },
+            containerColor = SmavColors.Surface,
+            title = { Text("Bill Details • ${detail.billNumber}", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 16.sp) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("${detail.customerName} (${detail.customerPhone})", color = SmavColors.TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    Text("${detail.paymentMode} • ${detail.dateTime}", color = SmavColors.TextSecondary, fontSize = 12.sp)
+                    HorizontalDivider(color = SmavColors.Border)
+                    detail.lines.forEach { line ->
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text(line.name, color = SmavColors.TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                                Text("Rs. ${String.format(Locale.ENGLISH, "%.2f", line.totalAmount)}", color = SmavColors.StepperGreen, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            }
+                            Text(
+                                text = "Qty: ${line.quantity} × Rs. ${String.format(Locale.ENGLISH, "%.2f", line.unitPrice)}" +
+                                    (line.stylistName?.takeIf { it.isNotBlank() }?.let { " • Stylist: $it" } ?: ""),
+                                color = SmavColors.TextSecondary,
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+                    HorizontalDivider(color = SmavColors.Border)
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("Grand Total", color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold)
+                        Text("Rs. ${String.format(Locale.ENGLISH, "%.2f", detail.amount)}", style = SmavNumericStyles.Price, color = SmavColors.StepperGreen)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { detailDialog = null }) { Text("Close", color = SmavColors.AccentPink, fontWeight = FontWeight.Bold) }
+            }
+        )
+    }
+
+    // Role-Gated Edit Bill Dialog (SUPERADMIN / ADMIN / Authorized MANAGER only)
+    if (canModify && editingSalonBill != null) {
+        val target = editingSalonBill!!
+        val previewSubtotal = editItems.sumOf { it.unitPrice * it.quantity }
+        val previewDiscount = (editDiscountText.toDoubleOrNull() ?: 0.0).coerceIn(0.0, previewSubtotal)
+        val previewTaxable = (previewSubtotal - previewDiscount).coerceAtLeast(0.0)
+        val previewTax = Math.round(previewTaxable * 0.18 * 100.0) / 100.0
+        val previewGrand = Math.round((previewTaxable + previewTax) * 100.0) / 100.0
+
+        MobileFormDialog(
+            title = "Edit Bill • ${target.billNumber}",
+            onDismiss = { if (!editSaving) editingSalonBill = null },
+            confirmText = "Save Audited Edit",
+            confirmEnabled = !editSaving && editConfirmed && editReason.trim().length >= 5 && editItems.isNotEmpty(),
+            isSaving = editSaving,
+            onConfirm = {
+                editSaving = true
+                errorBanner = null
+                scope.launch {
+                    val res = billingRepo.editSalonBillOfflineOrOnline(
+                        billId = target.id,
+                        customerName = editCustomerName,
+                        customerPhone = editCustomerPhone,
+                        paymentMode = editPaymentMode,
+                        discountAmount = previewDiscount,
+                        editedItems = editItems,
+                        reason = editReason
+                    )
+                    res.onSuccess { updated ->
+                        feedback = "Updated ${updated.billNumber} (Rs. ${String.format(Locale.ENGLISH, "%.2f", updated.grandTotal)})."
+                        editingSalonBill = null
+                    }.onFailure { err ->
+                        errorBanner = err.message ?: "Unable to edit bill."
+                    }
+                    editSaving = false
+                }
+            }
+        ) {
+            OutlinedTextField(
+                value = editCustomerName,
+                onValueChange = { editCustomerName = it },
+                label = { Text("Customer Name") },
+                singleLine = true,
+                colors = smavOutlinedFieldColors(),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            )
+            OutlinedTextField(
+                value = editCustomerPhone,
+                onValueChange = { editCustomerPhone = it },
+                label = { Text("Customer Phone") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                singleLine = true,
+                colors = smavOutlinedFieldColors(),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Text("Payment Mode", color = SmavColors.TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            FilterFlowRow(
+                items = listOf("upi", "cash", "card", "split"),
+                selected = editPaymentMode,
+                labelOf = { it.uppercase(Locale.ENGLISH) },
+                onSelect = { editPaymentMode = it }
+            )
+            OutlinedTextField(
+                value = editDiscountText,
+                onValueChange = { editDiscountText = it },
+                label = { Text("Discount Amount (Rs.)") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                singleLine = true,
+                colors = smavOutlinedFieldColors(),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            editItems.forEachIndexed { idx, line ->
+                SmavCard {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(line.serviceName, color = SmavColors.TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                            Text(
+                                text = "Rs. ${String.format(Locale.ENGLISH, "%.2f", line.unitPrice)} • Stylist: ${line.stylistName ?: "—"}",
+                                color = SmavColors.TextSecondary,
+                                fontSize = 11.sp
+                            )
+                        }
+                        SmavQuantityStepper(
+                            quantity = line.quantity,
+                            itemName = line.serviceName,
+                            onDecrement = {
+                                if (line.quantity > 1) {
+                                    editItems = editItems.toMutableList().also {
+                                        it[idx] = line.copy(quantity = line.quantity - 1)
+                                    }
+                                }
+                            },
+                            onIncrement = {
+                                editItems = editItems.toMutableList().also {
+                                    it[idx] = line.copy(quantity = line.quantity + 1)
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+
+            SummaryStatCard(
+                title = "Recalculated Total (incl. 18% GST)",
+                value = "Rs. ${String.format(Locale.ENGLISH, "%.2f", previewGrand)}",
+                subtitle = "Subtotal Rs. ${String.format(Locale.ENGLISH, "%.2f", previewSubtotal)} − Discount Rs. ${String.format(Locale.ENGLISH, "%.2f", previewDiscount)} + GST Rs. ${String.format(Locale.ENGLISH, "%.2f", previewTax)}",
+                accent = SmavColors.StepperGreen
+            )
+            OutlinedTextField(
+                value = editReason,
+                onValueChange = { editReason = it },
+                label = { Text("Audit Reason for Edit * (min 5 chars)") },
+                colors = smavOutlinedFieldColors(),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(checked = editConfirmed, onCheckedChange = { editConfirmed = it })
+                Text("I confirm this audited bill edit preserves original bill number and history.", color = SmavColors.TextSecondary, fontSize = 12.sp)
+            }
+        }
+    }
+
+    // Role-Gated Audited Void / Soft-Delete Dialog
+    if (canModify && voidTargetId != null) {
+        MobileFormDialog(
+            title = "Void Bill • $voidTargetNumber",
+            onDismiss = { if (!voidSaving) voidTargetId = null },
+            confirmText = "Confirm Void (Soft-Delete)",
+            confirmEnabled = !voidSaving && voidConfirmed && voidReason.trim().length >= 5,
+            isSaving = voidSaving,
+            onConfirm = {
+                voidSaving = true
+                errorBanner = null
+                val targetId = voidTargetId!!
+                scope.launch {
+                    val res = when (voidTargetType) {
+                        BusinessType.SALON -> billingRepo.voidSalonBillOfflineOrOnline(targetId, voidReason)
+                        BusinessType.RESTAURANT -> billingRepo.voidRestaurantOrderOfflineOrOnline(targetId, voidReason)
+                        BusinessType.RETAIL -> billingRepo.voidRetailBillOfflineOrOnline(targetId, voidReason)
+                        BusinessType.OTHER -> Result.failure(IllegalStateException("Unsupported outlet type"))
+                    }
+                    res.onSuccess { msgText ->
+                        feedback = msgText
+                        voidTargetId = null
+                    }.onFailure { err ->
+                        errorBanner = err.message ?: "Unable to void bill."
+                    }
+                    voidSaving = false
+                }
+            }
+        ) {
+            SmavWarningBannerCard("Audited soft-delete: bill $voidTargetNumber will be removed from today's active ledger and sales totals while preserving audit history.")
+            OutlinedTextField(
+                value = voidReason,
+                onValueChange = { voidReason = it },
+                label = { Text("Mandatory Void Reason * (min 5 chars)") },
+                colors = smavOutlinedFieldColors(),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(checked = voidConfirmed, onCheckedChange = { voidConfirmed = it })
+                Text("I confirm voiding bill $voidTargetNumber with this audit reason.", color = SmavColors.TextSecondary, fontSize = 12.sp)
             }
         }
     }
