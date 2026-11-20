@@ -6076,14 +6076,22 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
         canonicalBillNumber = String((existingByIdem as any).central_bill_number || existingByIdem.bill_number || canonicalBillNumber);
         centralBillId = (existingByIdem as any).central_bill_id ? String((existingByIdem as any).central_bill_id) : centralBillId;
       } else {
-        const normalizedItems = items.map((item: any) => ({
-          service_id: item.serviceId,
-          service_name: item.name,
-          stylist_id: item.stylistId,
-          stylist_name: item.stylist,
-          quantity: item.quantity,
-          unit_price: item.price
-        }));
+        const normalizedItems = items.map((item: any) => {
+          const qty = Math.max(1, Number(item.quantity || 1));
+          const unitPrice = Number(item.price || 0);
+          const discountPercent = Number(item.discountPercent || item.discount_percent || 0);
+          const lineTotal = Number((qty * unitPrice * (1 - discountPercent / 100)).toFixed(2));
+          return {
+            service_id: item.serviceId,
+            service_name: item.name,
+            stylist_id: item.stylistId,
+            stylist_name: item.stylist,
+            quantity: qty,
+            unit_price: unitPrice,
+            discount_percent: discountPercent,
+            line_total: lineTotal
+          };
+        });
 
         const validBranchUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(allowedBranch.id)
           ? allowedBranch.id
@@ -6147,13 +6155,14 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
           // Idempotent concurrent retry check — NEVER rewrite an assigned central bill number
           const { data: racedByIdem } = await lookupDb
             .from('smav_salon_bills')
-            .select('id, bill_number')
+            .select('id, bill_number, central_bill_id, central_bill_number')
             .eq('idempotency_key', cleanIdempotencyKey)
             .maybeSingle();
 
           if (racedByIdem?.id) {
             persistedBillId = String(racedByIdem.id);
-            canonicalBillNumber = String(racedByIdem.bill_number || canonicalBillNumber);
+            canonicalBillNumber = String((racedByIdem as any).central_bill_number || racedByIdem.bill_number || canonicalBillNumber);
+            centralBillId = (racedByIdem as any).central_bill_id ? String((racedByIdem as any).central_bill_id) : centralBillId;
           } else {
             return res.status(409).json({
               success: false,
@@ -6174,9 +6183,27 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
           localBillId: persistedBillId,
           sourceSystem
         });
-        centralBillId = finalized.centralBillId;
-      } catch {
-        // Non-fatal if pre-migration 019 DB doesn't have smav_central_bill_numbers yet
+        const resolvedCentralId = finalized.centralBillId;
+        if (resolvedCentralId && resolvedCentralId !== centralBillId && persistedBillId && serviceDb) {
+          try {
+            await serviceDb
+              .from('smav_salon_bills')
+              .update({
+                central_bill_id: resolvedCentralId,
+                central_bill_number: canonicalBillNumber,
+                branch_code: allowedBranch.branchCode,
+                branch_name: allowedBranch.branchName
+              })
+              .eq('id', persistedBillId)
+              .eq('outlet_id', session.activeOutlet.id);
+          } catch {}
+        }
+        centralBillId = resolvedCentralId;
+      } catch (finalizeErr: any) {
+        const errMsg = String(finalizeErr?.message || '');
+        if (!/could not find the function|does not exist|CENTRAL_BILL_NOT_FOUND/i.test(errMsg)) {
+          console.error('[SMAV Central Bill Finalize] Non-fatal error:', errMsg);
+        }
       }
 
       // Register notification jobs via serviceDb (post-authorization) using exact central_bill_number and selected branch

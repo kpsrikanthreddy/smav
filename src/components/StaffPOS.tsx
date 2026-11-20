@@ -139,6 +139,10 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
   const stylistSelectRefs = useRef<Record<number, HTMLSelectElement | null>>({});
   const isSubmittingBillRef = useRef(false);
   const prevOutletIdRef = useRef(session.activeOutlet.id);
+  const pendingAttemptRef = useRef<{
+    fingerprint: string;
+    idempotencyKey: string;
+  } | null>(null);
   const pendingCheckoutRef = useRef<{
     fingerprint: string;
     centralBillId: string;
@@ -252,6 +256,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       setPermittedBranches([]);
       setSelectedBranchCode('');
       setBranchError(null);
+      pendingAttemptRef.current = null;
       pendingCheckoutRef.current = null;
       try {
         const raw = window.localStorage.getItem(`smav:offline-queue:${session.activeOutlet.id}`);
@@ -768,8 +773,15 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
         })),
       });
 
+      if (!pendingAttemptRef.current || pendingAttemptRef.current.fingerprint !== fingerprint) {
+        pendingAttemptRef.current = {
+          fingerprint,
+          idempotencyKey: `WEB_${selectedBranch.branchCode}_${createCheckoutAttemptId()}`,
+        };
+      }
+
       if (!pendingCheckoutRef.current || pendingCheckoutRef.current.fingerprint !== fingerprint) {
-        const idempotencyKey = `WEB_${selectedBranch.branchCode}_${createCheckoutAttemptId()}`;
+        const idempotencyKey = pendingAttemptRef.current.idempotencyKey;
         const numberResponse = await fetch('/api/central/bill-numbers/reserve', {
           method: 'POST',
           headers: {
@@ -872,6 +884,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
         throw new Error(result?.message || `Bill could not be saved (HTTP ${response.status})`);
       }
 
+      pendingAttemptRef.current = null;
       pendingCheckoutRef.current = null;
       setActiveReceiptPreview(bill);
       setSalonCart([]);

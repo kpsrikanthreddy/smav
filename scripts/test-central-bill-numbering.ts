@@ -340,6 +340,187 @@ async function runTests() {
     else process.env.SMAV_DISPATCH_SECRET = prevDispatchSecret;
   }
 
+  // 10. Regression test: Kondapur (KONDA) bill — reserve, save, finalize, and retry with same idempotency key
+  {
+    const kondaOutletId = '28467997-d316-482e-be93-258dd26e1340';
+    const kondaCoordinator = new CentralBillNumberCoordinator();
+    const kondaNow = new Date('2026-11-20T06:00:00.000Z'); // 2026-11-20 11:30 IST
+    const kondaIdemKey = 'WEB_KONDA_REGRESSION_ATTEMPT_001';
+
+    // Simulated smav_salon_bills persistence table keyed by idempotency_key (mirrors /api/mobile/sync/bills)
+    const persistedSalonBills = new Map<
+      string,
+      {
+        id: string;
+        outlet_id: string;
+        bill_number: string;
+        central_bill_id: string;
+        central_bill_number: string;
+        branch_code: string;
+        branch_name: string;
+        idempotency_key: string;
+        customer_name: string;
+        customer_phone: string;
+        payment_mode: string;
+        subtotal: number;
+        discount_amount: number;
+        total_tax: number;
+        grand_total: number;
+        items: Array<{
+          service_id: string;
+          service_name: string;
+          stylist_id: string;
+          stylist_name: string;
+          quantity: number;
+          unit_price: number;
+        }>;
+      }
+    >();
+
+    // Step 1: Reserve central bill number for Kondapur (KONDA)
+    const reserved = await kondaCoordinator.reserveCentralBillNumber({
+      db: null,
+      outletId: kondaOutletId,
+      branchCode: 'KONDA',
+      idempotencyKey: kondaIdemKey,
+      sourceSystem: 'smav_web_pos',
+      now: kondaNow,
+    });
+    assert.equal(reserved.centralBillNumber, 'TGL-KONDA-20261120-0001');
+    assert.equal(reserved.branchCode, 'KONDA');
+    assert.equal(reserved.branchName, 'Kondapur');
+    assert.equal(reserved.status, 'RESERVED');
+    assert.equal(reserved.idempotentReplay, false);
+
+    // Step 2: Persist bill with 1 service, stylist, customer, payment, tax, and totals
+    const saveAndFinalize = async (resv: typeof reserved) => {
+      let existing = persistedSalonBills.get(resv.idempotencyKey);
+      if (!existing) {
+        existing = {
+          id: 'salon-bill-konda-001',
+          outlet_id: kondaOutletId,
+          bill_number: resv.centralBillNumber,
+          central_bill_id: resv.centralBillId,
+          central_bill_number: resv.centralBillNumber,
+          branch_code: resv.branchCode,
+          branch_name: resv.branchName,
+          idempotency_key: resv.idempotencyKey,
+          customer_name: 'Ananya Rao',
+          customer_phone: '9876543210',
+          payment_mode: 'upi',
+          subtotal: 1000,
+          discount_amount: 0,
+          total_tax: 180,
+          grand_total: 1180,
+          items: [
+            {
+              service_id: 'svc-haircut-01',
+              service_name: 'Layer Haircut',
+              stylist_id: 'sty-renuka-01',
+              stylist_name: 'Renuka',
+              quantity: 1,
+              unit_price: 1000,
+            },
+          ],
+        };
+        persistedSalonBills.set(resv.idempotencyKey, existing);
+      }
+
+      const finalized = await kondaCoordinator.finalizeCentralBillNumber({
+        db: null,
+        outletId: kondaOutletId,
+        centralBillNumber: existing.central_bill_number,
+        idempotencyKey: existing.idempotency_key,
+        localBillId: existing.id,
+        sourceSystem: 'smav_web_pos',
+      });
+      return { savedBill: existing, finalized };
+    };
+
+    const firstAttempt = await saveAndFinalize(reserved);
+    assert.equal(firstAttempt.finalized.status, 'FINALIZED');
+    assert.equal(firstAttempt.finalized.centralBillNumber, 'TGL-KONDA-20261120-0001');
+    assert.equal(firstAttempt.savedBill.central_bill_id, reserved.centralBillId);
+    assert.equal(firstAttempt.savedBill.central_bill_number, 'TGL-KONDA-20261120-0001');
+    assert.equal(firstAttempt.savedBill.outlet_id, kondaOutletId);
+    assert.equal(firstAttempt.savedBill.branch_code, 'KONDA');
+    assert.equal(firstAttempt.savedBill.branch_name, 'Kondapur');
+    assert.equal(firstAttempt.savedBill.customer_name, 'Ananya Rao');
+    assert.equal(firstAttempt.savedBill.payment_mode, 'upi');
+    assert.equal(firstAttempt.savedBill.total_tax, 180);
+    assert.equal(firstAttempt.savedBill.grand_total, 1180);
+    assert.equal(firstAttempt.savedBill.items.length, 1);
+    assert.equal(firstAttempt.savedBill.items[0].service_name, 'Layer Haircut');
+    assert.equal(firstAttempt.savedBill.items[0].stylist_name, 'Renuka');
+
+    // Step 3: Retry the exact same checkout (reserve + save + finalize) with the same idempotency key
+    const retriedReserve = await kondaCoordinator.reserveCentralBillNumber({
+      db: null,
+      outletId: kondaOutletId,
+      branchCode: 'KONDA',
+      idempotencyKey: kondaIdemKey,
+      sourceSystem: 'smav_web_pos',
+      now: kondaNow,
+    });
+    assert.equal(retriedReserve.idempotentReplay, true);
+    assert.equal(retriedReserve.centralBillId, reserved.centralBillId);
+    assert.equal(retriedReserve.centralBillNumber, 'TGL-KONDA-20261120-0001');
+
+    const retriedSave = await saveAndFinalize(retriedReserve);
+    assert.equal(retriedSave.finalized.status, 'FINALIZED');
+    assert.equal(retriedSave.finalized.centralBillId, reserved.centralBillId);
+    assert.equal(retriedSave.finalized.centralBillNumber, 'TGL-KONDA-20261120-0001');
+
+    // Step 4: Assert ONLY ONE central bill number and ONLY ONE finalized bill exist (and sequence did not skip)
+    const allKondaRecords = kondaCoordinator.getMemoryRecordsForOutlet(kondaOutletId);
+    assert.equal(allKondaRecords.length, 1, 'Expected exactly 1 central bill number after retry');
+    assert.equal(allKondaRecords[0].status, 'FINALIZED');
+    assert.equal(persistedSalonBills.size, 1, 'Expected exactly 1 saved salon bill after retry');
+
+    const nextDistinctKonda = await kondaCoordinator.reserveCentralBillNumber({
+      db: null,
+      outletId: kondaOutletId,
+      branchCode: 'KONDA',
+      idempotencyKey: 'WEB_KONDA_REGRESSION_ATTEMPT_002',
+      sourceSystem: 'smav_web_pos',
+      now: kondaNow,
+    });
+    assert.equal(nextDistinctKonda.centralBillNumber, 'TGL-KONDA-20261120-0002', 'Sequence must not skip after retry');
+  }
+
+  // 11. Static SQL regression check: ensure central bill RPCs in migrations 019 & 020 never have unqualified ON CONFLICT (outlet_id, ...)
+  {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    for (const relPath of [
+      'database/migrations/019_central_bill_numbering_and_branches.sql',
+      'database/migrations/020_fix_central_bill_rpc_ambiguous_outlet_id.sql',
+    ]) {
+      const sql = fs.readFileSync(path.resolve(process.cwd(), relPath), 'utf8');
+      const executableSql = sql
+        .split('\n')
+        .filter((line) => !line.trimStart().startsWith('--'))
+        .join('\n');
+      assert.equal(
+        /ON CONFLICT\s*\(\s*outlet_id\s*,\s*branch_code\s*,\s*billing_date\s*\)/i.test(executableSql),
+        false,
+        `${relPath} must not contain unqualified ON CONFLICT (outlet_id, branch_code, billing_date)`
+      );
+      const constraintMatches = executableSql.match(/ON CONFLICT ON CONSTRAINT smav_bill_number_counters_pkey/gi) || [];
+      assert.equal(
+        constraintMatches.length,
+        2,
+        `${relPath} must use ON CONFLICT ON CONSTRAINT smav_bill_number_counters_pkey in both reserve and allocate RPCs`
+      );
+      const conflictDirectiveMatches = sql.match(/#variable_conflict use_column/gi) || [];
+      assert.equal(
+        conflictDirectiveMatches.length,
+        3,
+        `${relPath} must set #variable_conflict use_column in all 3 RETURNS TABLE RPCs`
+      );
+    }
+  }
+
   console.log('ALL CENTRAL BILL NUMBERING & BRANCH TESTS PASSED');
 }
 
