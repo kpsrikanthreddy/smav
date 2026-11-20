@@ -1455,7 +1455,7 @@ export class SmavAuthGateway implements IAuthProvider {
     }
 
     const lastChecked = this.sessionLiveCheckedAt.get(session.token) || 0;
-    if (!forceFresh && Date.now() - lastChecked < 60 * 1000) {
+    if (!forceFresh && Date.now() - lastChecked < 15 * 1000) {
       return { active: true };
     }
 
@@ -2707,19 +2707,38 @@ function enforceExternallyManagedGuard(
   session: UserSession,
   outletCode: string,
   action: string,
-  targetIdentifier?: string
-): { allowed: boolean; isEmergencyOverride: boolean; message?: string } {
+  targetIdentifier?: string,
+  req?: express.Request
+): { allowed: boolean; isEmergencyOverride: boolean; code?: string; message?: string } {
   const ownership = getAuthoritativeOutletOwner(outletCode);
   if (!ownership.managedByOutlet) {
     return { allowed: true, isEmergencyOverride: false };
   }
+  const ownerDisplay = ownership.managedByLabel?.replace('Managed by ', '') || outletCode;
   if (session.role !== 'superadmin') {
     return {
       allowed: false,
       isEmergencyOverride: false,
-      message: `${ownership.managedByLabel}: User management for this outlet is read-only in SMAV. Make changes in the ${ownership.managedByLabel?.replace('Managed by ', '')} Admin Portal so they sync automatically.`,
+      code: 'MANAGED_BY_OUTLET',
+      message: `${ownership.managedByLabel}: User management for this outlet is read-only in SMAV. Make changes in the ${ownerDisplay} Admin Portal so they sync automatically.`,
     };
   }
+
+  const emergencyHeader = String(req?.headers?.['x-smav-emergency-override'] || '').trim().toLowerCase() === 'true';
+  const emergencyBody = req?.body?.emergencyOverride === true || req?.body?.emergencyOverride === 'true';
+  const overrideReason = String(
+    req?.body?.overrideReason || req?.headers?.['x-smav-override-reason'] || ''
+  ).trim();
+
+  if (!(emergencyHeader || emergencyBody) || overrideReason.length < 10) {
+    return {
+      allowed: false,
+      isEmergencyOverride: false,
+      code: 'MANAGED_BY_OUTLET_REQUIRES_RECOVERY_OVERRIDE',
+      message: `${ownership.managedByLabel}: Standard SMAV edits are blocked for externally managed users. Manage users in ${ownerDisplay} Admin Portal, or use the dedicated SUPERADMIN Emergency Recovery workflow with an explicit audit reason (minimum 10 characters).`,
+    };
+  }
+
   auditLogger.log({
     eventType: 'SUPERADMIN_EMERGENCY_USER_OVERRIDE',
     actorId: session.userId,
@@ -2729,6 +2748,20 @@ function enforceExternallyManagedGuard(
       authoritativeSource: ownership.authoritativeSource,
       action,
       targetIdentifier: targetIdentifier || null,
+      overrideReason,
+    },
+  });
+  void writeTrustedServerAuditLog({
+    userId: session.userId,
+    userEmail: session.email,
+    action: 'SUPERADMIN_EMERGENCY_USER_OVERRIDE',
+    entityType: 'USER',
+    entityId: targetIdentifier || outletCode.toLowerCase(),
+    details: {
+      outletCode: outletCode.toLowerCase(),
+      authoritativeSource: ownership.authoritativeSource,
+      requestedAction: action,
+      overrideReason,
     },
   });
   return { allowed: true, isEmergencyOverride: true };
@@ -2744,10 +2777,26 @@ function timingSafeStringEqual(a: string, b: string): boolean {
 
 function mapGlossyProductionRole(rawRole?: string): {
   smavRole: 'ADMIN' | 'STAFF';
-  edgeRoleHint: 'OWNER' | 'MANAGER' | 'ADMIN' | 'STYLIST' | 'RECEPTIONIST';
+  contractRole: 'ADMIN' | 'POS_BILLING';
+  edgeRoleHint: 'OWNER' | 'MANAGER' | 'ADMIN' | 'STYLIST' | 'RECEPTIONIST' | 'INVENTORY_STAFF';
   displayTitle: string;
 } {
   const norm = String(rawRole || '').trim().toUpperCase();
+  if (
+    norm === 'POS_BILLING' ||
+    norm === 'STAFF' ||
+    norm === 'INVENTORY_STAFF' ||
+    norm === 'RECEPTIONIST' ||
+    norm === 'STYLIST'
+  ) {
+    if (norm === 'STYLIST') {
+      return { smavRole: 'STAFF', contractRole: 'POS_BILLING', edgeRoleHint: 'STYLIST', displayTitle: rawRole || 'Salon Stylist' };
+    }
+    if (norm === 'INVENTORY_STAFF') {
+      return { smavRole: 'STAFF', contractRole: 'POS_BILLING', edgeRoleHint: 'INVENTORY_STAFF', displayTitle: rawRole || 'Inventory Staff' };
+    }
+    return { smavRole: 'STAFF', contractRole: 'POS_BILLING', edgeRoleHint: 'RECEPTIONIST', displayTitle: rawRole || 'POS Billing / Receptionist' };
+  }
   if (
     norm === 'OWNER' ||
     norm.includes('OWNER') ||
@@ -2756,15 +2805,18 @@ function mapGlossyProductionRole(rawRole?: string): {
     norm.includes('PARTNER') ||
     norm.includes('PROPRIETOR')
   ) {
-    return { smavRole: 'ADMIN', edgeRoleHint: 'OWNER', displayTitle: rawRole || 'Salon Owner / Director' };
+    return { smavRole: 'ADMIN', contractRole: 'ADMIN', edgeRoleHint: 'OWNER', displayTitle: rawRole || 'Salon Owner / Director' };
   }
   if (norm === 'MANAGER' || norm.includes('MANAGER') || norm === 'ADMIN') {
-    return { smavRole: 'ADMIN', edgeRoleHint: 'MANAGER', displayTitle: rawRole || 'Salon Branch Manager' };
+    return { smavRole: 'ADMIN', contractRole: 'ADMIN', edgeRoleHint: 'MANAGER', displayTitle: rawRole || 'Salon Branch Manager' };
   }
   if (norm.includes('STYLIST') || norm.includes('ARTIST') || norm.includes('BEAUTICIAN')) {
-    return { smavRole: 'STAFF', edgeRoleHint: 'STYLIST', displayTitle: rawRole || 'Salon Stylist' };
+    return { smavRole: 'STAFF', contractRole: 'POS_BILLING', edgeRoleHint: 'STYLIST', displayTitle: rawRole || 'Salon Stylist' };
   }
-  return { smavRole: 'STAFF', edgeRoleHint: 'RECEPTIONIST', displayTitle: rawRole || 'Salon Receptionist / Cashier' };
+  if (norm.includes('INVENTORY')) {
+    return { smavRole: 'STAFF', contractRole: 'POS_BILLING', edgeRoleHint: 'INVENTORY_STAFF', displayTitle: rawRole || 'Inventory Staff' };
+  }
+  return { smavRole: 'STAFF', contractRole: 'POS_BILLING', edgeRoleHint: 'RECEPTIONIST', displayTitle: rawRole || 'Salon Receptionist / Cashier' };
 }
 
 async function fetchEnrichedCentralStaff(supabaseJwt: string, outletCode?: string) {
@@ -3306,9 +3358,9 @@ app.post('/api/outlet-users', requireAuth, requireAdmin, async (req, res) => {
     return res.status(403).json({ success: false, message: scope.error });
   }
 
-  const managedGuard = enforceExternallyManagedGuard(session, scope.outletCode, 'upsert_user', userId || email);
+  const managedGuard = enforceExternallyManagedGuard(session, scope.outletCode, 'upsert_user', userId || email, req);
   if (!managedGuard.allowed) {
-    return res.status(403).json({ success: false, code: 'MANAGED_BY_OUTLET', message: managedGuard.message });
+    return res.status(403).json({ success: false, code: managedGuard.code || 'MANAGED_BY_OUTLET', message: managedGuard.message });
   }
 
   const outlet = await resolveOutletTargetDescriptor(scope.outletCode, session.supabaseToken);
@@ -3380,9 +3432,9 @@ app.put('/api/outlet-users/:userId', requireAuth, requireAdmin, async (req, res)
     return res.status(403).json({ success: false, message: scope.error });
   }
 
-  const managedGuard = enforceExternallyManagedGuard(session, scope.outletCode, 'update_user', targetUserId);
+  const managedGuard = enforceExternallyManagedGuard(session, scope.outletCode, 'update_user', targetUserId, req);
   if (!managedGuard.allowed) {
-    return res.status(403).json({ success: false, code: 'MANAGED_BY_OUTLET', message: managedGuard.message });
+    return res.status(403).json({ success: false, code: managedGuard.code || 'MANAGED_BY_OUTLET', message: managedGuard.message });
   }
 
   const outlet = await resolveOutletTargetDescriptor(scope.outletCode, session.supabaseToken);
@@ -3454,9 +3506,9 @@ app.post('/api/outlet-users/:userId/reset-password', requireAuth, requireAdmin, 
     return res.status(403).json({ success: false, message: scope.error });
   }
 
-  const managedGuard = enforceExternallyManagedGuard(session, scope.outletCode, 'reset_password', targetUserId);
+  const managedGuard = enforceExternallyManagedGuard(session, scope.outletCode, 'reset_password', targetUserId, req);
   if (!managedGuard.allowed) {
-    return res.status(403).json({ success: false, code: 'MANAGED_BY_OUTLET', message: managedGuard.message });
+    return res.status(403).json({ success: false, code: managedGuard.code || 'MANAGED_BY_OUTLET', message: managedGuard.message });
   }
 
   const outlet = await resolveOutletTargetDescriptor(scope.outletCode, session.supabaseToken);
@@ -3510,9 +3562,9 @@ app.post('/api/outlet-users/:userId/status', requireAuth, requireAdmin, async (r
     return res.status(403).json({ success: false, message: scope.error });
   }
 
-  const managedGuard = enforceExternallyManagedGuard(session, scope.outletCode, 'set_status', targetUserId);
+  const managedGuard = enforceExternallyManagedGuard(session, scope.outletCode, 'set_status', targetUserId, req);
   if (!managedGuard.allowed) {
-    return res.status(403).json({ success: false, code: 'MANAGED_BY_OUTLET', message: managedGuard.message });
+    return res.status(403).json({ success: false, code: managedGuard.code || 'MANAGED_BY_OUTLET', message: managedGuard.message });
   }
 
   const outlet = await resolveOutletTargetDescriptor(scope.outletCode, session.supabaseToken);
@@ -3617,6 +3669,15 @@ async function handleOutletIncomingUserSync(req: express.Request, res: express.R
     return res.status(400).json({ success: false, message: 'outletCode is required.' });
   }
 
+  // Validate X-Business-Source header when supplied so an outlet key cannot cross-write another outlet
+  const headerBusinessSource = String(req.headers['x-business-source'] || '').trim().toLowerCase();
+  if (headerBusinessSource && headerBusinessSource !== cleanOutletCode) {
+    return res.status(403).json({
+      success: false,
+      message: `Forbidden: X-Business-Source "${headerBusinessSource}" does not match target outlet "${cleanOutletCode}".`
+    });
+  }
+
   const rawOrigin = String(req.headers['x-smav-sync-origin'] || req.body?.syncOrigin || 'outlet_admin').trim().toLowerCase();
   if (rawOrigin === 'smav_portal') {
     return res.json({
@@ -3630,7 +3691,10 @@ async function handleOutletIncomingUserSync(req: express.Request, res: express.R
   const bearerToken = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.split(' ')[1] : '';
   const configuredKey = outletSyncCoordinator.getOutletIntegrationKey(cleanOutletCode);
 
-  // Optional HMAC-SHA256 authentication (X-SMAV-Timestamp + X-SMAV-Signature = hex(hmac(secret, `${timestamp}.${rawBody}`)))
+  // Authentication protocol:
+  //   - Accepts X-Integration-Key (timing-safe match against configured outlet integration key)
+  //   - Optionally accepts HMAC-SHA256 (X-SMAV-Timestamp + X-SMAV-Signature over `${timestamp}.${rawBody}`, ±5m window)
+  //   - Or authenticated SMAV SUPERADMIN / assigned outlet ADMIN Bearer JWT
   const hmacTimestamp = String(req.headers['x-smav-timestamp'] || '').trim();
   const hmacSignature = String(req.headers['x-smav-signature'] || '').trim();
   const hmacSecret = configuredKey || process.env.SMAV_DISPATCH_SECRET?.trim() || '';
@@ -3773,13 +3837,30 @@ async function handleOutletIncomingUserSync(req: express.Request, res: express.R
     }
   });
 
+  const contractDisplayRole: 'ADMIN' | 'POS_BILLING' | undefined =
+    result.role === 'ADMIN'
+      ? 'ADMIN'
+      : result.role === 'STAFF'
+        ? 'POS_BILLING'
+        : normalizedRole === 'ADMIN'
+          ? 'ADMIN'
+          : normalizedRole === 'STAFF'
+            ? 'POS_BILLING'
+            : undefined;
+  const isConflict = Boolean(result.conflict || result.httpStatus === 409 || result.syncStatus === 'CONFLICT');
+
   return res.status(result.httpStatus).json({
     ...result,
+    conflict: isConflict,
+    userId: result.userId || null,
     centralUserId: result.userId || null,
+    centralAuthId: result.userId || null,
     externalStaffId: resolvedExternalStaffId || result.outboxItem?.externalStaffId || null,
     outletId: outlet.id,
     outletCode: outlet.code,
-    displayRole: result.role === 'ADMIN' ? 'ADMIN' : result.role === 'STAFF' ? 'POS_BILLING' : undefined,
+    role: contractDisplayRole,
+    internalRole: result.role,
+    displayRole: contractDisplayRole,
     isActive: typeof result.outboxItem?.payload?.isActive === 'boolean' ? result.outboxItem.payload.isActive : resolvedIsActive
   });
 }
@@ -4648,9 +4729,9 @@ app.post('/api/admin/staff', requireAuth, requireAdmin, async (req, res) => {
   const cleanEmail = String(email || '').trim().toLowerCase();
   const cleanName = String(fullName || '').trim();
 
-  const managedGuard = enforceExternallyManagedGuard(session, session.activeOutlet.code, 'upsert_user', cleanEmail);
+  const managedGuard = enforceExternallyManagedGuard(session, session.activeOutlet.code, 'upsert_user', cleanEmail, req);
   if (!managedGuard.allowed) {
-    return res.status(403).json({ success: false, code: 'MANAGED_BY_OUTLET', message: managedGuard.message });
+    return res.status(403).json({ success: false, code: managedGuard.code || 'MANAGED_BY_OUTLET', message: managedGuard.message });
   }
 
   if (!cleanEmail || !cleanName) {
@@ -4709,9 +4790,9 @@ app.post('/api/admin/staff/:id/status', requireAuth, requireAdmin, async (req, r
     return res.status(400).json({ success: false, message: 'Valid Central Auth UUID is required.' });
   }
 
-  const managedGuard = enforceExternallyManagedGuard(session, session.activeOutlet.code, 'set_status', id);
+  const managedGuard = enforceExternallyManagedGuard(session, session.activeOutlet.code, 'set_status', id, req);
   if (!managedGuard.allowed) {
-    return res.status(403).json({ success: false, code: 'MANAGED_BY_OUTLET', message: managedGuard.message });
+    return res.status(403).json({ success: false, code: managedGuard.code || 'MANAGED_BY_OUTLET', message: managedGuard.message });
   }
 
   const outlet = await resolveOutletTargetDescriptor(session.activeOutlet.code, session.supabaseToken);
@@ -4740,9 +4821,9 @@ app.delete('/api/admin/staff/:id', requireAuth, requireAdmin, async (req, res) =
   }
 
   const { id } = req.params;
-  const managedGuard = enforceExternallyManagedGuard(session, session.activeOutlet.code, 'remove_staff', id);
+  const managedGuard = enforceExternallyManagedGuard(session, session.activeOutlet.code, 'remove_staff', id, req);
   if (!managedGuard.allowed) {
-    return res.status(403).json({ success: false, code: 'MANAGED_BY_OUTLET', message: managedGuard.message });
+    return res.status(403).json({ success: false, code: managedGuard.code || 'MANAGED_BY_OUTLET', message: managedGuard.message });
   }
 
   const email = (req.body?.email || req.query.email) as string | undefined;
@@ -4765,9 +4846,9 @@ app.post('/api/admin/staff/:id/reset-password', requireAuth, requireAdmin, async
     return res.status(400).json({ success: false, message: 'Valid Central Auth UUID is required.' });
   }
 
-  const managedGuard = enforceExternallyManagedGuard(session, session.activeOutlet.code, 'reset_password', id);
+  const managedGuard = enforceExternallyManagedGuard(session, session.activeOutlet.code, 'reset_password', id, req);
   if (!managedGuard.allowed) {
-    return res.status(403).json({ success: false, code: 'MANAGED_BY_OUTLET', message: managedGuard.message });
+    return res.status(403).json({ success: false, code: managedGuard.code || 'MANAGED_BY_OUTLET', message: managedGuard.message });
   }
 
   const { email, newPassword } = req.body || {};

@@ -8,6 +8,7 @@ import {
   Printer,
   Receipt,
   RefreshCw,
+  ShieldAlert,
   ShieldCheck,
   Sparkles,
   TrendingUp,
@@ -79,6 +80,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
   const [resetConfirmPassword, setResetConfirmPassword] = useState('');
 
   const [confirmToggleUser, setConfirmToggleUser] = useState<OutletUserRecord | null>(null);
+
+  // Separate, audited SUPERADMIN Emergency Recovery state for externally managed outlets
+  const [isRecoveryOpen, setIsRecoveryOpen] = useState(false);
+  const [recoveryUserId, setRecoveryUserId] = useState('');
+  const [recoveryAction, setRecoveryAction] = useState<'set_status' | 'reset_password' | 'update_user'>('set_status');
+  const [recoveryReason, setRecoveryReason] = useState('');
+  const [recoveryConfirmed, setRecoveryConfirmed] = useState(false);
+  const [recoveryNewPassword, setRecoveryNewPassword] = useState('');
+  const [recoveryTargetActive, setRecoveryTargetActive] = useState<boolean>(false);
+  const [recoveryEditRole, setRecoveryEditRole] = useState<'ADMIN' | 'STAFF'>('STAFF');
+  const [recoveryEditFullName, setRecoveryEditFullName] = useState('');
+  const [recoveryEditEmail, setRecoveryEditEmail] = useState('');
 
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
@@ -321,7 +334,109 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
     staffList.some((u) => Boolean(u.managedByOutlet));
   const managedByLabel =
     staffList.find((u) => u.managedByLabel)?.managedByLabel || 'Managed by Glossy Looks';
-  const canMutateOutletUsers = !isExternallyManaged || isSuperadmin;
+  // Hide standard Add/Edit/Reset/Disable controls for externally managed outlets (even for SUPERADMIN;
+  // SUPERADMIN uses the separate audited Emergency Recovery workflow instead).
+  const canMutateOutletUsers = !isExternallyManaged;
+  const externallyManagedStaff = staffList.filter(
+    (u) => (Boolean(u.managedByOutlet) || isExternallyManaged) && u.platformRole !== 'SUPERADMIN'
+  );
+
+  const openRecoveryModal = () => {
+    const first = externallyManagedStaff[0];
+    setActionError(null);
+    setActionSuccess(null);
+    setRecoveryUserId(first?.userId || '');
+    setRecoveryAction('set_status');
+    setRecoveryReason('');
+    setRecoveryConfirmed(false);
+    setRecoveryNewPassword('');
+    setRecoveryTargetActive(first ? !first.isActive : false);
+    const visRole = first ? getVisibleRole(first.outletRole || first.displayRole || first.role) : 'POS_BILLING';
+    setRecoveryEditRole(visRole === 'ADMIN' ? 'ADMIN' : 'STAFF');
+    setRecoveryEditFullName(first?.fullName || '');
+    setRecoveryEditEmail(first?.email || '');
+    setIsRecoveryOpen(true);
+  };
+
+  const handleRecoveryUserSelect = (nextId: string) => {
+    setRecoveryUserId(nextId);
+    const chosen = externallyManagedStaff.find((u) => u.userId === nextId);
+    if (chosen) {
+      setRecoveryTargetActive(!chosen.isActive);
+      const visRole = getVisibleRole(chosen.outletRole || chosen.displayRole || chosen.role);
+      setRecoveryEditRole(visRole === 'ADMIN' ? 'ADMIN' : 'STAFF');
+      setRecoveryEditFullName(chosen.fullName || '');
+      setRecoveryEditEmail(chosen.email || '');
+    }
+  };
+
+  const handleEmergencyRecoverySubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const target = externallyManagedStaff.find((u) => u.userId === recoveryUserId);
+    if (!target) {
+      setActionError('Select a target externally managed user first.');
+      return;
+    }
+    const cleanReason = recoveryReason.trim();
+    if (cleanReason.length < 10) {
+      setActionError('Provide an explicit audit reason (at least 10 characters) for SUPERADMIN emergency recovery.');
+      return;
+    }
+    if (!recoveryConfirmed) {
+      setActionError('Confirm that this SUPERADMIN emergency recovery override is audited.');
+      return;
+    }
+    if (recoveryAction === 'reset_password' && recoveryNewPassword.length < 8) {
+      setActionError('Temporary password must be at least 8 characters.');
+      return;
+    }
+
+    setIsActionLoading(true);
+    setActionError(null);
+    setActionSuccess(null);
+    try {
+      let res;
+      if (recoveryAction === 'set_status') {
+        res = await identityAdminService.setOutletUserStatus(session.token, target.userId, {
+          outletCode: session.activeOutlet.code,
+          email: target.email || undefined,
+          isActive: recoveryTargetActive,
+          emergencyOverride: true,
+          overrideReason: cleanReason,
+        });
+      } else if (recoveryAction === 'reset_password') {
+        res = await identityAdminService.resetOutletUserPassword(session.token, target.userId, {
+          outletCode: session.activeOutlet.code,
+          email: target.email || undefined,
+          newPassword: recoveryNewPassword,
+          emergencyOverride: true,
+          overrideReason: cleanReason,
+        });
+      } else {
+        res = await identityAdminService.updateOutletUser(session.token, target.userId, {
+          outletCode: session.activeOutlet.code,
+          fullName: recoveryEditFullName.trim() || target.fullName,
+          email: recoveryEditEmail.trim() || target.email || undefined,
+          role: recoveryEditRole,
+          emergencyOverride: true,
+          overrideReason: cleanReason,
+        });
+      }
+
+      if (res.success) {
+        setActionSuccess(res.message);
+        setIsRecoveryOpen(false);
+        setRecoveryNewPassword('');
+        setRecoveryReason('');
+        setRecoveryConfirmed(false);
+        await fetchAdminData();
+      } else {
+        setActionError(res.message || res.error || 'Emergency recovery operation failed.');
+      }
+    } finally {
+      setIsActionLoading(false);
+    }
+  };
 
   return (
     <div className="space-y-5">
@@ -442,6 +557,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
               >
                 Refresh
               </Button>
+              {isExternallyManaged && isSuperadmin && externallyManagedStaff.length > 0 && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={openRecoveryModal}
+                  leftIcon={<ShieldAlert className="w-3.5 h-3.5 text-[#B45309]" />}
+                >
+                  Emergency Recovery
+                </Button>
+              )}
               {canMutateOutletUsers && (
                 <Button
                   size="sm"
@@ -451,7 +576,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
                   }}
                   leftIcon={<UserPlus className="w-3.5 h-3.5" />}
                 >
-                  {isExternallyManaged ? 'Emergency Add User' : 'Add User'}
+                  Add User
                 </Button>
               )}
             </div>
@@ -600,7 +725,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
                   const rowExternallyManaged = Boolean(user.managedByOutlet || isExternallyManaged);
                   const rowManagedLabel = user.managedByLabel || managedByLabel;
                   const isProtected = user.platformRole === 'SUPERADMIN' || visibleRole === 'ADMIN';
-                  if (rowExternallyManaged && !isSuperadmin) {
+                  if (rowExternallyManaged) {
                     return <StatusBadge label={rowManagedLabel} tone="info" />;
                   }
                   const canManageRow = isSuperadmin || !isProtected;
@@ -608,57 +733,50 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
                     return <span className="text-[11px] text-[#6F737D]">SUPERADMIN Managed</span>;
                   }
                   return (
-                    <div className="space-y-1">
-                      {rowExternallyManaged && isSuperadmin && (
-                        <div className="text-[10px] font-semibold text-[#B45309] text-right">
-                          Emergency Override (Audited)
-                        </div>
-                      )}
-                      <div className="flex flex-wrap items-center justify-end gap-1.5">
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={isActionLoading}
-                          onClick={() => {
-                            setActionError(null);
-                            setEditingUser(user);
-                            setEditUserForm({
-                              fullName: user.fullName || '',
-                              username: user.username || '',
-                              email: user.email || '',
-                              phone: user.phone || '',
-                              role: visibleRole === 'ADMIN' ? 'ADMIN' : 'STAFF',
-                            });
-                          }}
-                          leftIcon={<Edit2 className="w-3 h-3" />}
-                        >
-                          Edit
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={isActionLoading}
-                          onClick={() => {
-                            setActionError(null);
-                            setResetTarget(user);
-                            setResetNewPassword('');
-                            setResetConfirmPassword('');
-                          }}
-                          leftIcon={<KeyRound className="w-3 h-3" />}
-                        >
-                          Reset Password
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant={user.isActive ? 'danger' : 'success'}
-                          disabled={isActionLoading}
-                          onClick={() =>
-                            user.isActive ? setConfirmToggleUser(user) : void executeToggleStatus(user)
-                          }
-                        >
-                          {user.isActive ? 'Disable' : 'Enable'}
-                        </Button>
-                      </div>
+                    <div className="flex flex-wrap items-center justify-end gap-1.5">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={isActionLoading}
+                        onClick={() => {
+                          setActionError(null);
+                          setEditingUser(user);
+                          setEditUserForm({
+                            fullName: user.fullName || '',
+                            username: user.username || '',
+                            email: user.email || '',
+                            phone: user.phone || '',
+                            role: visibleRole === 'ADMIN' ? 'ADMIN' : 'STAFF',
+                          });
+                        }}
+                        leftIcon={<Edit2 className="w-3 h-3" />}
+                      >
+                        Edit
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={isActionLoading}
+                        onClick={() => {
+                          setActionError(null);
+                          setResetTarget(user);
+                          setResetNewPassword('');
+                          setResetConfirmPassword('');
+                        }}
+                        leftIcon={<KeyRound className="w-3 h-3" />}
+                      >
+                        Reset Password
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant={user.isActive ? 'danger' : 'success'}
+                        disabled={isActionLoading}
+                        onClick={() =>
+                          user.isActive ? setConfirmToggleUser(user) : void executeToggleStatus(user)
+                        }
+                      >
+                        {user.isActive ? 'Disable' : 'Enable'}
+                      </Button>
                     </div>
                   );
                 },
@@ -669,9 +787,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
               const rowExternallyManaged = Boolean(user.managedByOutlet || isExternallyManaged);
               const rowManagedLabel = user.managedByLabel || managedByLabel;
               const isProtected = user.platformRole === 'SUPERADMIN' || visibleRole === 'ADMIN';
-              const canManageRow = rowExternallyManaged
-                ? isSuperadmin
-                : isSuperadmin || !isProtected;
+              const canManageRow = !rowExternallyManaged && (isSuperadmin || !isProtected);
               return (
                 <div className="space-y-2.5 text-xs">
                   <div className="flex items-start justify-between gap-2">
@@ -1325,6 +1441,156 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ session, onOpenP
         onConfirm={() => confirmToggleUser && void executeToggleStatus(confirmToggleUser)}
         onCancel={() => setConfirmToggleUser(null)}
       />
+
+      {/* Separate Audited SUPERADMIN Emergency Recovery Modal */}
+      {isRecoveryOpen && isSuperadmin && (
+        <div className="fixed inset-0 z-50 bg-[#111827]/50 backdrop-blur-[2px] flex items-center justify-center p-4">
+          <Card padding="lg" className="max-w-md w-full shadow-xl space-y-4 max-h-[92vh] overflow-y-auto">
+            <div className="flex items-center justify-between pb-2.5 border-b border-[#E5E7EC]">
+              <h3 className="text-base font-bold text-[#92400E] flex items-center gap-2">
+                <ShieldAlert className="w-4 h-4 shrink-0" />
+                <span>SUPERADMIN Emergency Recovery</span>
+              </h3>
+              <button
+                type="button"
+                onClick={() => setIsRecoveryOpen(false)}
+                className="w-8 h-8 rounded-lg flex items-center justify-center text-[#6F737D] hover:bg-[#F5F6FA] cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="p-3 rounded-xl bg-[#FFFBEB] border border-[#FDE68A] text-[11px] text-[#92400E] leading-relaxed">
+              {managedByLabel}: Standard user edits must be made in the Glossy Looks Admin Portal.
+              Use this recovery modal only during an incident; every action is logged in{' '}
+              <span className="font-mono">smav_audit_logs</span>.
+            </div>
+
+            <form onSubmit={handleEmergencyRecoverySubmit} className="space-y-3">
+              <FormField label="Target User" required>
+                <select
+                  value={recoveryUserId}
+                  onChange={(e) => handleRecoveryUserSelect(e.target.value)}
+                  required
+                  className={BASE_INPUT_CLASS}
+                >
+                  {externallyManagedStaff.map((u) => (
+                    <option key={u.userId} value={u.userId}>
+                      {u.fullName} ({u.email || u.userId}) — {u.isActive ? 'Active' : 'Disabled'}
+                    </option>
+                  ))}
+                </select>
+              </FormField>
+
+              <FormField label="Recovery Action" required>
+                <select
+                  value={recoveryAction}
+                  onChange={(e) =>
+                    setRecoveryAction(e.target.value as 'set_status' | 'reset_password' | 'update_user')
+                  }
+                  className={BASE_INPUT_CLASS}
+                >
+                  <option value="set_status">Enable / Disable Access</option>
+                  <option value="reset_password">Assign Emergency Temporary Password</option>
+                  <option value="update_user">Emergency Profile / Role Repair</option>
+                </select>
+              </FormField>
+
+              {recoveryAction === 'set_status' && (
+                <FormField label="Target Access Status">
+                  <select
+                    value={recoveryTargetActive ? 'active' : 'disabled'}
+                    onChange={(e) => setRecoveryTargetActive(e.target.value === 'active')}
+                    className={BASE_INPUT_CLASS}
+                  >
+                    <option value="disabled">Disable Account Immediately</option>
+                    <option value="active">Re-Enable Account</option>
+                  </select>
+                </FormField>
+              )}
+
+              {recoveryAction === 'reset_password' && (
+                <PasswordField
+                  label="Emergency Temporary Password (min. 8 chars)"
+                  value={recoveryNewPassword}
+                  onChange={(e) => setRecoveryNewPassword(e.target.value)}
+                  minLength={8}
+                  required
+                />
+              )}
+
+              {recoveryAction === 'update_user' && (
+                <div className="space-y-2.5">
+                  <FormField label="Full Name">
+                    <input
+                      type="text"
+                      value={recoveryEditFullName}
+                      onChange={(e) => setRecoveryEditFullName(e.target.value)}
+                      className={BASE_INPUT_CLASS}
+                    />
+                  </FormField>
+                  <FormField label="Email Address">
+                    <input
+                      type="email"
+                      value={recoveryEditEmail}
+                      onChange={(e) => setRecoveryEditEmail(e.target.value)}
+                      className={BASE_INPUT_CLASS}
+                    />
+                  </FormField>
+                  <FormField label="SMAV Outlet Role">
+                    <select
+                      value={recoveryEditRole}
+                      onChange={(e) => setRecoveryEditRole(e.target.value as 'ADMIN' | 'STAFF')}
+                      className={BASE_INPUT_CLASS}
+                    >
+                      <option value="STAFF">POS_BILLING (STAFF)</option>
+                      <option value="ADMIN">ADMIN</option>
+                    </select>
+                  </FormField>
+                </div>
+              )}
+
+              <FormField label="Mandatory Audit Reason (min. 10 characters)" required>
+                <textarea
+                  value={recoveryReason}
+                  onChange={(e) => setRecoveryReason(e.target.value)}
+                  placeholder="Explain why an emergency SMAV override is required."
+                  rows={2}
+                  minLength={10}
+                  required
+                  className={BASE_INPUT_CLASS}
+                />
+              </FormField>
+
+              <label className="flex items-start gap-2 text-xs text-[#2F3033] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={recoveryConfirmed}
+                  onChange={(e) => setRecoveryConfirmed(e.target.checked)}
+                  className="mt-0.5 rounded border-[#D1D5DB]"
+                />
+                <span>
+                  I confirm this SUPERADMIN emergency override is required and will be audit logged.
+                </span>
+              </label>
+
+              <div className="pt-3 flex items-center justify-end gap-2 border-t border-[#E5E7EC]">
+                <Button variant="outline" size="sm" onClick={() => setIsRecoveryOpen(false)}>
+                  Cancel
+                </Button>
+                <Button
+                  type="submit"
+                  size="sm"
+                  variant="danger"
+                  loading={isActionLoading}
+                  disabled={!recoveryConfirmed || recoveryReason.trim().length < 10}
+                >
+                  Execute Audited Recovery
+                </Button>
+              </div>
+            </form>
+          </Card>
+        </div>
+      )}
     </div>
   );
 };

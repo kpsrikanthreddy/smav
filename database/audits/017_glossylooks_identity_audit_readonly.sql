@@ -1,9 +1,9 @@
 -- =============================================================================
 -- READ-ONLY AUDIT & VERIFICATION QUERIES (ZERO DATA MODIFICATIONS)
 --
--- Contains SELECT-only queries to compare all 8 Glossy Looks users across:
+-- Contains SELECT-only queries to compare all 9 Glossy Looks users across:
 --   A. Central SMAV Supabase (https://qykdwswatopylzvqhgog.supabase.co)
---   B. Glossy Looks Supabase (https://onswigwiwuvkvoduuhxr.supabase.co)
+--   B. Glossy Looks Supabase (https://onswigwiwuvkvoduuhxr.supabase.co — public.users)
 --
 -- Safe to run at any time before AND after deployment.
 -- =============================================================================
@@ -50,9 +50,25 @@ LEFT JOIN public.smav_external_identities ei
 WHERE r.outlet_id IS NOT NULL
    OR ei.auth_user_id IS NOT NULL
    OR LOWER(COALESCE(u.email, '')) LIKE '%glossylooks%'
+   OR LOWER(COALESCE(u.email, '')) IN (
+     'owner@glossylooks.in',
+     'glossylooks01@gmail.com',
+     'paletimounika@glossylooks.in',
+     'deepika@glossylooks.in',
+     'staff@glossylooks.in',
+     'kpsrikanthreddy@gmail.com',
+     'shailaja@glossylooks.in',
+     'renuka@gmail.com',
+     'renuka@glossylooks.in',
+     'srikanth1981k@gmail.com',
+     'sharadha@gmail.com',
+     'kpsridataengineer@gmail.com'
+   )
    OR LOWER(COALESCE(p.full_name, '')) LIKE '%renuka%'
    OR LOWER(COALESCE(p.full_name, '')) LIKE '%sharadha%'
    OR LOWER(COALESCE(p.full_name, '')) LIKE '%mounika%'
+   OR LOWER(COALESCE(p.full_name, '')) LIKE '%srikanth%'
+   OR LOWER(COALESCE(p.full_name, '')) LIKE '%srireddy%'
    OR u.id IN (
      'bc6a10a9-2bfe-4460-94b9-ddef5e8aa344', -- Renuka ORIGINAL
      'c0e2945d-d5f0-43ef-989a-ca1ace82ec9a'  -- Renuka DUPLICATE
@@ -159,7 +175,8 @@ WHERE schemaname = 'public'
 ORDER BY tablename, indexname;
 
 
--- A6. Post-reconciliation count check (Target: all 8 Glossy Looks users represented,
+-- A6. Post-reconciliation count check (Target: all 9 Glossy Looks users represented
+--     or 8 outlet-scoped + 1 platform SUPERADMIN if SRIKANTH KAYIDAPURAM is SUPERADMIN,
 --     0 stale non-SYNCED outbox items, active count matches Glossy Looks active count)
 SELECT
   COUNT(*) AS total_glossylooks_roles,
@@ -175,26 +192,32 @@ WHERE r.outlet_id = '28467997-d316-482e-be93-258dd26e1340';
 -- PART B: RUN IN GLOSSY LOOKS SUPABASE (onswigwiwuvkvoduuhxr)
 -- =============================================================================
 -- Copy and execute ONLY Part B inside the Glossy Looks Supabase SQL Editor
--- (https://onswigwiwuvkvoduuhxr.supabase.co) to export all 8 authoritative users.
+-- (https://onswigwiwuvkvoduuhxr.supabase.co) to export all 9 authoritative users
+-- from public.users (never public.staff.role job titles).
 
 /*
--- B1. Inspect authoritative Glossy Looks staff / user records (adjust table name if `users` vs `staff`)
+-- B1. Inspect authoritative Glossy Looks public.users records (9 live Admin Users)
 SELECT
-  id AS local_staff_id,
-  name,
-  email,
-  role AS glossylooks_role,
+  u.id AS external_staff_id,
+  u.user_id AS login_code,
+  u.username,
+  u.name,
+  u.email,
+  u.phone,
+  u.role AS glossylooks_role,
   CASE
-    WHEN UPPER(COALESCE(role, '')) IN ('OWNER', 'DIRECTOR', 'FOUNDER', 'MANAGER', 'ADMIN') THEN 'ADMIN'
-    ELSE 'POS_BILLING (DB: STAFF)'
+    WHEN LOWER(COALESCE(u.role, '')) IN ('owner', 'manager') THEN 'ADMIN'
+    ELSE 'POS_BILLING (SMAV DB: STAFF)'
   END AS expected_smav_role,
-  is_active,
-  central_auth_id,
-  central_auth_status,
-  central_auth_linked_at
-FROM public.staff
-ORDER BY is_active DESC, role, name;
+  u.is_active,
+  u.central_auth_id,
+  u.central_auth_status,
+  u.central_sync_status,
+  u.central_sync_error,
+  u.central_auth_linked_at
+FROM public.users u
+ORDER BY u.is_active DESC, u.role, u.name;
 
--- B2. If Glossy Looks also stores login users in public.users / public.profiles, inspect those too:
+-- B2. Inspect combined view anchored on public.users (after Glossy Looks Migration 024):
 SELECT * FROM public.vw_smav_staff_auth_status ORDER BY is_active DESC, name;
 */

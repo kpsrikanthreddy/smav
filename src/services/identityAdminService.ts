@@ -69,6 +69,8 @@ export class IdentityAdminService {
       initialPassword?: string;
       isActive?: boolean;
       idempotencyKey?: string;
+      emergencyOverride?: boolean;
+      overrideReason?: string;
     }
   ): Promise<UnifiedSyncResponse> {
     try {
@@ -111,6 +113,8 @@ export class IdentityAdminService {
       outletCode: string;
       isActive?: boolean;
       idempotencyKey?: string;
+      emergencyOverride?: boolean;
+      overrideReason?: string;
     }
   ): Promise<UnifiedSyncResponse> {
     try {
@@ -148,6 +152,8 @@ export class IdentityAdminService {
       email?: string;
       outletCode: string;
       idempotencyKey?: string;
+      emergencyOverride?: boolean;
+      overrideReason?: string;
     }
   ): Promise<UnifiedSyncResponse> {
     try {
@@ -185,6 +191,8 @@ export class IdentityAdminService {
       email?: string;
       outletCode: string;
       idempotencyKey?: string;
+      emergencyOverride?: boolean;
+      overrideReason?: string;
     }
   ): Promise<UnifiedSyncResponse> {
     try {

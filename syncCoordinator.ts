@@ -82,6 +82,9 @@ export interface DispatchSyncResult {
   role?: 'ADMIN' | 'STAFF';
   isNewUser?: boolean;
   mustChangePassword?: boolean;
+  passwordResetRequired?: boolean;
+  conflict?: boolean;
+  idempotentReplay?: boolean;
   centralConfirmed: boolean;
   outletConfirmed: boolean;
   syncStatus: OutboxStatus;
@@ -243,6 +246,20 @@ export class OutletUserSyncCoordinator {
         : {}),
       ...(payload.syncVersion ? { syncVersion: Number(payload.syncVersion) } : {}),
     };
+  }
+
+  private sanitizeErrorText(rawError?: string | null, sensitiveValues: Array<string | undefined> = []): string | null {
+    if (!rawError) return null;
+    let text = String(rawError);
+    for (const secret of sensitiveValues) {
+      if (secret && secret.length >= 4) {
+        text = text.split(secret).join('[REDACTED]');
+      }
+    }
+    text = text
+      .replace(/(password|initialPassword|newPassword|temporaryPassword|secret|token|apikey|authorization)\s*[:=]\s*["']?[^\s"',}]+["']?/gi, '$1=[REDACTED]')
+      .slice(0, 400);
+    return text;
   }
 
   private getCentralServiceDb(): any | null {
@@ -539,10 +556,30 @@ export class OutletUserSyncCoordinator {
         username: existing.payload.username,
         role: existing.payload.role,
         mustChangePassword: existing.payload.mustChangePassword,
+        conflict: false,
+        idempotentReplay: true,
         centralConfirmed: existing.centralConfirmed,
         outletConfirmed: existing.outletConfirmed,
         syncStatus: existing.status,
         outboxItem: existing,
+      };
+    }
+    if (existing && existing.status === 'CONFLICT') {
+      return {
+        success: false,
+        httpStatus: 409,
+        message: existing.lastError || 'Idempotent replay: identity conflict requires manual reconciliation.',
+        userId: existing.targetUserId || undefined,
+        email: existing.payload.email,
+        username: existing.payload.username,
+        role: existing.payload.role,
+        conflict: true,
+        idempotentReplay: true,
+        centralConfirmed: existing.centralConfirmed,
+        outletConfirmed: existing.outletConfirmed,
+        syncStatus: existing.status,
+        outboxItem: existing,
+        conflictDetails: existing.conflictDetails,
       };
     }
 
@@ -615,18 +652,22 @@ export class OutletUserSyncCoordinator {
 
     if (!edgeRes?.success) {
       const httpStatus = Number(edgeRes?.status || 400);
-      const isConflict = httpStatus === 409;
+      const isConflict = httpStatus === 409 || edgeRes?.conflict === true;
       record.centralConfirmed = false;
       record.status = isConflict ? 'CONFLICT' : 'FAILED';
-      record.lastError = edgeRes?.error || edgeRes?.message || 'Central SMAV update rejected';
+      record.lastError = this.sanitizeErrorText(
+        edgeRes?.error || edgeRes?.message || 'Central SMAV update rejected',
+        [input.transientPassword, input.centralAuthToken]
+      );
       record.conflictDetails = isConflict ? edgeRes?.details || { error: record.lastError } : null;
       record.updatedAt = new Date().toISOString();
       await this.persistOutboxToCentralDb(record);
 
       return {
         success: false,
-        httpStatus,
+        httpStatus: isConflict ? 409 : httpStatus,
         message: record.lastError || 'Failed to update Central SMAV',
+        conflict: isConflict,
         centralConfirmed: false,
         outletConfirmed: record.outletConfirmed,
         syncStatus: record.status,
@@ -700,6 +741,8 @@ export class OutletUserSyncCoordinator {
         role: record.payload.role,
         isNewUser: Boolean(edgeRes.isNewUser),
         mustChangePassword: record.payload.mustChangePassword,
+        passwordResetRequired: Boolean(edgeRes.passwordResetRequired),
+        conflict: false,
         centralConfirmed: true,
         outletConfirmed: true,
         syncStatus: 'SYNCED',
@@ -776,6 +819,7 @@ export class OutletUserSyncCoordinator {
       role: record.payload.role,
       isNewUser: Boolean(edgeRes.isNewUser),
       mustChangePassword: record.payload.mustChangePassword,
+      conflict: Boolean(outletPush.isConflict),
       centralConfirmed: true,
       outletConfirmed: false,
       syncStatus: record.status,
