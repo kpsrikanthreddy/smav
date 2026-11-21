@@ -49,7 +49,7 @@ enum class SmavRoute(val title: String, val group: String) {
 
     // POS & Shared Operations
     POS_BILLING("POS Billing", "Operations"),
-    POS_RECENT_BILLS("Recent Bills & Reprint", "Operations"),
+    POS_RECENT_BILLS("Bills & Reprint", "Operations"),
     OFFLINE_SYNC("Offline Bills & Sync", "Operations"),
     PRINTER_SETTINGS("Printer Settings", "Device"),
     INTEGRATION_DIAGNOSTICS("Integration Diagnostics", "Administration")
@@ -78,7 +78,7 @@ fun drawerItemsForSession(session: StaffSession): List<DrawerRouteItem> {
             add(DrawerRouteItem(SmavRoute.SUPERADMIN_AUDIT, "Security Audit Logs", Icons.Default.Security))
             add(DrawerRouteItem(SmavRoute.SUPERADMIN_SUPABASE, "Central Supabase & RLS", Icons.Default.Storage))
             add(DrawerRouteItem(SmavRoute.POS_BILLING, "Auditor POS", Icons.Default.PointOfSale))
-            add(DrawerRouteItem(SmavRoute.POS_RECENT_BILLS, "Recent Bills & Reprint", Icons.Default.ReceiptLong))
+            add(DrawerRouteItem(SmavRoute.POS_RECENT_BILLS, "Bills & Reprint", Icons.Default.ReceiptLong))
             add(DrawerRouteItem(SmavRoute.OFFLINE_SYNC, "Offline Sync Queue", Icons.Default.CloudSync))
             add(DrawerRouteItem(SmavRoute.PRINTER_SETTINGS, "Printer Settings", Icons.Default.Print))
         }
@@ -88,7 +88,7 @@ fun drawerItemsForSession(session: StaffSession): List<DrawerRouteItem> {
             DrawerRouteItem(SmavRoute.POS_BILLING, "Open POS Billing", Icons.Default.PointOfSale),
             DrawerRouteItem(SmavRoute.ADMIN_STAFF, "Staff & POS Users", Icons.Default.Group),
             DrawerRouteItem(SmavRoute.ADMIN_CATALOG, "Catalog & Prices", Icons.Default.MenuBook),
-            DrawerRouteItem(SmavRoute.POS_RECENT_BILLS, "Recent Bills & Reprint", Icons.Default.ReceiptLong),
+            DrawerRouteItem(SmavRoute.POS_RECENT_BILLS, "Bills & Reprint", Icons.Default.ReceiptLong),
             DrawerRouteItem(SmavRoute.ADMIN_REPORTS, "Outlet Reports", Icons.Default.BarChart),
             DrawerRouteItem(SmavRoute.ADMIN_SYNC, "Sync Status & Outbox", Icons.Default.CloudSync),
             DrawerRouteItem(SmavRoute.INTEGRATION_DIAGNOSTICS, "Integration Diagnostics", Icons.Default.SettingsInputComponent),
@@ -98,7 +98,7 @@ fun drawerItemsForSession(session: StaffSession): List<DrawerRouteItem> {
 
         else -> listOf(
             DrawerRouteItem(SmavRoute.POS_BILLING, "POS Billing", Icons.Default.PointOfSale),
-            DrawerRouteItem(SmavRoute.POS_RECENT_BILLS, "Recent Bills & Reprint", Icons.Default.ReceiptLong),
+            DrawerRouteItem(SmavRoute.POS_RECENT_BILLS, "Bills & Reprint", Icons.Default.ReceiptLong),
             DrawerRouteItem(SmavRoute.OFFLINE_SYNC, "Pending Offline Sync", Icons.Default.CloudSync),
             DrawerRouteItem(SmavRoute.PRINTER_SETTINGS, "Printer Settings", Icons.Default.Print)
         )
@@ -382,60 +382,65 @@ fun SmavAppScaffold(
                         colors = TopAppBarDefaults.topAppBarColors(containerColor = SmavColors.Surface)
                     )
 
-                    FlowRow(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(SmavColors.SurfaceSubtle)
-                            .padding(horizontal = 14.dp, vertical = 6.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        StatusBadgeChip(
-                            text = if (isOnline) "Online" else "Offline Mode",
-                            color = if (isOnline) SmavColors.StepperGreen else SmavColors.WarningText
-                        )
-                        StatusBadgeChip(
-                            text = session.businessType.displayName,
-                            color = when (session.businessType) {
-                                BusinessType.SALON -> SmavColors.AccentPink
-                                BusinessType.RESTAURANT -> SmavColors.WarningText
-                                BusinessType.RETAIL -> SmavColors.InfoText
-                                BusinessType.OTHER -> SmavColors.TextSecondary
-                            }
-                        )
-                        if (pendingSyncCount > 0) {
-                            Surface(
-                                color = SmavColors.WarningBg,
-                                shape = RoundedCornerShape(8.dp),
-                                border = BorderStroke(1.dp, SmavColors.WarningBorder),
-                                modifier = Modifier.clickable {
-                                    onNavigate(
-                                        if (session.role.isAdminOnly()) SmavRoute.ADMIN_SYNC else SmavRoute.OFFLINE_SYNC
+                    val hideSalonPosStatusStrip =
+                        session.businessType == BusinessType.SALON &&
+                            (currentRoute == SmavRoute.POS_BILLING || currentRoute == SmavRoute.POS_RECENT_BILLS)
+                    if (!hideSalonPosStatusStrip) {
+                        FlowRow(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(SmavColors.SurfaceSubtle)
+                                .padding(horizontal = 14.dp, vertical = 6.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            StatusBadgeChip(
+                                text = if (isOnline) "Online" else "Offline Mode",
+                                color = if (isOnline) SmavColors.StepperGreen else SmavColors.WarningText
+                            )
+                            StatusBadgeChip(
+                                text = session.businessType.displayName,
+                                color = when (session.businessType) {
+                                    BusinessType.SALON -> SmavColors.AccentPink
+                                    BusinessType.RESTAURANT -> SmavColors.WarningText
+                                    BusinessType.RETAIL -> SmavColors.InfoText
+                                    BusinessType.OTHER -> SmavColors.TextSecondary
+                                }
+                            )
+                            if (pendingSyncCount > 0) {
+                                Surface(
+                                    color = SmavColors.WarningBg,
+                                    shape = RoundedCornerShape(8.dp),
+                                    border = BorderStroke(1.dp, SmavColors.WarningBorder),
+                                    modifier = Modifier.clickable {
+                                        onNavigate(
+                                            if (session.role.isAdminOnly()) SmavRoute.ADMIN_SYNC else SmavRoute.OFFLINE_SYNC
+                                        )
+                                    }
+                                ) {
+                                    Text(
+                                        text = "$pendingSyncCount pending sync",
+                                        color = SmavColors.WarningText,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
                                     )
                                 }
-                            ) {
-                                Text(
-                                    text = "$pendingSyncCount pending sync",
-                                    color = SmavColors.WarningText,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                                )
                             }
-                        }
-                        if (!anyPrinterConnected) {
-                            Surface(
-                                color = SmavColors.Surface,
-                                shape = RoundedCornerShape(8.dp),
-                                border = BorderStroke(1.dp, SmavColors.Border),
-                                modifier = Modifier.clickable { onNavigate(SmavRoute.PRINTER_SETTINGS) }
-                            ) {
-                                Text(
-                                    text = "Printer not connected",
-                                    color = SmavColors.TextSecondary,
-                                    fontSize = 11.sp,
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                                )
+                            if (!anyPrinterConnected) {
+                                Surface(
+                                    color = SmavColors.Surface,
+                                    shape = RoundedCornerShape(8.dp),
+                                    border = BorderStroke(1.dp, SmavColors.Border),
+                                    modifier = Modifier.clickable { onNavigate(SmavRoute.PRINTER_SETTINGS) }
+                                ) {
+                                    Text(
+                                        text = "Printer not connected",
+                                        color = SmavColors.TextSecondary,
+                                        fontSize = 11.sp,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                    )
+                                }
                             }
                         }
                     }
