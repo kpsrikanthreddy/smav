@@ -342,11 +342,17 @@ export const SuperadminDashboard: React.FC<SuperadminDashboardProps> = ({
     const q = searchQuery.trim().toLowerCase();
     return outlets.filter((o) => {
       const matchesCat = selectedCategory === 'all' || o.category === selectedCategory;
+      // The central registry can contain historical or partially configured
+      // outlets. Never let a nullable database field crash the entire
+      // superadmin screen after the asynchronous outlet load completes.
+      const outletName = String(o.name || '').toLowerCase();
+      const outletCode = String(o.code || '').toLowerCase();
+      const outletAddress = String(o.address || '').toLowerCase();
       const matchesSearch =
         !q ||
-        o.name.toLowerCase().includes(q) ||
-        o.code.toLowerCase().includes(q) ||
-        o.address.toLowerCase().includes(q);
+        outletName.includes(q) ||
+        outletCode.includes(q) ||
+        outletAddress.includes(q);
       return matchesCat && matchesSearch;
     });
   }, [outlets, selectedCategory, searchQuery]);
