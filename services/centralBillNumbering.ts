@@ -608,6 +608,8 @@ export class CentralBillNumberCoordinator {
     createdBy?: string | null;
     deviceId?: string | null;
     billPrefix?: string;
+    /** YYYY-MM-DD business date; only privileged callers may request a past date. */
+    billingDate?: string | null;
     now?: Date;
   }): Promise<CentralBillReservationResult> {
     const cleanBranchCode = normalizeDynamicBranchCode(params.branchCode);
@@ -625,7 +627,15 @@ export class CentralBillNumberCoordinator {
         ? params.createdBy
         : null;
 
-    // 1. Primary path: atomic PostgreSQL RPC (Migration 022 dynamic signature with graceful fallback to 019/020 signature)
+    const todayIndia = getIndiaDateParts(params.now).dateIso;
+    const requestedBillingDate = String(params.billingDate || todayIndia).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedBillingDate) || requestedBillingDate > todayIndia) {
+      throw new Error('INVALID_BILLING_DATE: billingDate must be today or an earlier Asia/Kolkata date.');
+    }
+
+    // 1. Primary path: atomic PostgreSQL RPC. A past date deliberately fails
+    // closed until Migration 023 is applied; silently issuing a current-date
+    // bill number would break central numbering.
     if (params.db) {
       let rpcRes = await params.db.rpc('smav_reserve_central_bill_number', {
         p_outlet_id: params.outletId,
@@ -636,12 +646,16 @@ export class CentralBillNumberCoordinator {
         p_device_id: params.deviceId || null,
         p_bill_prefix: params.billPrefix || 'TGL',
         p_branch_id: cleanBranchId,
+        p_billing_date: requestedBillingDate,
       });
 
       if (
         rpcRes.error &&
         (rpcRes.error.code === 'PGRST202' || /could not find the function/i.test(String(rpcRes.error.message || '')))
       ) {
+        if (requestedBillingDate !== todayIndia) {
+          throw new Error('BACKDATED_BILLING_MIGRATION_REQUIRED: Apply SMAV Migration 023 before creating backdated bills.');
+        }
         rpcRes = await params.db.rpc('smav_reserve_central_bill_number', {
           p_outlet_id: params.outletId,
           p_branch_code: cleanBranchCode,
@@ -714,7 +728,7 @@ export class CentralBillNumberCoordinator {
       matchedMemBranch?.name || String(params.branchName || '').trim() || resolvedBranchCode;
     const resolvedPrefix = matchedMemBranch?.billPrefix || params.billPrefix || 'TGL';
 
-    const { dateIso, dateCompact } = getIndiaDateParts(params.now);
+    const { dateIso, dateCompact } = getIndiaDateParts(new Date(`${requestedBillingDate}T12:00:00+05:30`));
     const counterKey = `${params.outletId}:${resolvedBranchCode}:${dateCompact}`;
 
     let currentMax = this.memCounters.get(counterKey) || 0;

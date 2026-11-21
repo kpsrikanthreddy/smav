@@ -5632,6 +5632,25 @@ async function handleReserveCentralBillNumber(req: express.Request, res: express
       req.body?.sourceSystem || req.body?.source_system || auth.defaultSourceSystem
     );
     const deviceId = String(req.body?.deviceId || req.body?.device_id || '').trim() || null;
+    const todayIndia = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit'
+    }).format(new Date());
+    const billingDate = String(req.body?.billingDate ?? req.body?.billing_date ?? todayIndia).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(billingDate) || billingDate > todayIndia) {
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_BILLING_DATE',
+        message: 'Billing Date must be today or a past Asia/Kolkata date.'
+      });
+    }
+    const isBackdated = billingDate !== todayIndia;
+    if (isBackdated && !['superadmin', 'admin', 'owner'].includes(String(auth.userRole || '').toLowerCase())) {
+      return res.status(403).json({
+        success: false,
+        code: 'BACKDATED_BILLING_FORBIDDEN',
+        message: 'Only Owner, Admin, and Superadmin may reserve a bill number for a past date.'
+      });
+    }
 
     const reserved = await centralBillNumberCoordinator.reserveCentralBillNumber({
       db: serviceDb,
@@ -5643,7 +5662,8 @@ async function handleReserveCentralBillNumber(req: express.Request, res: express
       sourceSystem,
       createdBy: auth.userId,
       deviceId,
-      billPrefix: allowedBranch.billPrefix || 'TGL'
+      billPrefix: allowedBranch.billPrefix || 'TGL',
+      billingDate,
     });
 
     return res.json({

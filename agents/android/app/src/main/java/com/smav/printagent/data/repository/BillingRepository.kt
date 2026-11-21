@@ -782,7 +782,7 @@ class BillingRepository(
                 status = "QUEUED"
             )
         )
-        OfflineSyncWorker.scheduleImmediateSync(context)
+        OfflineSyncWorker.enqueueSync(context)
         Result.success(updatedEntity.copy(syncStatus = "PENDING"))
     }
 
@@ -843,7 +843,7 @@ class BillingRepository(
                 status = "QUEUED"
             )
         )
-        OfflineSyncWorker.scheduleImmediateSync(context)
+        OfflineSyncWorker.enqueueSync(context)
         Result.success("Bill ${existing.billNumber} voided offline; will sync safely when online.")
     }
 
@@ -900,7 +900,7 @@ class BillingRepository(
                 status = "QUEUED"
             )
         )
-        OfflineSyncWorker.scheduleImmediateSync(context)
+        OfflineSyncWorker.enqueueSync(context)
         Result.success("Order ${existing.orderNumber} voided offline; will sync safely when online.")
     }
 
