@@ -62,8 +62,12 @@ class SyncRepository(
 
             // 1. Sync Salon Bills strictly belonging to the active outlet (preserving already-printed central bill number)
             if (session.businessType == BusinessType.SALON) {
+                val cachedBranchIds = sessionManager.getPermittedBranches(activeOutletId).map { it.id }.toSet()
                 val pendingBills = database.salonBillDao().getUnsyncedBills().filter {
-                    it.branchId == activeOutletId || it.branchId == session.branchId
+                    it.businessId == activeOutletId ||
+                        it.branchId == activeOutletId ||
+                        (session.branchId.isNotBlank() && it.branchId == session.branchId) ||
+                        it.branchId in cachedBranchIds
                 }
                 if (pendingBills.isNotEmpty()) {
                     val billsJsonArray = JsonArray()
@@ -71,8 +75,7 @@ class SyncRepository(
                         val items = database.salonBillDao().getItemsForBill(bill.id)
                         if (items.isEmpty()) continue
 
-                        val resolvedBranchName = bill.branchName?.takeIf { it.isNotBlank() }
-                            ?: com.smav.printagent.model.BranchOption.displayNameForCode(bill.branchCode)
+                        val resolvedBranchName = bill.branchName?.takeIf { it.isNotBlank() } ?: bill.branchCode
 
                         val billObj = JsonObject().apply {
                             addProperty("id", bill.id)
@@ -81,6 +84,9 @@ class SyncRepository(
                             addProperty("centralBillNumber", bill.billNumber)
                             if (!bill.centralBillId.isNullOrBlank()) {
                                 addProperty("centralBillId", bill.centralBillId)
+                            }
+                            if (bill.branchId.isNotBlank() && bill.branchId != activeOutletId) {
+                                addProperty("branchId", bill.branchId)
                             }
                             addProperty("branchCode", bill.branchCode)
                             addProperty("branchName", resolvedBranchName)
@@ -145,7 +151,7 @@ class SyncRepository(
             // 2. Sync Restaurant Orders strictly belonging to the active outlet
             if (session.businessType == BusinessType.RESTAURANT) {
                 val pendingOrders = database.restaurantOrderDao().getUnsyncedOrders().filter {
-                    it.branchId == activeOutletId || it.branchId == session.branchId
+                    it.branchId == activeOutletId || (session.branchId.isNotBlank() && it.branchId == session.branchId)
                 }
                 if (pendingOrders.isNotEmpty()) {
                     val ordersJsonArray = JsonArray()

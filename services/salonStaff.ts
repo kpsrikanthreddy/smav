@@ -34,6 +34,7 @@ export interface OutletMatchTarget {
   code: string;
   name?: string;
   supabaseUrl?: string;
+  knownBranchIds?: string[];
 }
 
 export interface SalonStaffFetchResult {
@@ -70,7 +71,6 @@ export interface FetchGlossyLooksStaffOptions {
 }
 
 const DEFAULT_GLOSSY_LOOKS_STAFF_URL = 'https://www.glossylooks.in/api/staff';
-const GLOSSY_FLAGSHIP_BRANCH_ID = 'tgl-gachibowli-main';
 
 const ACTIVE_STATUS_TOKENS = new Set(['true', '1', 'active', 'enabled', 'available']);
 const INACTIVE_STATUS_TOKENS = new Set([
@@ -550,10 +550,14 @@ function getExpectedOutletTokens(outlet: OutletMatchTarget): Set<string> {
   if (id) tokens.add(id);
   if (code) tokens.add(code);
 
-  // Glossy Looks Gachibowli flagship uses branch_id "tgl-gachibowli-main" upstream
-  // alongside central_outlet_code "glossylooks" and central id "outlet_glossy_gach".
+  if (Array.isArray(outlet.knownBranchIds)) {
+    for (const branchId of outlet.knownBranchIds) {
+      const clean = String(branchId || '').trim().toLowerCase();
+      if (clean) tokens.add(clean);
+    }
+  }
+
   if (code === 'glossylooks' || id === 'outlet_glossy_gach') {
-    tokens.add(GLOSSY_FLAGSHIP_BRANCH_ID);
     tokens.add('the_glossy_looks');
     tokens.add('glossylooks');
     tokens.add('outlet_glossy_gach');
@@ -565,22 +569,28 @@ export function matchStaffOutlet(
   record: Record<string, unknown>,
   outlet: OutletMatchTarget
 ): { matched: boolean; outletId: string } {
-  const candidates = [
-    firstNonEmptyString(record.branchId, record.branch_id),
+  const outletCandidates = [
     firstNonEmptyString(record.outletId, record.outlet_id),
     firstNonEmptyString(record.outletCode, record.outlet_code),
     firstNonEmptyString(record.centralOutletCode, record.central_outlet_code),
   ].filter(Boolean);
+  const branchCandidate = firstNonEmptyString(record.branchId, record.branch_id);
 
-  if (candidates.length === 0) {
+  if (outletCandidates.length === 0 && !branchCandidate) {
     return { matched: true, outletId: outlet.id };
   }
 
   const expected = getExpectedOutletTokens(outlet);
-  for (const candidate of candidates) {
+  for (const candidate of [...outletCandidates, ...(branchCandidate ? [branchCandidate] : [])]) {
     if (expected.has(candidate.toLowerCase())) {
       return { matched: true, outletId: outlet.id || candidate };
     }
+  }
+
+  // If the upstream staff API is already scoped to this GlossyLooks outlet and returned
+  // a branch_id without a conflicting outlet identifier, accept any dynamic branch ID for this outlet.
+  if (outletCandidates.length === 0 && branchCandidate && isGlossyLooksOutlet(outlet)) {
+    return { matched: true, outletId: outlet.id };
   }
 
   return { matched: false, outletId: '' };

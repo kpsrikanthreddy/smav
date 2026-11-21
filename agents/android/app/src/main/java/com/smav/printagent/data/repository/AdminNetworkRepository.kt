@@ -45,18 +45,18 @@ class AdminNetworkRepository(
         val assignedList = parseAssignedOutlets(raw.getAsJsonArray("assignedOutlets"))
 
         val outletId = activeOutlet?.optString("id")
-            ?.ifBlank { raw.optString("business_id") }
+            ?.ifBlank { raw.optString("outlet_id", "business_id") }
             ?.ifBlank { "central_smav" }
-            ?: raw.optString("business_id").ifBlank { "central_smav" }
+            ?: raw.optString("outlet_id", "business_id").ifBlank { "central_smav" }
 
         val outletCode = activeOutlet?.optString("code")
-            ?.ifBlank { raw.optString("branch_code") }
-            ?: raw.optString("branch_code")
+            ?.ifBlank { raw.optString("outlet_code", "outletCode") }
+            ?: raw.optString("outlet_code", "outletCode")
 
         val outletName = activeOutlet?.optString("name")
-            ?.ifBlank { raw.optString("business_name") }
+            ?.ifBlank { raw.optString("outlet_name", "business_name") }
             ?.ifBlank { "SMAV Enterprise Central Headquarters" }
-            ?: raw.optString("business_name").ifBlank { "SMAV Enterprise Central Headquarters" }
+            ?: raw.optString("outlet_name", "business_name").ifBlank { "SMAV Enterprise Central Headquarters" }
 
         val rawCat = activeOutlet?.optString("category")
             ?.ifBlank { raw.optString("business_type") }
@@ -75,9 +75,10 @@ class AdminNetworkRepository(
             businessId = outletId,
             businessType = businessType,
             businessName = outletName,
-            branchId = outletId,
+            // Never conflate outlet_id with physical branch_id at login; physical branches load dynamically via /api/pos/branches
+            branchId = "",
             branchCode = outletCode,
-            branchName = outletName,
+            branchName = "",
             role = role,
             permissions = permissions,
             deviceId = sessionManager.deviceId,
@@ -99,9 +100,10 @@ class AdminNetworkRepository(
                 businessId = id,
                 businessName = name.ifBlank { "Outlet" },
                 businessType = obj.optString("outletCategory", "outlet_category", "business_type", "category"),
-                branchId = obj.optString("branch_id", "branchId").ifBlank { id },
-                branchCode = obj.optString("outletCode", "outlet_code", "branch_code", "code"),
-                branchName = obj.optString("branch_name", "branchName").ifBlank { name },
+                // Outlet selector carries outlet identity only; never default branchId to outletId
+                branchId = "",
+                branchCode = obj.optString("outletCode", "outlet_code", "code"),
+                branchName = "",
                 role = obj.optString("role").ifBlank { "staff" },
                 displayRole = obj.optString("displayRole")
             )

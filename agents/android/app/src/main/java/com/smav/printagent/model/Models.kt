@@ -132,19 +132,14 @@ data class Outlet(
 
 data class BranchOption(
     val id: String,
+    val name: String = "",
     val branchCode: String,
-    val branchName: String,
-    val billPrefix: String = "TGL"
+    val branchName: String = "",
+    val billPrefix: String = "TGL",
+    val isActive: Boolean = true
 ) {
-    companion object {
-        fun displayNameForCode(code: String?): String {
-            return when ((code ?: "").trim().uppercase(Locale.ENGLISH)) {
-                "GACHI" -> "Gachibowli"
-                "KONDA" -> "Kondapur"
-                else -> (code ?: "").trim()
-            }
-        }
-    }
+    val displayName: String
+        get() = name.ifBlank { branchName }.ifBlank { branchCode }
 }
 
 data class SalonService(
@@ -285,7 +280,7 @@ data class AvailableBusinessOption(
     @SerializedName("displayRole") val displayRole: String = ""
 ) {
     val normalizedBusinessType: BusinessType get() = BusinessType.fromRawCategory(businessType)
-    val resolvedBranchId: String get() = branchId.ifBlank { businessId }
+    val resolvedBranchId: String get() = branchId
     val resolvedBranchName: String get() = branchName.ifBlank { businessName }
 }
 

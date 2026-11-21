@@ -81,15 +81,14 @@ class BillingRepository(
         if (cartItems.isEmpty()) {
             return@withContext Result.failure(IllegalArgumentException("Cart is empty"))
         }
+        val normalizedBranchId = selectedBranch?.id?.trim().orEmpty()
         val normalizedBranchCode = selectedBranch?.branchCode?.trim()?.uppercase(Locale.ENGLISH).orEmpty()
-        if (selectedBranch == null || normalizedBranchCode !in setOf("GACHI", "KONDA")) {
+        if (selectedBranch == null || !selectedBranch.isActive || normalizedBranchId.isBlank() || normalizedBranchCode.isBlank()) {
             return@withContext Result.failure(
                 IllegalArgumentException("Branch selection is mandatory before generating a bill.")
             )
         }
-        val normalizedBranchName = selectedBranch.branchName.ifBlank {
-            BranchOption.displayNameForCode(normalizedBranchCode)
-        }
+        val normalizedBranchName = selectedBranch.displayName
 
         val normalizedCustomerName = customerName?.trim().orEmpty()
         val normalizedCustomerPhone = customerPhone?.trim().orEmpty()
@@ -122,6 +121,7 @@ class BillingRepository(
             val bearer = SmavApiClient.bearer(session.token)
             val req = JsonObject().apply {
                 addProperty("outletId", branch.id)
+                addProperty("branchId", normalizedBranchId)
                 addProperty("branchCode", normalizedBranchCode)
                 addProperty("branchName", normalizedBranchName)
                 addProperty("sourceSystem", "smav_android_agent")
@@ -217,8 +217,8 @@ class BillingRepository(
         val billEntity = SalonBillEntity(
             id = billId,
             billNumber = finalBillNumber,
-            businessId = "the_glossy_looks",
-            branchId = branch.id,
+            businessId = branch.id,
+            branchId = normalizedBranchId,
             branchCode = normalizedBranchCode,
             branchName = normalizedBranchName,
             centralBillId = centralBillId,
@@ -350,7 +350,7 @@ class BillingRepository(
         }
 
         val deviceId = sessionManager.deviceId
-        val branchCode = branch.code.ifBlank { "GACH" }
+        val branchCode = branch.code.ifBlank { "MAIN" }
 
         val todayPrefix = "%$branchCode-${BillIdGenerator.getTodayDateString()}%"
         val existingCount = database.restaurantOrderDao().countOrdersMatchingPrefix(branchCode, todayPrefix)

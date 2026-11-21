@@ -232,13 +232,18 @@ private fun SalonPosScreen(
     val services = bundle?.salonServices.orEmpty()
     val stylists = bundle?.stylists.orEmpty()
     val permittedBranches = bundle?.branches.orEmpty()
+    val isBillingBlocked = bundle != null && !loading && (bundle.billingBlocked || permittedBranches.isEmpty())
+    val branchAuthMessage = bundle?.branchAuthorizationMessage
+        ?: "No active branch is assigned to your account. Contact an administrator before billing."
     val offlinePoolCounts = bundle?.offlinePreallocatedCounts.orEmpty()
 
-    // Preselect branch ONLY when authenticated user has exactly 1 assigned branch; otherwise require manual selection.
-    LaunchedEffect(permittedBranches) {
+    // Preselect branch ONLY when authenticated user has exactly 1 active assigned branch; otherwise require manual selection.
+    LaunchedEffect(permittedBranches, isBillingBlocked) {
         selectedBranch = when {
+            isBillingBlocked -> null
             permittedBranches.size == 1 -> permittedBranches.first()
-            selectedBranch != null && permittedBranches.any { it.branchCode == selectedBranch?.branchCode } -> selectedBranch
+            selectedBranch != null && permittedBranches.any { it.id == selectedBranch?.id } ->
+                permittedBranches.first { it.id == selectedBranch?.id }
             else -> null
         }
     }
@@ -328,15 +333,19 @@ private fun SalonPosScreen(
                 item {
                     val selectedOfflineCount = selectedBranch?.let { offlinePoolCounts[it.branchCode] ?: 0 }
                     val offlineNote = if (selectedOfflineCount != null) {
-                        "Using offline cached catalog (${services.size} services). Preallocated numbers for ${selectedBranch?.branchName}: $selectedOfflineCount."
+                        "Using offline cached catalog (${services.size} services). Preallocated numbers for ${selectedBranch?.displayName}: $selectedOfflineCount."
                     } else {
-                        "Using offline cached catalog (${services.size} services). Select a branch to check preallocated offline bill numbers."
+                        "Using offline cached catalog (${services.size} services). Select an active branch to check preallocated offline bill numbers."
                     }
                     SmavWarningBannerCard(offlineNote)
                 }
             }
 
-            if (permittedBranches.isNotEmpty()) {
+            if (isBillingBlocked) {
+                item {
+                    ErrorBannerCard(branchAuthMessage, onRetry = onRefresh)
+                }
+            } else if (permittedBranches.isNotEmpty()) {
                 item {
                     SmavCard {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -353,7 +362,7 @@ private fun SalonPosScreen(
                                 )
                                 selectedBranch?.let { br ->
                                     Text(
-                                        text = "${br.branchName} (${br.branchCode})",
+                                        text = "${br.displayName} (${br.branchCode})",
                                         color = SmavColors.StepperGreen,
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.SemiBold
@@ -363,7 +372,7 @@ private fun SalonPosScreen(
                             FilterFlowRow(
                                 items = permittedBranches,
                                 selected = selectedBranch,
-                                labelOf = { "${it.branchName} (${it.branchCode})" },
+                                labelOf = { "${it.displayName} (${it.branchCode})" },
                                 onSelect = { chosen ->
                                     if (permittedBranches.size > 1 || selectedBranch == null) {
                                         selectedBranch = chosen
@@ -374,7 +383,7 @@ private fun SalonPosScreen(
                             )
                             if (selectedBranch == null) {
                                 Text(
-                                    text = "Select Gachibowli or Kondapur to enable bill generation.",
+                                    text = "Select an active branch to enable bill generation.",
                                     color = SmavColors.WarningText,
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Medium
@@ -475,10 +484,16 @@ private fun SalonPosScreen(
         }
 
         SmavCheckoutBottomBar(
-            countLabel = "${cart.sumOf { it.quantity }} service(s)" + (selectedBranch?.let { " • ${it.branchName}" } ?: " • Select Branch"),
+            countLabel = "${cart.sumOf { it.quantity }} service(s)" + (
+                when {
+                    isBillingBlocked -> " • No Assigned Branch"
+                    selectedBranch != null -> " • ${selectedBranch!!.displayName}"
+                    else -> " • Select Branch"
+                }
+            ),
             totalAmount = grandTotal,
             ctaText = "Review & Bill",
-            ctaEnabled = cart.isNotEmpty() && selectedBranch != null,
+            ctaEnabled = cart.isNotEmpty() && !isBillingBlocked && selectedBranch != null,
             ctaIcon = Icons.Default.ShoppingCartCheckout,
             onCtaClick = { showCartSheet = true }
         )
@@ -568,11 +583,13 @@ private fun SalonPosScreen(
             title = "Finalize Salon Bill",
             onDismiss = { showCartSheet = false },
             confirmText = "Generate & Print Bill",
-            confirmEnabled = effectiveCart.isNotEmpty() && selectedBranch != null && !busyBilling && stylists.isNotEmpty() && effectiveCart.none { it.stylist == null || it.stylist.id.isBlank() },
+            confirmEnabled = effectiveCart.isNotEmpty() && !isBillingBlocked && selectedBranch != null && !busyBilling && stylists.isNotEmpty() && effectiveCart.none { it.stylist == null || it.stylist.id.isBlank() },
             isSaving = busyBilling,
             onConfirm = {
                 if (!busyBilling) {
-                    if (selectedBranch == null) {
+                    if (isBillingBlocked) {
+                        billingError = branchAuthMessage
+                    } else if (selectedBranch == null) {
                         billingError = "Branch selection is mandatory before generating a bill."
                     } else if (customerName.isBlank()) {
                         billingError = "Customer name is required."
@@ -584,7 +601,7 @@ private fun SalonPosScreen(
                         busyBilling = true
                         billingError = null
                         val activeBranch = selectedBranch!!
-                        val fingerprint = "${branch.id}|${activeBranch.branchCode}|${customerName.trim()}|${customerPhone.trim()}|$paymentMode|" +
+                        val fingerprint = "${branch.id}|${activeBranch.id}|${activeBranch.branchCode}|${customerName.trim()}|${customerPhone.trim()}|$paymentMode|" +
                             effectiveCart.joinToString(",") { "${it.service.id}:${it.quantity}:${it.stylist?.id}:${it.discountPercent}" }
                         if (checkoutAttemptFingerprint != fingerprint) {
                             checkoutAttemptFingerprint = fingerprint
@@ -615,8 +632,8 @@ private fun SalonPosScreen(
 
                                 val printRes = billingRepo.reprintSalonBill(bill.id, branch, session.userName)
                                 printFeedback = printRes.fold(
-                                    { "Bill ${bill.billNumber} (${activeBranch.branchName}) saved and printed via Bluetooth ESC/POS." },
-                                    { err -> "Bill ${bill.billNumber} (${activeBranch.branchName}) saved, but Bluetooth print failed (${err.message ?: "Printer unavailable"}). Tap Print Copy after connecting printer." }
+                                    { "Bill ${bill.billNumber} (${activeBranch.displayName}) saved and printed via Bluetooth ESC/POS." },
+                                    { err -> "Bill ${bill.billNumber} (${activeBranch.displayName}) saved, but Bluetooth print failed (${err.message ?: "Printer unavailable"}). Tap Print Copy after connecting printer." }
                                 )
                             }.onFailure { err ->
                                 billingError = err.message ?: "Failed to generate bill."
@@ -627,12 +644,14 @@ private fun SalonPosScreen(
                 }
             }
         ) {
-            if (permittedBranches.isNotEmpty()) {
+            if (isBillingBlocked) {
+                ErrorBannerCard(branchAuthMessage)
+            } else if (permittedBranches.isNotEmpty()) {
                 Text("Branch *", color = SmavColors.TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                 FilterFlowRow(
                     items = permittedBranches,
                     selected = selectedBranch,
-                    labelOf = { "${it.branchName} (${it.branchCode})" },
+                    labelOf = { "${it.displayName} (${it.branchCode})" },
                     onSelect = { chosen ->
                         if (permittedBranches.size > 1 || selectedBranch == null) {
                             selectedBranch = chosen
@@ -725,8 +744,7 @@ private fun SalonPosScreen(
             containerColor = SmavColors.Surface,
             title = { Text("Bill Generated", color = SmavColors.StepperGreen, fontWeight = FontWeight.Bold) },
             text = {
-                val resolvedBranchName = bill.branchName?.takeIf { it.isNotBlank() }
-                    ?: BranchOption.displayNameForCode(bill.branchCode)
+                val resolvedBranchName = bill.branchName?.takeIf { it.isNotBlank() } ?: bill.branchCode
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     if (resolvedBranchName.isNotBlank()) {
                         Text("Branch: $resolvedBranchName (${bill.branchCode})", color = SmavColors.TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
@@ -1362,7 +1380,7 @@ fun RecentBillsScreen(
     val startOfTodayMs = remember(session.businessId) { BillIdGenerator.getStartOfTodayMillis() }
 
     val salonBills by database.salonBillDao()
-        .getTodayActiveBillsForBranch(session.businessId, startOfTodayMs)
+        .getTodayActiveBillsForOutlet(session.businessId, startOfTodayMs)
         .collectAsState(initial = emptyList())
     val restOrders by database.restaurantOrderDao()
         .getTodayActiveOrdersForBranch(session.businessId, startOfTodayMs)
@@ -1491,8 +1509,7 @@ fun RecentBillsScreen(
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(bill.billNumber, color = SmavColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                                    val resolvedBranch = bill.branchName?.takeIf { it.isNotBlank() }
-                                        ?: BranchOption.displayNameForCode(bill.branchCode)
+                                    val resolvedBranch = bill.branchName?.takeIf { it.isNotBlank() } ?: bill.branchCode
                                     if (resolvedBranch.isNotBlank()) {
                                         Text("Branch: $resolvedBranch", color = SmavColors.TextSecondary, fontSize = 11.sp, fontWeight = FontWeight.Medium)
                                     }

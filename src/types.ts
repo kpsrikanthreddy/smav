@@ -311,12 +311,17 @@ export interface TransactionLedgerItem {
 
 export interface OutletBranchOption {
   id: string;
+  name?: string;
   outletId?: string;
   outletCode?: string;
   branchCode: string;
   branchName: string;
+  externalBranchId?: string | null;
   billPrefix: string;
   isActive?: boolean;
+  address?: string | null;
+  gstin?: string | null;
+  whatsappPhone?: string | null;
 }
 
 export interface BillNumberReconciliationReport {

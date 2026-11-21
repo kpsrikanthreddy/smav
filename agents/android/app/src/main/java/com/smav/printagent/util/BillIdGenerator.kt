@@ -7,10 +7,8 @@ import java.util.Locale
 import java.util.TimeZone
 
 /**
- * Deterministic offline unique bill ID generator.
- * Format examples:
- * - The Glossy Looks Salon: TGL-GACHI-20261106-0001
- * - MOZZ / Starters4U:       MOZZ-GACH-20261106-0001
+ * Deterministic bill ID utilities.
+ * Central salon bill numbers follow: {PREFIX}-{BRANCH_CODE}-{YYYYMMDD}-{SEQUENCE}
  */
 object BillIdGenerator {
 
@@ -59,17 +57,11 @@ object BillIdGenerator {
         return sdf.format(Date(timestamp))
     }
 
-    fun salonBranchCode(code: String, name: String, address: String): String {
-        val source = "$code $name $address".trim().lowercase(Locale.ENGLISH)
-        return when {
-            "kondapur" in source || Regex("(^|[^a-z])konda?([^a-z]|$)").containsMatchIn(source) -> "KONDA"
-            "gachibowli" in source || Regex("(^|[^a-z])gachi?([^a-z]|$)").containsMatchIn(source) -> "GACHI"
-            else -> code.trim()
-                .uppercase(Locale.ENGLISH)
-                .replace(Regex("[^A-Z0-9]"), "")
-                .take(5)
-                .ifBlank { "GACHI" }
-        }
+    fun salonBranchCode(code: String): String {
+        return code.trim()
+            .uppercase(Locale.ENGLISH)
+            .replace(Regex("[^A-Z0-9]"), "")
+            .take(12)
     }
 
     /**
@@ -103,7 +95,7 @@ object BillIdGenerator {
      * Validates that a bill number conforms to the standard pattern.
      */
     fun isValidBillNumber(billNumber: String): Boolean {
-        val regex = Regex("^(TGL|MOZZ|RTL)-[A-Z0-9]{2,8}-\\d{8}-\\d{4,}$")
+        val regex = Regex("^[A-Z0-9]{2,8}-[A-Z0-9]{2,12}-\\d{8}-\\d{4,}$")
         return regex.matches(billNumber)
     }
 }

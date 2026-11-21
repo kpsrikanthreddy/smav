@@ -433,8 +433,7 @@ export function normalizeLedgerBillRow(
   const centralBillNumber = row.central_bill_number || row.centralBillNumber || null;
   const branchCode = String(row.branch_code || row.branchCode || details.branch_code || details.branchCode || '').trim().toUpperCase() || null;
   const branchName =
-    String(row.branch_name || row.branchName || details.branch_name || details.branchName || '').trim() ||
-    (branchCode === 'GACHI' ? 'Gachibowli' : branchCode === 'KONDA' ? 'Kondapur' : null);
+    String(row.branch_name || row.branchName || details.branch_name || details.branchName || '').trim() || null;
 
   return {
     id: String(row.id || rawBillNumber || ''),
@@ -447,7 +446,7 @@ export function normalizeLedgerBillRow(
     branchCode,
     branchName,
     sourceSystem: row.source_system || row.sourceSystem || null,
-    isLegacyBill: !centralBillNumber && !/^TGL-(GACHI|KONDA)-\d{8}-\d{4,}$/i.test(rawBillNumber),
+    isLegacyBill: !centralBillNumber && !/^[A-Z0-9]{2,8}-[A-Z0-9]{2,12}-\d{8}-\d{4,}$/i.test(rawBillNumber),
     idempotencyKey: row.idempotency_key || row.idempotencyKey || undefined,
     customerName: rawCustomerName || 'Walk-in Guest',
     customerPhone: rawCustomerPhone,

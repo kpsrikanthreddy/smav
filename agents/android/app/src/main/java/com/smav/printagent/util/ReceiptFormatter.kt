@@ -73,7 +73,7 @@ object ReceiptFormatter {
 
         // Metadata
         val resolvedBranchName = bill.branchName?.takeIf { it.isNotBlank() }
-            ?: com.smav.printagent.model.BranchOption.displayNameForCode(bill.branchCode)
+            ?: bill.branchCode.takeIf { it.isNotBlank() }.orEmpty()
         b.alignLeft()
         if (resolvedBranchName.isNotBlank()) {
             b.setBold(true)

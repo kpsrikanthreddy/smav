@@ -1,55 +1,76 @@
-# GlossyLooks Admin Portal — Central Bill Numbering & Mandatory Branch Selection Contract
+# GlossyLooks Admin Portal — Central Bill Numbering & Dynamic Branch Architecture Contract
 
-This specification defines the exact contract between the **GlossyLooks Admin Portal** (backend + POS UI) and the **SMAV Central Billing Backend** so that **GlossyLooks Admin Portal POS**, **SMAV Web Counter POS**, and **SMAV Android Print Agent** share one atomic, immutable bill-number sequence per `(outlet, branch, Asia/Kolkata date)`.
+This specification defines the contract between the **GlossyLooks Admin Portal** (backend + POS UI) and the **SMAV Central Billing Backend** so that **GlossyLooks Admin Portal POS**, **SMAV Web Counter POS**, and **SMAV Android Print Agent** share:
+- One canonical, centrally managed branch master (`public.smav_branches`) with **zero hard-coded branch IDs, names, or codes** in runtime application code.
+- One atomic, immutable bill-number sequence per `(outlet, branch, Asia/Kolkata date)`.
 
 ---
 
-## 1. Canonical Branch Codes & Bill Number Format
+## 1. Canonical Branches & Dynamic Bill Number Format
 
-| Branch Display Name | Canonical `branchCode` | `externalBranchId` | Bill Prefix |
-| --- | --- | --- | --- |
-| **Gachibowli** | `GACHI` | `tgl-gachibowli-main` | `TGL` |
-| **Kondapur** | `KONDA` | `tgl-kondapur-main` | `TGL` |
+Active branches are read dynamically from `public.smav_branches`. Migration `022_branch_standardization_and_dynamic_references.sql` standardizes the initial two active branches for The Glossy Looks and safely migrates legacy references (`tgl-gachibowli-main` → `tgl-gachi`, `brn-1793346038689` → `tgl-konda`, plus any duplicate Gachibowli/Kondapur rows):
 
-**Format:**
+| Canonical `id` | Display `name` / `branchName` | `branchCode` | `billPrefix` | `isActive` |
+| --- | --- | --- | --- | --- |
+| `tgl-gachi` | **Gachibowli** | `GACHI` | `TGL` | `true` |
+| `tgl-konda` | **Kondapur** | `KONDA` | `TGL` | `true` |
+
+### Zero-Code Future Branch Onboarding
+To launch a new branch (for example `id: "tgl-madhapur"`, `name: "Madhapur"`, `branch_code: "MADHA"`, `bill_prefix: "TGL"`, `is_active: true`):
+1. Insert a single active row into `public.smav_branches` for the outlet.
+2. Assign staff in `public.smav_user_branch_assignments` (if staff use explicit per-branch scoping).
+3. No code changes, enums, redeploys, or app releases are required — Web POS, Android Print Agent, GlossyLooks Admin Portal, central bill numbering, offline preallocation, and finalized-sale webhooks immediately support the new branch.
+
+### Bill Number Format
 ```text
-TGL-{BRANCH_CODE}-{YYYYMMDD}-{4_DIGIT_SEQUENCE}
+{BILL_PREFIX}-{BRANCH_CODE}-{YYYYMMDD}-{4_DIGIT_SEQUENCE}
 ```
 Examples:
 - `TGL-GACHI-20261120-0001`
 - `TGL-KONDA-20261120-0001`
-- `TGL-GACHI-20261120-0002`
+- `TGL-MADHA-20261120-0001` *(future branch, zero code changes)*
 
 **Rules:**
 1. Date (`YYYYMMDD`) is always computed server-side in **India Standard Time (`Asia/Kolkata`)**.
 2. Sequence resets to `0001` per `(outlet_id, branch_code, billing_date)` using an atomic PostgreSQL transaction + advisory lock (`smav_reserve_central_bill_number`).
-3. **Never** generate final bill numbers in GlossyLooks frontend code, browser `localStorage`, or GlossyLooks Supabase triggers/sequences.
+3. **Never** generate final bill numbers in GlossyLooks frontend code, Android local code, browser `localStorage`, or brand database triggers/sequences.
 4. Once assigned, a `central_bill_number` is **immutable** (`trg_smav_central_bill_number_immutable`) and must be stored identically across SMAV, GlossyLooks `orders` / `payments`, thermal receipts, and WhatsApp receipt/feedback payloads.
-5. Historical bill numbers created before cutover are preserved untouched as legacy records.
+5. Historical finalized bill numbers are **never modified or renumbered** during migrations; only their canonical `branch_id` / `branch_code` / `branch_name` references are standardized.
 
 ---
 
 ## 2. Authentication (Server-to-Server from GlossyLooks Backend)
 
-Call SMAV Central API from the GlossyLooks backend (never expose integration secrets in browser code). Any one of the following authentication methods is accepted:
+Call SMAV Central API strictly from the **GlossyLooks Admin backend** (`GlossyLooks Admin backend → SMAV Billing & Sync Gateway → SMAV Print Agent`). The browser must **never** call SMAV using secrets.
 
-1. **Integration Key Header** *(recommended for server-to-server)*:
-   - `X-Integration-Key: <GLOSSYLOOKS_INTEGRATION_KEY>` (or `X-SMAV-Gateway-Secret`)
-2. **HMAC-SHA256 Signed Request** *(optional defense-in-depth; valid within ±5 minutes)*:
-   - `X-SMAV-Timestamp: <unix_ms_or_seconds>`
-   - `X-SMAV-Signature: <hex(HMAC_SHA256(GLOSSYLOOKS_INTEGRATION_KEY, "${timestamp}.${rawJsonBody}"))>`
-3. **SMAV User Bearer Token** *(when calling directly with a SMAV session)*:
-   - `Authorization: Bearer <smav_access_token>`
+For all three GlossyLooks integration endpoints:
+- `GET /api/integrations/glossylooks/branches`
+- `POST /api/integrations/glossylooks/bill-numbers/reserve`
+- `POST /api/integrations/glossylooks/bill-numbers/finalize`
+
+**BOTH** authentication factors are strictly required on every request (SMAV user Bearer tokens are **never** required for these server-to-server routes):
+
+1. **Integration Key Header** (validated strictly against `GLOSSYLOOKS_INTEGRATION_KEY`):
+   - `X-Integration-Key: <GLOSSYLOOKS_INTEGRATION_KEY>`
+2. **HMAC-SHA256 Signature Headers** (validated separately using `SMAV_DISPATCH_SECRET`, ±5 minute window):
+   - `X-SMAV-Timestamp: <unix_seconds_or_ms>`
+   - `X-SMAV-Signature: <hex(HMAC_SHA256(SMAV_DISPATCH_SECRET, "${timestamp}.${rawBody}"))>`
+   - For `GET` requests with no request body, `rawBody` **MUST** be the empty string `""` (NOT `"{}"`).
+
+*(Generic SMAV Web POS / Android Print Agent endpoints `/api/pos/branches`, `/api/central/bill-numbers/reserve`, `/api/central/bill-numbers/finalize`, and `/api/central/bill-numbers/allocate-range` continue to authenticate via `Authorization: Bearer <smav_access_token>`.)*
 
 ---
 
 ## 3. Endpoints
 
-### 3.1 List Permitted Branches
+### 3.1 List Active Permitted Branches
 `GET /api/integrations/glossylooks/branches`  
 *(Generic SMAV alias: `GET /api/pos/branches`)*
 
-Returns active branches for the outlet and whether auto-selection is permitted.
+Returns only **active** (`is_active = true`), deduplicated branches from `public.smav_branches` in normalized shape `{ id, name, branchCode, branchName, isActive, ... }`, along with dynamic selection rules:
+- **1 active permitted branch** → `autoSelectedBranch` populated, `requiresManualBranchSelection: false`, `billingBlocked: false`
+- **2+ active permitted branches** → `autoSelectedBranch: null`, `requiresManualBranchSelection: true`, `billingBlocked: false`
+- **0 active permitted branches** → `branches: []`, `autoSelectedBranch: null`, `billingBlocked: true`, `authorizationMessage: "..."`
 
 **Response (`200 OK`):**
 ```json
@@ -59,26 +80,30 @@ Returns active branches for the outlet and whether auto-selection is permitted.
   "outletCode": "glossylooks",
   "branches": [
     {
-      "id": "uuid",
-      "outletId": "39a76a12-...",
+      "id": "tgl-gachi",
+      "name": "Gachibowli",
       "branchCode": "GACHI",
       "branchName": "Gachibowli",
-      "externalBranchId": "tgl-gachibowli-main",
-      "billPrefix": "TGL",
-      "isActive": true
+      "isActive": true,
+      "outletId": "39a76a12-...",
+      "externalBranchId": "tgl-gachi",
+      "billPrefix": "TGL"
     },
     {
-      "id": "uuid",
-      "outletId": "39a76a12-...",
+      "id": "tgl-konda",
+      "name": "Kondapur",
       "branchCode": "KONDA",
       "branchName": "Kondapur",
-      "externalBranchId": "tgl-kondapur-main",
-      "billPrefix": "TGL",
-      "isActive": true
+      "isActive": true,
+      "outletId": "39a76a12-...",
+      "externalBranchId": "tgl-konda",
+      "billPrefix": "TGL"
     }
   ],
   "autoSelectedBranch": null,
-  "requiresManualBranchSelection": true
+  "requiresManualBranchSelection": true,
+  "billingBlocked": false,
+  "authorizationMessage": null
 }
 ```
 
@@ -86,22 +111,23 @@ Returns active branches for the outlet and whether auto-selection is permitted.
 `POST /api/integrations/glossylooks/bill-numbers/reserve`  
 *(Generic SMAV aliases: `POST /api/central/bill-numbers/reserve`, `POST /api/pos/salon/next-bill-number`)*
 
-Call this immediately before saving/printing a GlossyLooks POS bill. Reuse the **exact same `idempotencyKey`** on network retries for the same checkout attempt so SMAV returns the previously assigned bill number instead of allocating a second one.
+Call this immediately before saving/printing a POS bill. Reuse the **exact same `idempotencyKey`** on network retries for the same checkout attempt so SMAV returns the previously assigned bill number instead of allocating a second one.
 
 **Request Body:**
 ```json
 {
+  "branchId": "tgl-gachi",
   "branchCode": "GACHI",
   "idempotencyKey": "GLPOS_20261120_8f4c1a2e-9b7d-4e3f-9d1a-3b6c5f2e1a90",
   "sourceSystem": "glossylooks_admin_portal",
   "actorUserId": "5d29c8a0-...",
   "actorRole": "owner",
-  "assignedBranchCodes": ["GACHI", "KONDA"]
+  "assignedBranchIds": ["tgl-gachi", "tgl-konda"]
 }
 ```
-- `branchCode` *(required)*: `GACHI`, `KONDA`, `Gachibowli`, or `Kondapur` (normalized server-side; blank or unknown values return `400 BRANCH_REQUIRED`).
+- `branchId` / `branchCode` *(at least one required)*: Resolved dynamically against active rows in `public.smav_branches`. Blank, unknown, or inactive branches return `400 BRANCH_REQUIRED`.
 - `idempotencyKey` *(required for safe retries)*: Deterministic per checkout attempt (also accepted via `X-Idempotency-Key` header).
-- `assignedBranchCodes` *(optional)*: Staff's assigned branch codes in GlossyLooks; if provided and `branchCode` is not included, SMAV returns `403 BRANCH_NOT_PERMITTED`.
+- `assignedBranchIds` / `assignedBranchCodes` *(optional)*: Staff's assigned branches; if provided and empty or excluding the selected branch, SMAV returns `403 NO_ASSIGNED_BRANCH` or `403 BRANCH_NOT_PERMITTED`.
 
 **Response (`200 OK`):**
 ```json
@@ -111,7 +137,7 @@ Call this immediately before saving/printing a GlossyLooks POS bill. Reuse the *
   "centralBillNumber": "TGL-GACHI-20261120-0001",
   "billNumber": "TGL-GACHI-20261120-0001",
   "outletId": "39a76a12-...",
-  "branchId": "a1b2c3d4-...",
+  "branchId": "tgl-gachi",
   "branchCode": "GACHI",
   "branchName": "Gachibowli",
   "billingDate": "2026-11-20",
@@ -150,7 +176,7 @@ Call immediately after GlossyLooks persists its `orders` / `payments` record so 
   "centralBillNumber": "TGL-GACHI-20261120-0001",
   "billNumber": "TGL-GACHI-20261120-0001",
   "outletId": "39a76a12-...",
-  "branchId": "a1b2c3d4-...",
+  "branchId": "tgl-gachi",
   "branchCode": "GACHI",
   "branchName": "Gachibowli",
   "status": "FINALIZED",
@@ -162,38 +188,47 @@ Call immediately after GlossyLooks persists its `orders` / `payments` record so 
 ### 3.4 Reconciliation Report (Admin / Superadmin)
 `GET /api/admin/bill-numbers/reconciliation` *(requires SMAV Admin/Superadmin Bearer token)*
 
-Returns duplicate detections, unlinked `TGL-*` bills, mismatched numbers, unused reserved/preallocated counts, branch breakdown, and preserved `legacyHistoricalBillsCount`.
+Returns duplicate detections, unlinked central bills, mismatched numbers, unused reserved/preallocated counts, dynamic branch breakdown, and preserved `legacyHistoricalBillsCount`.
 
 ### 3.5 Standard Error Codes
 | HTTP Status | `code` | Meaning |
 | --- | --- | --- |
-| `400` | `BRANCH_REQUIRED` | Missing or invalid branch (`GACHI` / `KONDA` required) |
+| `400` | `BRANCH_REQUIRED` | Missing, inactive, or unknown active branch in `public.smav_branches` |
 | `400` | `CENTRAL_BILL_NUMBER_REQUIRED` | Missing `centralBillNumber` during finalize/sync |
 | `401` | `UNAUTHORIZED` | Missing/invalid Bearer token, `X-Integration-Key`, or HMAC signature |
-| `403` | `BRANCH_NOT_PERMITTED` | User is not allowed to bill for the selected branch |
+| `403` | `NO_ASSIGNED_BRANCH` | Authenticated user has 0 active assigned branches; billing is blocked |
+| `403` | `BRANCH_NOT_PERMITTED` | User is not allowed to bill for the selected active branch |
 | `404` | `OUTLET_NOT_FOUND` | Unknown outlet code |
 | `409` | `DUPLICATE_CENTRAL_BILL_NUMBER` / `CENTRAL_BILL_VOIDED` | Duplicate bill number or attempt to finalize a voided number |
 
 ---
 
-## 4. Required GlossyLooks Admin Portal POS Changes
+## 4. Required GlossyLooks Admin Portal POS Alignment
 
-1. **Mandatory Branch Selector**:
-   - Add a required **Branch** selector (`Gachibowli (GACHI)`, `Kondapur (KONDA)`) to the GlossyLooks Admin Portal POS checkout screen.
-   - Preselect a branch **only** when the authenticated user has **exactly 1** assigned branch. If the user has 2+ permitted branches (or is Owner/Admin), start unselected and require explicit selection.
-   - Disable **Generate Bill** / **Print Receipt** until a branch is selected.
-   - Enforce `BRANCH_REQUIRED` and `BRANCH_NOT_PERMITTED` on the GlossyLooks backend route as well.
+1. **Dynamic Branch Master & Selector**:
+   - Load active branches dynamically from `GET /api/integrations/glossylooks/branches` (never hard-code branch IDs, names, or codes in UI dropdowns or backend maps).
+   - Standardize GlossyLooks local branch references to canonical IDs (`tgl-gachi`, `tgl-konda`, and any future `smav_branches.id`).
+   - Preselect a branch **only** when the authenticated user has **exactly 1** active assigned branch. If 2+, start unselected and require explicit selection. If 0, block billing with a clear authorization alert.
+   - Disable **Generate Bill** / **Print Receipt** until an active branch is selected.
 2. **Reserve → Save → Finalize Flow**:
    - Generate a deterministic `idempotencyKey` per checkout attempt (reset only when cart/branch changes or after billing completes).
-   - Call `POST /api/integrations/glossylooks/bill-numbers/reserve` to get `centralBillId` and `centralBillNumber`.
-   - Persist `central_bill_id`, `central_bill_number`, `branch_code`, and `branch_name` on GlossyLooks `orders` and `payments` records (keep `bill_number = centralBillNumber`).
+   - Call `POST /api/integrations/glossylooks/bill-numbers/reserve` with canonical `branchId` and `branchCode` to obtain `centralBillId` and `centralBillNumber`.
+   - Persist `central_bill_id`, `central_bill_number`, `branch_id`, `branch_code`, and `branch_name` on GlossyLooks `orders` and `payments` records (keep `bill_number = centralBillNumber`).
    - Call `POST /api/integrations/glossylooks/bill-numbers/finalize` with `externalOrderId`.
-   - Pass `centralBillNumber`, `branchCode`, and `branchName` into WhatsApp receipt & feedback templates.
-3. **80mm Thermal Receipt Template**:
-   - **Remove** full salon street address, city, PIN code, and GSTIN from the receipt header/footer.
-   - **Keep** `THE GLOSSY LOOKS`, `"Professional Women's Salon"`, WhatsApp contact line (`9966970003 (G) · 9154744608 (K)`), `Branch: <Gachibowli | Kondapur>` near `Bill No: <TGL-...>`, date/time, customer details, services, stylist, tax, payment mode, and totals.
-4. **Optional Outbound Sync Webhook (SMAV → GlossyLooks)**:
-   - Set `GLOSSYLOOKS_BILL_SYNC_WEBHOOK_URL=https://www.glossylooks.in/api/integrations/smav/sale-event` on the SMAV Cloud Run backend. When configured, SMAV automatically POSTs finalized bills from **SMAV Web POS** and **SMAV Android Print Agent** with `event_id`, `event_type: "central_bill_finalized"`, `central_bill_id`, `central_bill_number`, `branch_code`, `branch_name`, `idempotency_key`, `customer_name`, `customer_phone`, `payment_mode`, `grand_total`, `billed_at`, and `source_system`, signed with `X-SMAV-Event-Id`, `X-SMAV-Timestamp` (Unix seconds), `X-SMAV-Signature` (HMAC-SHA256 using `SMAV_DISPATCH_SECRET`, falling back to `GLOSSYLOOKS_INTEGRATION_KEY`), and `X-Integration-Key`.
+3. **Strict Finalized-Sale Sequence & Durable-Only Outbox (SMAV → GlossyLooks)**:
+   - Set `GLOSSYLOOKS_BILL_SYNC_WEBHOOK_URL=https://www.glossylooks.in/api/integrations/smav/sale-event` on the SMAV Cloud Run backend.
+   - For both online and delayed offline sync, `/api/mobile/sync/bills` enforces the strict sequence:
+     `reserve central number → save local/central bill → finalize central bill number via central RPC → persist durable outbound event in public.smav_outbound_sale_events → dispatch signed event via public.smav_claim_due_outbound_sale_events`.
+   - If central finalization fails, `central_bill_finalized` is **never** enqueued or sent; SMAV returns a retryable HTTP `503` (`CENTRAL_BILL_FINALIZE_FAILED`) and leaves the bill pending for safe idempotent retry.
+   - There is **no in-memory fallback queue** for finalized-sale events. If `public.smav_outbound_sale_events` or `public.smav_claim_due_outbound_sale_events` is unavailable, SMAV returns HTTP `503` (`OUTBOUND_OUTBOX_UNAVAILABLE`, `retryable: true`) and does **not** report successful GlossyLooks synchronization.
+   - Failed webhook deliveries after durable persistence remain queued in `public.smav_outbound_sale_events` and retry automatically with exponential backoff using the **exact same `idempotency_key` and `central_bill_number`**.
+   - Signed headers sent on every delivery & retry (unchanged):
+     - `X-Integration-Key: <GLOSSYLOOKS_INTEGRATION_KEY>`
+     - `X-SMAV-Timestamp: <unix_seconds>`
+     - `X-SMAV-Signature: <hex(HMAC_SHA256(SMAV_DISPATCH_SECRET, "${timestamp}.${rawJsonBody}"))>`
+     - `X-SMAV-Event-Id: <event_id>`
+     - `X-Idempotency-Key: <idempotency_key>`
+   - Payload includes canonical dynamic fields: `event_id`, `event_type`, `idempotency_key`, `central_bill_id`, `central_bill_number`, `bill_number`, `outlet_id`, `outlet_code`, `branch_id`, `branch_code`, `branch_name`, `local_branch_id` (= `branch_id`), `external_branch_id` (= `branch_id`), `external_order_id`, `customer_name`, `customer_phone`, `cashier_name`, `payment_mode`, `payment_status`, `subtotal`, `discount`, `tax_amount`, `grand_total`, `paid_amount`, `due_amount`, `billed_at`, `source_system`, and complete `items` array.
 
 ---
 
@@ -201,6 +236,7 @@ Returns duplicate detections, unlinked `TGL-*` bills, mismatched numbers, unused
 
 | Variable | Where | Purpose |
 | --- | --- | --- |
-| `GLOSSYLOOKS_INTEGRATION_KEY` | SMAV Backend & GlossyLooks Backend | Shared secret for `X-Integration-Key` and HMAC-SHA256 signing |
-| `GLOSSYLOOKS_BILL_SYNC_WEBHOOK_URL` | SMAV Backend | `https://www.glossylooks.in/api/integrations/smav/sale-event` — GlossyLooks webhook endpoint to store SMAV-originated `central_bill_number` on GlossyLooks orders/payments |
+| `GLOSSYLOOKS_INTEGRATION_KEY` | SMAV Backend & GlossyLooks Backend | Shared secret validated via `X-Integration-Key` |
+| `SMAV_DISPATCH_SECRET` | SMAV Backend & GlossyLooks Backend | Separate shared secret for HMAC-SHA256 signing (`${timestamp}.${rawBody}`) on both inbound and outbound server calls |
+| `GLOSSYLOOKS_BILL_SYNC_WEBHOOK_URL` | SMAV Backend | `https://www.glossylooks.in/api/integrations/smav/sale-event` — GlossyLooks webhook endpoint to record SMAV-originated bills in GlossyLooks Payment Ledger |
 | `SMAV_API_BASE_URL` | GlossyLooks Backend | Base URL of the SMAV Cloud Run service |

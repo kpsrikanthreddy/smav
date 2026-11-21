@@ -53,12 +53,12 @@ FROM public.smav_outlets o
 CROSS JOIN (
   VALUES
     ('GACHI', 'Gachibowli', 'tgl-gachibowli-main'),
-    ('KONDA', 'Kondapur', 'tgl-kondapur-main')
+    ('KONDA', 'Kondapur', 'brn-1793346038689')
 ) AS v(branch_code, branch_name, external_branch_id)
 WHERE lower(coalesce(o.outlet_code, o.code, '')) = 'glossylooks'
 ON CONFLICT (outlet_id, branch_code) DO UPDATE
   SET branch_name = EXCLUDED.branch_name,
-      external_branch_id = COALESCE(public.smav_branches.external_branch_id, EXCLUDED.external_branch_id),
+      external_branch_id = EXCLUDED.external_branch_id,
       bill_prefix = EXCLUDED.bill_prefix,
       updated_at = now();
 

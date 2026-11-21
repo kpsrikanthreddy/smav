@@ -84,13 +84,6 @@ const salonSubcategoryLabel = (item: Pick<SalonService, 'name' | 'subcategory'>)
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 };
 
-const branchNameFromCode = (code?: string | null): string => {
-  const normalized = (code || '').trim().toUpperCase();
-  if (normalized === 'GACHI') return 'Gachibowli';
-  if (normalized === 'KONDA') return 'Kondapur';
-  return normalized || '';
-};
-
 const createCheckoutAttemptId = (): string => {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID();
@@ -119,15 +112,19 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
   // Salon Data
   const [salonServices, setSalonServices] = useState<SalonService[]>([]);
   const [permittedBranches, setPermittedBranches] = useState<OutletBranchOption[]>([]);
-  const [selectedBranchCode, setSelectedBranchCode] = useState<string>('');
+  const [selectedBranchId, setSelectedBranchId] = useState<string>('');
   const [isLoadingBranches, setIsLoadingBranches] = useState<boolean>(false);
   const [branchError, setBranchError] = useState<string | null>(null);
+  const [branchAuthBlocked, setBranchAuthBlocked] = useState<boolean>(false);
+  const [branchAuthMessage, setBranchAuthMessage] = useState<string | null>(null);
   const [stylists, setStylists] = useState<Stylist[]>([]);
   const [isLoadingStylists, setIsLoadingStylists] = useState(false);
   const [stylistError, setStylistError] = useState<string | null>(null);
   const [stylistUpstreamStatus, setStylistUpstreamStatus] = useState<number | null>(null);
   const [billSaveError, setBillSaveError] = useState<string | null>(null);
   const [billSuccessMessage, setBillSuccessMessage] = useState<string | null>(null);
+  const [completedBill, setCompletedBill] = useState<any | null>(null);
+  const [confirmNewBillOpen, setConfirmNewBillOpen] = useState<boolean>(false);
   const [missingStylistIdx, setMissingStylistIdx] = useState<number | null>(null);
   const [isProcessingBill, setIsProcessingBill] = useState(false);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
@@ -250,6 +247,8 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       setRetailCart([]);
       setActiveReceiptPreview(null);
       setActiveKotPreview(null);
+      setCompletedBill(null);
+      setConfirmNewBillOpen(false);
       setBillSaveError(null);
       setBillSuccessMessage(null);
       setMissingStylistIdx(null);
@@ -419,15 +418,59 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
   }, [category, isLoadingStylists, stylistError, stylists]);
 
   const applyBranchSelectionRules = useCallback(
-    (branchesList: OutletBranchOption[], autoBranch?: OutletBranchOption | null) => {
-      setPermittedBranches(branchesList);
+    (
+      branchesList: OutletBranchOption[],
+      autoBranch?: OutletBranchOption | null,
+      billingBlockedFlag?: boolean,
+      authMessage?: string | null
+    ) => {
+      // Dynamically deduplicate active branches from smav_branches without any hardcoded branch IDs, names, or codes.
+      const seenIds = new Set<string>();
+      const seenCodes = new Set<string>();
+      const activeList: OutletBranchOption[] = [];
+      for (const raw of branchesList) {
+        if (raw.isActive === false) continue;
+        const id = String(raw.id || '').trim();
+        const code = String(raw.branchCode || '').trim().toUpperCase();
+        const name = String(raw.name || raw.branchName || '').trim();
+        if (!id || !code || !name) continue;
+        const idKey = id.toLowerCase();
+        if (seenIds.has(idKey) || seenCodes.has(code)) continue;
+        seenIds.add(idKey);
+        seenCodes.add(code);
+        activeList.push({
+          ...raw,
+          id,
+          name,
+          branchCode: code,
+          branchName: name,
+          isActive: true,
+        });
+      }
+      activeList.sort((a, b) => a.branchName.localeCompare(b.branchName));
+
+      setPermittedBranches(activeList);
       setBranchError(null);
-      // Preselect branch ONLY when authenticated user has exactly 1 assigned branch; otherwise require manual selection.
-      if (branchesList.length === 1) {
-        setSelectedBranchCode((autoBranch?.branchCode || branchesList[0].branchCode).toUpperCase());
+
+      const isBlocked = Boolean(billingBlockedFlag) || activeList.length === 0;
+      setBranchAuthBlocked(isBlocked);
+      setBranchAuthMessage(
+        isBlocked
+          ? authMessage ||
+              'No active branch is assigned to your account. Contact an administrator before billing.'
+          : null
+      );
+
+      // Preselect branch ONLY when authenticated user has exactly 1 active assigned branch; otherwise require manual selection.
+      if (!isBlocked && activeList.length === 1) {
+        const preferredId =
+          autoBranch?.id && activeList.some((b) => b.id === autoBranch.id)
+            ? autoBranch.id
+            : activeList[0].id;
+        setSelectedBranchId(preferredId);
       } else {
-        setSelectedBranchCode((prev) =>
-          branchesList.some((b) => b.branchCode === prev) ? prev : ''
+        setSelectedBranchId((prev) =>
+          activeList.some((b) => b.id === prev) ? prev : ''
         );
       }
     },
@@ -437,8 +480,10 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
   const loadPermittedBranches = useCallback(async () => {
     if (category !== 'salon') {
       setPermittedBranches([]);
-      setSelectedBranchCode('');
+      setSelectedBranchId('');
       setBranchError(null);
+      setBranchAuthBlocked(false);
+      setBranchAuthMessage(null);
       return;
     }
     setIsLoadingBranches(true);
@@ -453,7 +498,12 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
         return;
       }
       const list: OutletBranchOption[] = Array.isArray(data.branches) ? data.branches : [];
-      applyBranchSelectionRules(list, data.autoSelectedBranch || null);
+      applyBranchSelectionRules(
+        list,
+        data.autoSelectedBranch || null,
+        Boolean(data.billingBlocked),
+        data.authorizationMessage || null
+      );
     } catch {
       setBranchError('Could not load permitted branches from central SMAV server.');
     } finally {
@@ -478,8 +528,13 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       if (data.category === 'salon') {
         setSalonServices(data.services || []);
         setAppointments(data.appointments || []);
-        if (Array.isArray(data.branches) && data.branches.length > 0) {
-          applyBranchSelectionRules(data.branches, data.autoSelectedBranch || null);
+        if (Array.isArray(data.branches)) {
+          applyBranchSelectionRules(
+            data.branches,
+            data.autoSelectedBranch || null,
+            Boolean(data.billingBlocked),
+            data.authorizationMessage || null
+          );
         } else {
           void loadPermittedBranches();
         }
@@ -503,8 +558,8 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
   }, [session.activeOutlet.id, loadPosData, loadStylists]);
 
   const selectedBranch = useMemo(
-    () => permittedBranches.find((b) => b.branchCode === selectedBranchCode) || null,
-    [permittedBranches, selectedBranchCode]
+    () => permittedBranches.find((b) => b.id === selectedBranchId) || null,
+    [permittedBranches, selectedBranchId]
   );
 
   // Cart Quantity Helpers
@@ -705,7 +760,15 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
     if (isSubmittingBillRef.current || isProcessingBill) return;
     if (salonCart.length === 0) return;
 
-    if (!selectedBranch || !selectedBranchCode) {
+    if (branchAuthBlocked) {
+      setBillSaveError(
+        branchAuthMessage ||
+          'You have no assigned active branch for billing. Contact an administrator.'
+      );
+      return;
+    }
+
+    if (!selectedBranch || !selectedBranchId) {
       setBillSaveError('Branch selection is mandatory before generating a bill.');
       document.getElementById('pos-salon-branch')?.focus();
       return;
@@ -760,6 +823,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
     try {
       const fingerprint = JSON.stringify({
         outletId: session.activeOutlet.id,
+        branchId: selectedBranch.id,
         branchCode: selectedBranch.branchCode,
         customerName: customerName.trim(),
         customerPhone: customerPhone.trim(),
@@ -790,8 +854,9 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
           },
           body: JSON.stringify({
             outletId: session.activeOutlet.id,
+            branchId: selectedBranch.id,
             branchCode: selectedBranch.branchCode,
-            branchName: selectedBranch.branchName,
+            branchName: selectedBranch.name || selectedBranch.branchName,
             sourceSystem: 'smav_web_pos',
             idempotencyKey,
           }),
@@ -808,7 +873,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
           billNumber: numberResult.centralBillNumber,
           branchId: numberResult.branchId || selectedBranch.id,
           branchCode: numberResult.branchCode || selectedBranch.branchCode,
-          branchName: numberResult.branchName || selectedBranch.branchName,
+          branchName: numberResult.branchName || selectedBranch.name || selectedBranch.branchName,
           idempotencyKey: numberResult.idempotencyKey || idempotencyKey,
         };
       }
@@ -886,10 +951,9 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
 
       pendingAttemptRef.current = null;
       pendingCheckoutRef.current = null;
+      setCompletedBill(bill);
+      setConfirmNewBillOpen(false);
       setActiveReceiptPreview(bill);
-      setSalonCart([]);
-      setCustomerName('');
-      setCustomerPhone('');
       setLedgerRefreshTick((prev) => prev + 1);
       setBillSuccessMessage(
         `Bill ${bill.billNumber} (${branchName}) saved. Opening ${paperWidthMm}mm browser print dialog.`
@@ -1054,15 +1118,17 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
     setMissingStylistIdx(null);
     setBillSaveError(null);
     setBillSuccessMessage(null);
+    setCompletedBill(null);
+    setConfirmNewBillOpen(false);
     setActiveReceiptPreview(null);
     setActiveKotPreview(null);
+    pendingAttemptRef.current = null;
     pendingCheckoutRef.current = null;
   };
 
   const handlePrintLedgerCopy = (entry: TransactionLedgerEntry) => {
     const resolvedBranchCode = entry.branchCode || null;
-    const resolvedBranchName =
-      entry.branchName || (resolvedBranchCode ? branchNameFromCode(resolvedBranchCode) : null);
+    const resolvedBranchName = entry.branchName || resolvedBranchCode || null;
     const reprintReceipt = {
       billNumber: entry.centralBillNumber || entry.billNumber,
       centralBillNumber: entry.centralBillNumber || entry.billNumber,
@@ -1261,8 +1327,8 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
           </span>
         </div>
 
-        {/* Post-Billing Action Bar (Print Copy + Clear, shown cleanly after successful billing) */}
-        {activeReceiptPreview && (
+        {/* Post-Billing Action Bar for non-salon outlets or when viewing another tab */}
+        {activeReceiptPreview && !(category === 'salon' && completedBill && activePosView === 'billing') && (
           <div className="bg-[#ECFDF5] border-b border-[#BBF7D0] px-4 py-3 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2.5 min-w-0">
               <CheckCircle2 className="w-4 h-4 text-[#15803D] shrink-0" />
@@ -1287,9 +1353,15 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
               >
                 Print Copy
               </Button>
-              <Button variant="secondary" size="sm" onClick={handleClearBillingForm}>
-                Clear
-              </Button>
+              {category === 'salon' && completedBill ? (
+                <Button variant="secondary" size="sm" onClick={() => setActivePosView('billing')}>
+                  View Receipt
+                </Button>
+              ) : (
+                <Button variant="secondary" size="sm" onClick={handleClearBillingForm}>
+                  Clear
+                </Button>
+              )}
             </div>
           </div>
         )}
@@ -1299,8 +1371,124 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
           {/* VIEW 1: ACTIVE CART */}
           {activePosView === 'billing' && (
             <div className="space-y-4">
+              {/* SALON COMPLETED BILL & RECEIPT SCREEN */}
+              {category === 'salon' && completedBill && (
+                <div className="space-y-4">
+                  <div className="rounded-2xl border border-[#BBF7D0] bg-[#ECFDF5] p-4 sm:p-5 space-y-4">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="flex items-start gap-3 min-w-0">
+                        <div className="w-9 h-9 rounded-xl bg-[#15803D] text-white flex items-center justify-center shrink-0">
+                          <CheckCircle2 className="w-5 h-5" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-sm font-bold text-[#14532D]">Bill Completed</p>
+                          <p className="text-xs font-mono font-semibold text-[#166534] break-all">
+                            {completedBill.centralBillNumber || completedBill.billNumber}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <p className="text-[11px] font-medium text-[#15803D]">Total Paid</p>
+                        <p className="text-lg font-bold text-[#14532D] tabular-nums">
+                          ₹{Number(completedBill.grandTotal || 0).toFixed(2)}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs bg-white/90 rounded-xl border border-[#D1FAE5] p-3">
+                      <div>
+                        <p className="text-[10px] font-semibold uppercase tracking-wide text-[#6F737D]">Branch</p>
+                        <p className="font-semibold text-[#2F3033] mt-0.5">
+                          {completedBill.branchName || completedBill.branchCode}
+                          {completedBill.branchCode ? ` (${completedBill.branchCode})` : ''}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-[10px] font-semibold uppercase tracking-wide text-[#6F737D]">Customer</p>
+                        <p className="font-semibold text-[#2F3033] mt-0.5 truncate">
+                          {completedBill.customerName || 'Walk-in Customer'}
+                          {completedBill.customerPhone ? ` · ${completedBill.customerPhone}` : ''}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-[10px] font-semibold uppercase tracking-wide text-[#6F737D]">Payment Mode</p>
+                        <p className="font-semibold text-[#2F3033] uppercase mt-0.5">
+                          {String(completedBill.paymentMode || 'upi')}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2.5">
+                      <Button
+                        variant="success"
+                        size="sm"
+                        onClick={() => {
+                          setActiveReceiptPreview(completedBill);
+                          openBrowserPrintDialog();
+                        }}
+                        disabled={isPrinterBusy}
+                        leftIcon={<Printer className="w-3.5 h-3.5" />}
+                      >
+                        Print Copy
+                      </Button>
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        onClick={() => setConfirmNewBillOpen(true)}
+                      >
+                        New Bill
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setActivePosView('ledger')}
+                        leftIcon={<Receipt className="w-3.5 h-3.5" />}
+                      >
+                        Today&apos;s Ledger
+                      </Button>
+                    </div>
+
+                    {confirmNewBillOpen && (
+                      <div
+                        role="alertdialog"
+                        aria-label="Confirm starting a new bill"
+                        className="rounded-xl border border-[#FCD34D] bg-[#FFFBEB] px-3.5 py-3 flex flex-wrap items-center justify-between gap-3"
+                      >
+                        <p className="text-xs font-medium text-[#92400E]">
+                          Clear the current cart and customer details to start a new bill?
+                        </p>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <Button
+                            variant="primary"
+                            size="sm"
+                            onClick={handleClearBillingForm}
+                          >
+                            Confirm &amp; Start New Bill
+                          </Button>
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={() => setConfirmNewBillOpen(false)}
+                          >
+                            Cancel
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="rounded-2xl border border-[#E5E7EC] bg-[#F9FAFC] p-4">
+                    <div className="flex items-center justify-between text-xs text-[#6F737D] mb-1">
+                      <span className="font-semibold text-[#2F3033]">Receipt Preview ({paperWidthMm}mm)</span>
+                      <span className="font-mono text-[11px]">{completedBill.timestamp}</span>
+                    </div>
+                    <ThermalReceiptSlip receipt={completedBill} paperWidthMm={paperWidthMm} />
+                  </div>
+                </div>
+              )}
+
               {/* SALON CART */}
-              {category === 'salon' && (
+              {category === 'salon' && !completedBill && (
                 <div className="space-y-4">
                   {isLoadingStylists && (
                     <div className="rounded-xl border border-[#BFDBFE] bg-[#EFF6FF] px-3.5 py-2.5 text-xs text-[#1D4ED8] flex items-center gap-2">
@@ -1430,24 +1618,26 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                     <FormField label="Branch *" htmlFor="pos-salon-branch">
                       <select
                         id="pos-salon-branch"
-                        value={selectedBranchCode}
+                        value={selectedBranchId}
                         onChange={(e) => {
-                          setSelectedBranchCode(e.target.value);
+                          setSelectedBranchId(e.target.value);
                           setBillSaveError(null);
                           pendingCheckoutRef.current = null;
                         }}
-                        disabled={isLoadingBranches || permittedBranches.length === 1}
+                        disabled={isLoadingBranches || branchAuthBlocked || permittedBranches.length === 1}
                         required
                         className={`${BASE_INPUT_CLASS} ${
-                          !selectedBranchCode ? 'border-[#F59E0B] bg-[#FFFBEB]/40' : ''
+                          !selectedBranchId ? 'border-[#F59E0B] bg-[#FFFBEB]/40' : ''
                         }`}
                       >
                         {permittedBranches.length !== 1 && (
-                          <option value="">Select branch (required)</option>
+                          <option value="">
+                            {branchAuthBlocked ? 'No active branch assigned' : 'Select branch (required)'}
+                          </option>
                         )}
                         {permittedBranches.map((branch) => (
-                          <option key={branch.branchCode} value={branch.branchCode}>
-                            {branch.branchName} ({branch.branchCode})
+                          <option key={branch.id} value={branch.id}>
+                            {branch.name || branch.branchName} ({branch.branchCode})
                           </option>
                         ))}
                       </select>
@@ -1488,6 +1678,16 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                     </FormField>
                   </div>
 
+                  {branchAuthBlocked && (
+                    <div
+                      role="alert"
+                      className="rounded-xl border border-[#FECACA] bg-[#FEF2F2] px-3.5 py-2.5 text-xs text-[#B91C1C] font-medium"
+                    >
+                      {branchAuthMessage ||
+                        'You have no assigned active branch for billing. Contact an administrator to assign an active branch.'}
+                    </div>
+                  )}
+
                   {branchError && (
                     <div className="rounded-xl border border-[#FECACA] bg-[#FEF2F2] px-3.5 py-2 text-xs text-[#B91C1C] flex items-center justify-between gap-2">
                       <span>{branchError}</span>
@@ -1509,13 +1709,13 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                     ]}
                     grandTotalValue={`₹${salonGrandTotal}`}
                     itemCountLabel={`${activeCartCount} service${activeCartCount === 1 ? '' : 's'}${
-                      selectedBranch ? ` · ${selectedBranch.branchName}` : ''
+                      selectedBranch ? ` · ${selectedBranch.name || selectedBranch.branchName}` : ''
                     }`}
                     action={
                       <div className="space-y-2">
-                        {!selectedBranchCode && (
+                        {!branchAuthBlocked && !selectedBranchId && (
                           <p className="text-[11px] text-[#B45309] font-medium">
-                            Select a branch (Gachibowli or Kondapur) before generating a bill.
+                            Select an active branch before generating a bill.
                           </p>
                         )}
                         {!isOnline && (
@@ -1537,7 +1737,8 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                           onClick={() => void handlePrintSalonBill()}
                           disabled={
                             salonCart.length === 0 ||
-                            !selectedBranchCode ||
+                            branchAuthBlocked ||
+                            !selectedBranchId ||
                             !isOnline ||
                             isLoadingStylists ||
                             Boolean(stylistError) ||
@@ -2151,7 +2352,7 @@ const ThermalReceiptSlip: React.FC<ThermalReceiptSlipProps> = ({
       <p className="text-[10px] text-[#4B5563] pt-1">Date: {receipt.timestamp}</p>
       {(receipt.branchName || receipt.branchCode) && (
         <p className="font-semibold text-[10px] text-[#111827]">
-          Branch: {receipt.branchName || branchNameFromCode(receipt.branchCode)}
+          Branch: {receipt.branchName || receipt.branchCode}
         </p>
       )}
       <p className="font-bold text-[10px]">

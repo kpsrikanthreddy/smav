@@ -50,6 +50,9 @@ interface SalonBillDao {
     @Query("SELECT * FROM salon_bills WHERE branchId = :branchId AND isVoided = 0 AND createdAtLocal >= :startOfDayMs ORDER BY createdAtLocal DESC")
     fun getTodayActiveBillsForBranch(branchId: String, startOfDayMs: Long): Flow<List<SalonBillEntity>>
 
+    @Query("SELECT * FROM salon_bills WHERE (businessId = :outletId OR branchId = :outletId) AND isVoided = 0 AND createdAtLocal >= :startOfDayMs ORDER BY createdAtLocal DESC")
+    fun getTodayActiveBillsForOutlet(outletId: String, startOfDayMs: Long): Flow<List<SalonBillEntity>>
+
     @Query("SELECT * FROM salon_bills WHERE id = :id LIMIT 1")
     suspend fun getBillById(id: String): SalonBillEntity?
 

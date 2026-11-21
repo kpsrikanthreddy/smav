@@ -44,7 +44,7 @@ data class StaffLoginResponse(
 data class SelectBusinessRequest(
     @SerializedName("user_id") val userId: String,
     @SerializedName("business_id") val businessId: String,
-    @SerializedName("branch_id") val branchId: String,
+    @SerializedName("branch_id") val branchId: String? = null,
     @SerializedName("device_id") val deviceId: String
 )
 
