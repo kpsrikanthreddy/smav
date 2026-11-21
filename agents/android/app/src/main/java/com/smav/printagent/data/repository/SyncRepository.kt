@@ -4,10 +4,15 @@ import android.content.Context
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.smav.printagent.data.local.AppDatabase
+import com.smav.printagent.data.local.entities.SalonBillEntity
 import com.smav.printagent.model.BusinessType
+import com.smav.printagent.model.BranchOption
 import com.smav.printagent.network.SmavApiClient
 import com.smav.printagent.network.SyncPrintStatusRequest
 import com.smav.printagent.network.UnauthorizedSessionException
+import com.smav.printagent.network.optBool
+import com.smav.printagent.network.optString
+import com.smav.printagent.util.BillIdGenerator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.IOException
@@ -25,6 +30,81 @@ class SyncRepository(
         val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
         sdf.timeZone = TimeZone.getTimeZone("UTC")
         return sdf.format(Date(epochMs))
+    }
+
+    /**
+     * A bill created by an older APK may contain a local TGL-GLOSS number.  It
+     * must never be uploaded as that number: reserve once with the central
+     * service, persist the issued number locally, then sync/finalize it.
+     *
+     * This deliberately resolves the branch from the bill's stored ID/code,
+     * not from the current POS selection, so a queued bill remains syncable.
+     */
+    private suspend fun ensureCentralSalonBillNumber(
+        api: com.smav.printagent.network.ApiService,
+        bearer: String,
+        outletId: String,
+        bill: SalonBillEntity,
+        permittedBranches: List<BranchOption>
+    ): SalonBillEntity {
+        val storedId = bill.branchId.trim()
+        val storedCode = bill.branchCode.trim().uppercase(Locale.ENGLISH)
+        val branch = permittedBranches.firstOrNull {
+            it.isActive && (it.id == storedId || it.branchCode.trim().uppercase(Locale.ENGLISH) == storedCode)
+        // Legacy APKs stored GLOSS instead of the actual branch code.  It is
+        // safe to recover that record only when this operator has exactly one
+        // active permitted branch; otherwise we fail closed rather than assign
+        // a bill to the wrong branch.
+        } ?: permittedBranches.singleOrNull() ?: throw IllegalStateException(
+            "Pending bill ${bill.billNumber} cannot be synced because its saved branch is no longer active or permitted."
+        )
+
+        val expectedPrefix = "${branch.billPrefix.ifBlank { "TGL" }.uppercase(Locale.ENGLISH)}-${branch.branchCode.trim().uppercase(Locale.ENGLISH)}-"
+        if (!bill.centralBillId.isNullOrBlank() && bill.billNumber.uppercase(Locale.ENGLISH).startsWith(expectedPrefix)) {
+            return bill
+        }
+
+        val recoveryKey = "ANDROID_RECOVER_${bill.id}"
+        val response = api.reserveCentralBillNumber(bearer, JsonObject().apply {
+            addProperty("outletId", outletId)
+            addProperty("branchId", branch.id)
+            addProperty("branchCode", branch.branchCode.trim().uppercase(Locale.ENGLISH))
+            addProperty("branchName", branch.displayName)
+            addProperty("sourceSystem", "smav_android_agent")
+            addProperty("idempotencyKey", recoveryKey)
+            addProperty("deviceId", bill.deviceId)
+        })
+        val body = response.body()
+        if (!response.isSuccessful || body == null || !body.optBool("success", false)) {
+            throw IOException(SmavApiClient.parseErrorMessage(response, "Central bill-number reservation failed."))
+        }
+        val centralBillId = body.optString("centralBillId")
+        val centralBillNumber = body.optString("centralBillNumber")
+        val centralIdempotencyKey = body.optString("idempotencyKey").ifBlank { recoveryKey }
+        if (centralBillId.isBlank() || centralBillNumber.isBlank() || !BillIdGenerator.isValidBillNumber(centralBillNumber)) {
+            throw IOException("Central bill-number reservation returned an invalid bill number.")
+        }
+
+        val canonicalCode = body.optString("branchCode").ifBlank { branch.branchCode }.uppercase(Locale.ENGLISH)
+        val canonicalName = body.optString("branchName").ifBlank { branch.displayName }
+        val canonicalId = body.optString("branchId").ifBlank { branch.id }
+        database.salonBillDao().applyCentralBillReservation(
+            id = bill.id,
+            billNumber = centralBillNumber,
+            centralBillId = centralBillId,
+            branchId = canonicalId,
+            branchCode = canonicalCode,
+            branchName = canonicalName,
+            idempotencyKey = centralIdempotencyKey
+        )
+        return bill.copy(
+            billNumber = centralBillNumber,
+            centralBillId = centralBillId,
+            branchId = canonicalId,
+            branchCode = canonicalCode,
+            branchName = canonicalName,
+            idempotencyKey = centralIdempotencyKey
+        )
     }
 
     suspend fun syncAllPending(): Result<Int> = withContext(Dispatchers.IO) {
@@ -62,16 +142,26 @@ class SyncRepository(
 
             // 1. Sync Salon Bills strictly belonging to the active outlet (preserving already-printed central bill number)
             if (session.businessType == BusinessType.SALON) {
-                val cachedBranchIds = sessionManager.getPermittedBranches(activeOutletId).map { it.id }.toSet()
+                val permittedBranches = sessionManager.getPermittedBranches(activeOutletId).filter { it.isActive }
+                val cachedBranchIds = permittedBranches.map { it.id }.toSet()
+                val cachedBranchCodes = permittedBranches.map { it.branchCode.uppercase(Locale.ENGLISH) }.toSet()
                 val pendingBills = database.salonBillDao().getUnsyncedBills().filter {
                     it.businessId == activeOutletId ||
                         it.branchId == activeOutletId ||
                         (session.branchId.isNotBlank() && it.branchId == session.branchId) ||
-                        it.branchId in cachedBranchIds
+                        it.branchId in cachedBranchIds ||
+                        it.branchCode.uppercase(Locale.ENGLISH) in cachedBranchCodes
                 }
                 if (pendingBills.isNotEmpty()) {
                     val billsJsonArray = JsonArray()
-                    for (bill in pendingBills) {
+                    for (pendingBill in pendingBills) {
+                        val bill = ensureCentralSalonBillNumber(
+                            api = api,
+                            bearer = bearer,
+                            outletId = activeOutletId,
+                            bill = pendingBill,
+                            permittedBranches = permittedBranches
+                        )
                         val items = database.salonBillDao().getItemsForBill(bill.id)
                         if (items.isEmpty()) continue
 

@@ -85,6 +85,18 @@ interface SalonBillDao {
     @Query("UPDATE salon_bills SET syncStatus = :status, syncError = :error, createdAtServer = :serverTime WHERE id = :id OR billNumber = :id")
     suspend fun updateSyncStatus(id: String, status: String, error: String?, serverTime: Long?)
 
+    /** Replaces a legacy locally-generated number with the authoritative central reservation. */
+    @Query("UPDATE salon_bills SET billNumber = :billNumber, centralBillId = :centralBillId, branchId = :branchId, branchCode = :branchCode, branchName = :branchName, idempotencyKey = :idempotencyKey, syncStatus = 'PENDING', syncError = NULL WHERE id = :id")
+    suspend fun applyCentralBillReservation(
+        id: String,
+        billNumber: String,
+        centralBillId: String,
+        branchId: String,
+        branchCode: String,
+        branchName: String,
+        idempotencyKey: String
+    )
+
     @Query("UPDATE salon_bills SET isVoided = 1, voidReason = :reason, voidedAtLocal = :voidedAt, voidedBy = :voidedBy, updatedAtLocal = :voidedAt, conflictMessage = NULL WHERE id = :id")
     suspend fun markVoided(id: String, reason: String, voidedAt: Long, voidedBy: String)
 

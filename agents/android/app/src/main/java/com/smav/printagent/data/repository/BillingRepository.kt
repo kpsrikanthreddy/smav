@@ -120,7 +120,10 @@ class BillingRepository(
             val api = SmavApiClient.create(sessionManager)
             val bearer = SmavApiClient.bearer(session.token)
             val req = JsonObject().apply {
-                addProperty("outletId", branch.id)
+                // The outlet is the tenant/business ID.  The selected branch is
+                // sent separately below; using a branch ID as outletId caused
+                // legacy Android bills to fall back to local TGL-GLOSS numbers.
+                addProperty("outletId", session.businessId)
                 addProperty("branchId", normalizedBranchId)
                 addProperty("branchCode", normalizedBranchCode)
                 addProperty("branchName", normalizedBranchName)
@@ -156,7 +159,7 @@ class BillingRepository(
             val todayIso = BillIdGenerator.getIndiaIsoDate()
             database.preallocatedBillNumberDao().expireBeforeDate(todayIso)
             val claimed = database.preallocatedBillNumberDao().claimNextAvailable(
-                outletId = branch.id,
+                outletId = session.businessId,
                 branchCode = normalizedBranchCode,
                 billingDate = todayIso,
                 billId = billId
