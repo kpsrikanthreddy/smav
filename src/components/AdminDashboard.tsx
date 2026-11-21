@@ -45,6 +45,67 @@ interface AdminDashboardProps {
   onChangePaperWidth?: (width: 58 | 80) => void;
 }
 
+/**
+ * The reconciliation endpoint has existed in two response shapes during the
+ * central-billing rollout.  Keep the admin UI tolerant of either shape so an
+ * older gateway response cannot blank the whole application for an admin.
+ */
+const normalizeReconciliationReport = (
+  value: unknown,
+  outlet: UserSession['activeOutlet']
+): BillNumberReconciliationReport | null => {
+  if (!value || typeof value !== 'object') return null;
+
+  const report = value as Record<string, any>;
+  if (report.summary && Array.isArray(report.duplicates) && Array.isArray(report.missingBillNumbers)) {
+    return report as BillNumberReconciliationReport;
+  }
+
+  const byBranch = report.byBranch && typeof report.byBranch === 'object' ? report.byBranch : {};
+  const duplicateBillNumbers = Array.isArray(report.duplicateBillNumbers) ? report.duplicateBillNumbers : [];
+  const missingCentralBills = Array.isArray(report.missingCentralBills) ? report.missingCentralBills : [];
+  const mismatchedBills = Array.isArray(report.mismatchedBills) ? report.mismatchedBills : [];
+
+  return {
+    outletId: String(report.outletId || outlet.id),
+    outletCode: String(report.outletCode || outlet.code),
+    generatedAt: String(report.generatedAt || new Date().toISOString()),
+    summary: {
+      totalBills: Number(report.totalSalonBills || 0),
+      centralLinkedBills: Number(report.linkedBillsCount || 0),
+      legacyHistoricalBills: Number(report.legacyHistoricalBillsCount || 0),
+      missingBillNumbersCount: Number(report.missingCentralBillNumberCount || missingCentralBills.length),
+      duplicateBillNumbersCount: duplicateBillNumbers.length,
+      unlinkedCentralFormatBillsCount: mismatchedBills.length,
+      reservedUnusedCount: Number(report.reservedUnfinalizedCount || 0),
+      preallocatedAvailableCount: Number(report.preallocatedUnusedCount || 0),
+    },
+    duplicates: duplicateBillNumbers.map((item: any) => ({
+      billNumber: String(item.billNumber || ''),
+      occurrences: Number(item.count || 0),
+      billIds: Array.isArray(item.ids) ? item.ids.map(String) : [],
+    })),
+    missingBillNumbers: missingCentralBills.map((item: any) => ({
+      billId: String(item.id || ''),
+      createdAt: String(item.createdAt || ''),
+      customerName: 'Unknown customer',
+      grandTotal: 0,
+    })),
+    unlinkedCentralFormatBills: mismatchedBills.map((item: any) => ({
+      billId: String(item.id || ''),
+      billNumber: String(item.billNumber || ''),
+      branchCode: null,
+      createdAt: String(item.createdAt || ''),
+    })),
+    branchBreakdown: Object.entries(byBranch).map(([branchCode, counts]: [string, any]) => ({
+      branchCode,
+      branchName: branchCode,
+      centralBills: Number(counts?.finalized || 0),
+      legacyBills: 0,
+    })),
+  };
+};
+
 export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   session,
   onOpenPos,
@@ -137,7 +198,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
       if (repRes && repRes.success !== false) setReports(repRes);
       if (reconRes && reconRes.success && reconRes.report) {
-        setReconciliation(reconRes.report);
+        setReconciliation(normalizeReconciliationReport(reconRes.report, session.activeOutlet));
       }
 
       if (session.activeOutlet.category === 'salon') {
