@@ -73,14 +73,11 @@ CREATE POLICY smav_branch_migration_audit_service_all
 -- =============================================================================
 -- 2. Fail-Closed FK Check & Verbatim Capture on Reviewed Allow-List ONLY
 -- =============================================================================
-CREATE TEMP TABLE IF NOT EXISTS pg_temp.smav_saved_branch_fks (
-  table_name text NOT NULL,
-  constraint_name text NOT NULL,
-  constraint_def text NOT NULL,
-  PRIMARY KEY (table_name, constraint_name)
-) ON COMMIT DROP;
-
-TRUNCATE TABLE pg_temp.smav_saved_branch_fks;
+-- FK definitions are recorded in the durable migration audit table rather than
+-- a temporary/helper table. This avoids SQL Editor statement/session ordering
+-- issues while retaining the exact original definition for recreation.
+DELETE FROM public.smav_branch_migration_audit
+WHERE action = 'migration_022_saved_fk_capture';
 
 DO $$
 DECLARE
@@ -131,10 +128,21 @@ BEGIN
       AND ns.nspname = 'public'
       AND rel.relname = ANY(v_allowed_fk_tables)
   LOOP
-    INSERT INTO pg_temp.smav_saved_branch_fks (table_name, constraint_name, constraint_def)
-    VALUES (v_fk.table_name, v_fk.constraint_name, v_fk.constraint_def)
-    ON CONFLICT (table_name, constraint_name) DO UPDATE
-      SET constraint_def = EXCLUDED.constraint_def;
+    INSERT INTO public.smav_branch_migration_audit (
+      old_branch_id,
+      action,
+      reference_counts,
+      notes
+    )
+    VALUES (
+      v_fk.table_name || ':' || v_fk.constraint_name,
+      'migration_022_saved_fk_capture',
+      jsonb_build_object(
+        'table_name', v_fk.table_name,
+        'constraint_name', v_fk.constraint_name
+      ),
+      v_fk.constraint_def
+    );
 
     EXECUTE format(
       'ALTER TABLE public.%I DROP CONSTRAINT %I',
@@ -247,7 +255,7 @@ $$;
 -- 3D. 8) Explicit user-to-branch assignment join table (dynamic, zero hardcoding)
 CREATE TABLE IF NOT EXISTS public.smav_user_branch_assignments (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id uuid NOT NULL REFERENCES public.smav_users(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL REFERENCES public.smav_profiles(id) ON DELETE CASCADE,
   outlet_id uuid NOT NULL REFERENCES public.smav_outlets(id) ON DELETE CASCADE,
   branch_id text NOT NULL,
   is_default boolean NOT NULL DEFAULT false,
@@ -327,7 +335,9 @@ BEGIN
     RETURN;
   END IF;
 
-  CREATE TEMP TABLE IF NOT EXISTS pg_temp.smav_branch_remap (
+  -- See the note above: use a short-lived regular table so this migration
+  -- remains reliable in the Supabase SQL Editor.
+  CREATE TABLE IF NOT EXISTS public.smav_branch_migration_remap (
     outlet_id uuid NOT NULL,
     old_branch_id text NOT NULL,
     old_branch_code text,
@@ -337,12 +347,12 @@ BEGIN
     new_branch_name text NOT NULL,
     is_db_row boolean NOT NULL DEFAULT false,
     PRIMARY KEY (outlet_id, old_branch_id)
-  ) ON COMMIT DROP;
+  );
 
-  TRUNCATE TABLE pg_temp.smav_branch_remap;
+  TRUNCATE TABLE public.smav_branch_migration_remap;
 
   -- Seed explicit known GlossyLooks legacy IDs for this single outlet ONLY
-  INSERT INTO pg_temp.smav_branch_remap (
+  INSERT INTO public.smav_branch_migration_remap (
     outlet_id, old_branch_id, old_branch_code, old_branch_name,
     new_branch_id, new_branch_code, new_branch_name, is_db_row
   )
@@ -425,7 +435,7 @@ BEGIN
     END IF;
 
     IF v_target_id IS NOT NULL AND v_branch.id <> v_target_id THEN
-      INSERT INTO pg_temp.smav_branch_remap (
+      INSERT INTO public.smav_branch_migration_remap (
         outlet_id, old_branch_id, old_branch_code, old_branch_name,
         new_branch_id, new_branch_code, new_branch_name, is_db_row
       )
@@ -580,7 +590,7 @@ BEGIN
     UPDATE public.smav_central_bill_numbers AS c
     SET branch_id = m.new_branch_id,
         branch_name = m.new_branch_name
-    FROM pg_temp.smav_branch_remap AS m
+    FROM public.smav_branch_migration_remap AS m
     WHERE c.outlet_id = v_glossy_outlet_id
       AND m.outlet_id = v_glossy_outlet_id
       AND c.branch_id = m.old_branch_id;
@@ -601,7 +611,7 @@ BEGIN
     UPDATE public.smav_salon_bills AS sb
     SET branch_id = m.new_branch_id,
         branch_name = m.new_branch_name
-    FROM pg_temp.smav_branch_remap AS m
+    FROM public.smav_branch_migration_remap AS m
     WHERE sb.outlet_id = v_glossy_outlet_id
       AND m.outlet_id = v_glossy_outlet_id
       AND sb.branch_id = m.old_branch_id;
@@ -623,7 +633,7 @@ BEGIN
     UPDATE public.smav_central_sales AS cs
     SET branch_id = m.new_branch_id,
         branch_name = m.new_branch_name
-    FROM pg_temp.smav_branch_remap AS m
+    FROM public.smav_branch_migration_remap AS m
     WHERE cs.outlet_id = v_glossy_outlet_id
       AND m.outlet_id = v_glossy_outlet_id
       AND cs.branch_id = m.old_branch_id;
@@ -645,7 +655,7 @@ BEGIN
     UPDATE public.smav_bill_number_batches AS bb
     SET branch_id = m.new_branch_id,
         branch_name = m.new_branch_name
-    FROM pg_temp.smav_branch_remap AS m
+    FROM public.smav_branch_migration_remap AS m
     WHERE bb.outlet_id = v_glossy_outlet_id
       AND m.outlet_id = v_glossy_outlet_id
       AND bb.branch_id = m.old_branch_id;
@@ -665,7 +675,7 @@ BEGIN
   IF to_regclass('public.smav_bill_number_counters') IS NOT NULL THEN
     UPDATE public.smav_bill_number_counters AS cnt
     SET branch_id = m.new_branch_id
-    FROM pg_temp.smav_branch_remap AS m
+    FROM public.smav_branch_migration_remap AS m
     WHERE cnt.outlet_id = v_glossy_outlet_id
       AND m.outlet_id = v_glossy_outlet_id
       AND cnt.branch_id = m.old_branch_id;
@@ -685,7 +695,7 @@ BEGIN
     UPDATE public.smav_outbound_sale_events AS ev
     SET branch_id = m.new_branch_id,
         branch_name = m.new_branch_name
-    FROM pg_temp.smav_branch_remap AS m
+    FROM public.smav_branch_migration_remap AS m
     WHERE ev.outlet_id = v_glossy_outlet_id
       AND m.outlet_id = v_glossy_outlet_id
       AND ev.branch_id = m.old_branch_id;
@@ -707,7 +717,7 @@ BEGIN
     INSERT INTO public.smav_user_branch_assignments (user_id, outlet_id, branch_id, is_default, is_active)
     SELECT uba.user_id, uba.outlet_id, m.new_branch_id, uba.is_default, uba.is_active
     FROM public.smav_user_branch_assignments AS uba
-    JOIN pg_temp.smav_branch_remap AS m
+    JOIN public.smav_branch_migration_remap AS m
       ON m.outlet_id = uba.outlet_id AND m.old_branch_id = uba.branch_id
     WHERE uba.outlet_id = v_glossy_outlet_id
     ON CONFLICT (user_id, outlet_id, branch_id) DO UPDATE
@@ -715,7 +725,7 @@ BEGIN
           updated_at = now();
 
     DELETE FROM public.smav_user_branch_assignments AS uba
-    USING pg_temp.smav_branch_remap AS m
+    USING public.smav_branch_migration_remap AS m
     WHERE uba.outlet_id = v_glossy_outlet_id
       AND m.outlet_id = v_glossy_outlet_id
       AND uba.branch_id = m.old_branch_id
@@ -756,7 +766,7 @@ BEGIN
                      END
               ), '{}'::text[])
             ) AS raw_id
-            LEFT JOIN pg_temp.smav_branch_remap AS m
+            LEFT JOIN public.smav_branch_migration_remap AS m
               ON m.outlet_id = uor.outlet_id AND m.old_branch_id = raw_id
             LEFT JOIN public.smav_branches AS b
               ON b.outlet_id = uor.outlet_id AND b.is_active = true AND b.id = raw_id
@@ -785,7 +795,7 @@ BEGIN
   -- ---------------------------------------------------------------------------
   FOR v_remap IN
     SELECT *
-    FROM pg_temp.smav_branch_remap AS m
+    FROM public.smav_branch_migration_remap AS m
     WHERE m.outlet_id = v_glossy_outlet_id
       AND m.is_db_row = true
       AND m.old_branch_id <> m.new_branch_id
@@ -908,8 +918,12 @@ DECLARE
   v_saved RECORD;
 BEGIN
   FOR v_saved IN
-    SELECT table_name, constraint_name, constraint_def
-    FROM pg_temp.smav_saved_branch_fks
+    SELECT
+      reference_counts->>'table_name' AS table_name,
+      reference_counts->>'constraint_name' AS constraint_name,
+      notes AS constraint_def
+    FROM public.smav_branch_migration_audit
+    WHERE action = 'migration_022_saved_fk_capture'
     ORDER BY table_name, constraint_name
   LOOP
     IF NOT EXISTS (
@@ -1483,5 +1497,9 @@ SELECT
     ELSE 'LINKED_OK'
   END AS reconciliation_status
 FROM public.smav_salon_bills AS sb;
+
+-- Migration-only helpers: remove them after all references and FKs have been
+-- recreated successfully. A failed transaction rolls this creation back.
+DROP TABLE IF EXISTS public.smav_branch_migration_remap;
 
 COMMIT;

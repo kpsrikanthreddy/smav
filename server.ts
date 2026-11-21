@@ -5573,7 +5573,11 @@ async function handleReserveCentralBillNumber(req: express.Request, res: express
     const auth = await resolveCentralBillAuthContext(req, forcedOutletCode);
     if (!auth.ok) return res.status(auth.status).json({ success: false, code: auth.code, message: auth.message });
 
-    if (auth.outlet.category !== 'salon') {
+    // The GlossyLooks server-to-server route is itself a salon integration.
+    // Its branch master is already resolved below, so do not reject billing
+    // solely because a stale outlet-directory category is blank/"other".
+    // Interactive SMAV POS/API calls still enforce the stored outlet category.
+    if (auth.outlet.category !== 'salon' && forcedOutletCode !== 'glossylooks') {
       return res.status(400).json({ success: false, code: 'SALON_OUTLET_REQUIRED', message: 'A salon outlet must be selected.' });
     }
 

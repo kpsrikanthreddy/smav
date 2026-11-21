@@ -477,7 +477,9 @@ export function normalizeSalonRole(
     return { accepted: false, role: '', smavRole: 'POS_BILLING' };
   }
 
-  // Only users whose authoritative public.users.role is STYLIST are selectable as POS stylists.
+  // A linked user account is authoritative whenever it exists. Only a linked
+  // STYLIST account is selectable; owners/managers/receptionists never become
+  // service stylists merely because of a free-text staff designation.
   if (resolved.canonicalRole === 'STYLIST') {
     return {
       accepted: true,
@@ -485,6 +487,32 @@ export function normalizeSalonRole(
       sourceRole: resolved.canonicalRole,
       smavRole: resolved.smavRole,
     };
+  }
+
+  // A salon service specialist does not need a portal-login user account just
+  // to be assigned to a bill. Accept active, unlinked GlossyLooks staff whose
+  // operational designation clearly denotes a service stylist/artist. This
+  // affects POS assignment only; it grants no SMAV login or admin privilege.
+  if (!resolved.canonicalRole) {
+    const jobTitle = firstNonEmptyString(
+      record.staff_role,
+      record.staffRole,
+      record.job_title,
+      record.jobTitle,
+      record.designation,
+      record.specialty,
+      record.role
+    ).toLowerCase().replace(/[\s_-]+/g, ' ').trim();
+    const isSalonServiceSpecialist = /\b(stylist|beautician|hairdresser)\b/.test(jobTitle)
+      || /\b(makeup|nail|hair)\s+artist\b/.test(jobTitle);
+    if (isSalonServiceSpecialist) {
+      return {
+        accepted: true,
+        role: 'Stylist',
+        sourceRole: 'STYLIST',
+        smavRole: 'POS_BILLING',
+      };
+    }
   }
 
   return {
