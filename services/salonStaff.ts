@@ -460,8 +460,13 @@ export function resolveAuthoritativeUserRole(
 }
 
 /**
- * Determines whether a staff record is an eligible POS stylist based strictly on authoritative `public.users.role`.
- * Never uses `public.staff.role` (job title) for access or display role.
+ * Determines whether a staff record is eligible for *assignment to a salon
+ * service*. This does not grant SMAV login or administrative access.
+ *
+ * A linked portal account remains authoritative: only a linked STYLIST can
+ * be selected. An active staff profile with no canonical portal role can also
+ * be selected when its operational designation is a salon service role. This
+ * is needed for artists who do not require an individual portal login.
  */
 export function normalizeSalonRole(
   record: Record<string, unknown>,
@@ -473,10 +478,6 @@ export function normalizeSalonRole(
   smavRole: 'ADMIN' | 'POS_BILLING';
 } {
   const resolved = resolveAuthoritativeUserRole(record, userIndex);
-  if (!resolved.canonicalRole || !resolved.displayRole) {
-    return { accepted: false, role: '', smavRole: 'POS_BILLING' };
-  }
-
   // A linked user account is authoritative whenever it exists. Only a linked
   // STYLIST account is selectable; owners/managers/receptionists never become
   // service stylists merely because of a free-text staff designation.
@@ -489,36 +490,47 @@ export function normalizeSalonRole(
     };
   }
 
+  // An explicit non-stylist portal role is never overridden by a staff job
+  // title. This keeps reception, inventory and admin accounts out of POS
+  // service assignment.
+  if (resolved.canonicalRole) {
+    return {
+      accepted: false,
+      role: resolved.displayRole || '',
+      sourceRole: resolved.canonicalRole,
+      smavRole: resolved.smavRole,
+    };
+  }
+
   // A salon service specialist does not need a portal-login user account just
-  // to be assigned to a bill. Accept active, unlinked GlossyLooks staff whose
-  // operational designation clearly denotes a service stylist/artist. This
-  // affects POS assignment only; it grants no SMAV login or admin privilege.
-  if (!resolved.canonicalRole) {
-    const jobTitle = firstNonEmptyString(
-      record.staff_role,
-      record.staffRole,
-      record.job_title,
-      record.jobTitle,
-      record.designation,
-      record.specialty,
-      record.role
-    ).toLowerCase().replace(/[\s_-]+/g, ' ').trim();
-    const isSalonServiceSpecialist = /\b(stylist|beautician|hairdresser)\b/.test(jobTitle)
-      || /\b(makeup|nail|hair)\s+artist\b/.test(jobTitle);
-    if (isSalonServiceSpecialist) {
-      return {
-        accepted: true,
-        role: 'Stylist',
-        sourceRole: 'STYLIST',
-        smavRole: 'POS_BILLING',
-      };
-    }
+  // to be assigned to a bill. The earlier implementation returned before this
+  // block whenever canonicalRole was absent, making this intended fallback
+  // unreachable and leaving valid artists out of the dropdown.
+  const jobTitle = firstNonEmptyString(
+    record.staff_role,
+    record.staffRole,
+    record.job_title,
+    record.jobTitle,
+    record.designation,
+    record.specialty,
+    record.role
+  ).toLowerCase().replace(/[\s_-]+/g, ' ').trim();
+  const isNonServiceRole = /\b(owner|manager|admin|reception|cashier|billing|inventory|account|security)\b/.test(jobTitle);
+  const isSalonServiceSpecialist = /\b(stylist|beautician|hairdresser|therapist|technician|esthetician|cosmetologist)\b/.test(jobTitle)
+    || /\b(makeup|nail|hair|beauty|bridal|facial|spa)\b.*\b(artist|specialist|expert|professional)\b/.test(jobTitle);
+
+  if (!isNonServiceRole && isSalonServiceSpecialist) {
+    return {
+      accepted: true,
+      role: 'Stylist',
+      sourceRole: 'STYLIST',
+      smavRole: 'POS_BILLING',
+    };
   }
 
   return {
     accepted: false,
-    role: resolved.displayRole,
-    sourceRole: resolved.canonicalRole,
+    role: '',
     smavRole: resolved.smavRole,
   };
 }
