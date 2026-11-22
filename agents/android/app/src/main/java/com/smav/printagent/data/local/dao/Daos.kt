@@ -59,6 +59,18 @@ interface SalonBillDao {
     @Query("SELECT * FROM salon_bills WHERE billNumber = :billNumber LIMIT 1")
     suspend fun getBillByNumber(billNumber: String): SalonBillEntity?
 
+    @Query("SELECT * FROM salon_bills WHERE centralBillId = :centralBillId LIMIT 1")
+    suspend fun getBillByCentralId(centralBillId: String): SalonBillEntity?
+
+    @Query("SELECT * FROM salon_bills WHERE idempotencyKey = :idempotencyKey LIMIT 1")
+    suspend fun getBillByIdempotencyKey(idempotencyKey: String): SalonBillEntity?
+
+    @Query("SELECT * FROM salon_bills WHERE (businessId = :outletId OR branchId = :outletId) AND isVoided = 1 ORDER BY createdAtLocal DESC")
+    suspend fun getDeletedBillsForOutlet(outletId: String): List<SalonBillEntity>
+
+    @Query("SELECT * FROM salon_bills WHERE (businessId = :outletId OR branchId = :outletId) AND isVoided = 0 AND syncStatus = 'SYNCED' AND createdAtLocal >= :startOfDayMs")
+    suspend fun getTodaySyncedBillsForOutlet(outletId: String, startOfDayMs: Long): List<SalonBillEntity>
+
     @Query("SELECT * FROM salon_bill_items WHERE billId = :billId")
     suspend fun getItemsForBill(billId: String): List<SalonBillItemEntity>
 
@@ -99,6 +111,12 @@ interface SalonBillDao {
 
     @Query("UPDATE salon_bills SET isVoided = 1, voidReason = :reason, voidedAtLocal = :voidedAt, voidedBy = :voidedBy, updatedAtLocal = :voidedAt, conflictMessage = NULL WHERE id = :id")
     suspend fun markVoided(id: String, reason: String, voidedAt: Long, voidedBy: String)
+
+    @Query("UPDATE salon_bills SET isVoided = 1, voidReason = :reason, voidedAtLocal = :voidedAt, voidedBy = :voidedBy, updatedAtLocal = :voidedAt, syncStatus = 'SYNCED', syncError = NULL, conflictMessage = NULL WHERE id = :id")
+    suspend fun markVoidedSynced(id: String, reason: String?, voidedAt: Long, voidedBy: String?)
+
+    @Query("UPDATE salon_bills SET isVoided = 0, voidReason = NULL, voidedAtLocal = NULL, voidedBy = NULL, updatedAtLocal = :restoredAt, syncStatus = 'SYNCED', syncError = NULL, conflictMessage = NULL WHERE id = :id")
+    suspend fun markRestored(id: String, restoredAt: Long)
 
     @Query("UPDATE salon_bills SET conflictMessage = :message, syncStatus = 'CONFLICT' WHERE id = :id OR billNumber = :id")
     suspend fun markConflict(id: String, message: String?)

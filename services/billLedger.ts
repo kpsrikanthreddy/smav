@@ -55,6 +55,17 @@ export interface TransactionLedgerEntry {
   editReason?: string | null;
   voidedAt?: string | null;
   voidReason?: string | null;
+  deletedAt?: string | null;
+  deletedBy?: string | null;
+  deletedByName?: string | null;
+  deleteReason?: string | null;
+  restoredAt?: string | null;
+  restoredBy?: string | null;
+  restoredByName?: string | null;
+  restoreReason?: string | null;
+  externalBillId?: string | null;
+  syncRevision?: number;
+  updatedAt?: string | null;
   editHistory?: BillEditAuditSnapshot[];
 }
 
@@ -177,9 +188,39 @@ export function isTimestampInOutletLocalToday(
   return ms >= bounds.startMs && ms <= bounds.endMs;
 }
 
+export function getOutletDateRangeBounds(params: {
+  fromDate?: string | null;
+  toDate?: string | null;
+  timezone?: string;
+}): { timezone: string; fromDateKey: string | null; toDateKey: string | null; startIso: string | null; endIso: string | null } {
+  const resolvedTz = params.timezone || DEFAULT_OUTLET_TIMEZONE;
+  const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+  const cleanFrom = params.fromDate && dateRe.test(params.fromDate.trim()) ? params.fromDate.trim() : null;
+  const cleanTo = params.toDate && dateRe.test(params.toDate.trim()) ? params.toDate.trim() : null;
+
+  let startIso: string | null = null;
+  let endIso: string | null = null;
+
+  if (cleanFrom) {
+    const [y, m, d] = cleanFrom.split('-').map(Number);
+    const roughStartUtc = new Date(Date.UTC(y, m - 1, d, 0, 0, 0, 0));
+    const offsetMs = getTimezoneOffsetMs(roughStartUtc, resolvedTz);
+    startIso = new Date(roughStartUtc.getTime() - offsetMs).toISOString();
+  }
+
+  if (cleanTo) {
+    const [y, m, d] = cleanTo.split('-').map(Number);
+    const roughNextDayUtc = new Date(Date.UTC(y, m - 1, d + 1, 0, 0, 0, 0));
+    const nextOffsetMs = getTimezoneOffsetMs(roughNextDayUtc, resolvedTz);
+    endIso = new Date(roughNextDayUtc.getTime() - nextOffsetMs - 1).toISOString();
+  }
+
+  return { timezone: resolvedTz, fromDateKey: cleanFrom, toDateKey: cleanTo, startIso, endIso };
+}
+
 /**
- * RBAC check for Edit / Void bill operations.
- * Allowed: SUPERADMIN, ADMIN, and authorized MANAGER / OWNER (mapped to ADMIN in SMAV).
+ * RBAC check for Edit / Void / Restore & Historical/Deleted Ledger access.
+ * Allowed: SUPERADMIN, ADMIN, OWNER, and authorized MANAGER (mapped to ADMIN in SMAV).
  * Blocked: POS_BILLING, STAFF, STYLIST, RECEPTIONIST, INVENTORY_STAFF.
  */
 export function canModifyBills(session?: {
@@ -192,11 +233,30 @@ export function canModifyBills(session?: {
   const role = String(session.role || '').trim().toLowerCase();
   const displayRole = String(session.displayRole || '').trim().toUpperCase();
   const outletRole = String(session.outletRole || '').trim().toUpperCase();
+  const sourceRole = String(session.sourceRole || '').trim().toUpperCase();
 
   if (role === 'superadmin' || displayRole === 'SUPERADMIN') return true;
-  if (role === 'admin' || displayRole === 'ADMIN' || outletRole === 'ADMIN') return true;
-  if (outletRole === 'MANAGER' || outletRole === 'OWNER' || displayRole === 'MANAGER') return true;
+  if (role === 'admin' || displayRole === 'ADMIN' || outletRole === 'ADMIN' || sourceRole === 'ADMIN') return true;
+  if (
+    outletRole === 'MANAGER' ||
+    outletRole === 'OWNER' ||
+    displayRole === 'MANAGER' ||
+    displayRole === 'OWNER' ||
+    sourceRole === 'OWNER' ||
+    sourceRole === 'MANAGER'
+  ) {
+    return true;
+  }
   return false;
+}
+
+export function canViewHistoricalAndDeletedBills(session?: {
+  role?: string | null;
+  displayRole?: string | null;
+  outletRole?: string | null;
+  sourceRole?: string | null;
+} | null): boolean {
+  return canModifyBills(session);
 }
 
 export function extractStylistNames(items: LedgerBillItem[]): string[] {
@@ -459,11 +519,24 @@ export function normalizeLedgerBillRow(
     createdAt,
     stylistNames: extractStylistNames(items),
     editVersion: Math.max(1, Number(row.edit_version ?? row.editVersion ?? 1)),
-    isVoided: Boolean(row.is_voided ?? row.isVoided ?? false),
+    isVoided: Boolean(row.is_voided ?? row.isVoided ?? Boolean(row.deleted_at || row.deletedAt)),
     editedAt: row.edited_at || row.editedAt || null,
     editReason: row.edit_reason || row.editReason || null,
-    voidedAt: row.voided_at || row.voidedAt || null,
-    voidReason: row.void_reason || row.voidReason || null,
+    voidedAt: row.voided_at || row.voidedAt || row.deleted_at || row.deletedAt || null,
+    voidReason: row.void_reason || row.voidReason || row.delete_reason || row.deleteReason || null,
+    deletedAt: row.deleted_at || row.deletedAt || row.voided_at || row.voidedAt || null,
+    deletedBy: row.deleted_by || row.deletedBy || row.voided_by || row.voidedBy || null,
+    deletedByName: row.deleted_by_name || row.deletedByName || null,
+    deleteReason: row.delete_reason || row.deleteReason || row.void_reason || row.voidReason || null,
+    restoredAt: row.restored_at || row.restoredAt || null,
+    restoredBy: row.restored_by || row.restoredBy || null,
+    restoredByName: row.restored_by_name || row.restoredByName || null,
+    restoreReason: row.restore_reason || row.restoreReason || null,
+    externalBillId: row.external_bill_id || row.externalBillId || null,
+    syncRevision: Number.isFinite(Number(row.sync_revision ?? row.syncRevision))
+      ? Number(row.sync_revision ?? row.syncRevision)
+      : undefined,
+    updatedAt: row.updated_at || row.updatedAt || null,
     editHistory: Array.isArray(row.edit_history)
       ? row.edit_history
       : Array.isArray(row.editHistory)

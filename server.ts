@@ -22,6 +22,8 @@ import {
 import {
   DEFAULT_OUTLET_TIMEZONE,
   canModifyBills,
+  canViewHistoricalAndDeletedBills,
+  getOutletDateRangeBounds,
   getOutletLocalDayBounds,
   isTimestampInOutletLocalToday,
   normalizeLedgerBillRow,
@@ -2051,6 +2053,26 @@ function broadcastCatalogUpdate(outletId: string, eventData: any) {
         client.res.write(payload);
       } catch (_e) {}
     }
+  });
+}
+
+function broadcastLedgerUpdate(
+  outletId: string,
+  event: {
+    action: 'created' | 'upserted' | 'edited' | 'voided' | 'restored';
+    billId?: string | null;
+    billNumber?: string | null;
+    branchId?: string | null;
+    branchCode?: string | null;
+    isVoided?: boolean;
+    syncRevision?: number | null;
+  }
+) {
+  broadcastCatalogUpdate(outletId, {
+    type: 'LEDGER_UPDATED',
+    outletId,
+    ...event,
+    timestamp: Date.now()
   });
 }
 
@@ -5736,6 +5758,47 @@ async function handleFinalizeCentralBillNumber(req: express.Request, res: expres
       sourceSystem
     });
 
+    // Single Source of Truth: whenever external portal (e.g. Glossy Looks Admin) supplies bill
+    // details during finalization, persist/upsert into central SMAV billing table so SMAV Web
+    // and SMAV Android immediately see the bill with identical invoice/branch/payment details.
+    let syncedLedgerBillId: string | null = null;
+    const hasBillSnapshot =
+      req.body?.grandTotal !== undefined ||
+      req.body?.grand_total !== undefined ||
+      (Array.isArray(req.body?.items) && req.body.items.length > 0) ||
+      Boolean(req.body?.customerName || req.body?.customer_name);
+    if (serviceDb && hasBillSnapshot) {
+      try {
+        const upserted = await upsertExternalBillIntoCentralLedger({
+          db: serviceDb,
+          outlet: auth.outlet,
+          centralBillId: finalized.centralBillId,
+          centralBillNumber: finalized.centralBillNumber,
+          externalBillId: externalOrderId || localBillId || null,
+          idempotencyKey: idempotencyKey || `EXT_${finalized.centralBillNumber}`,
+          branchId: finalized.branchId || String(req.body?.branchId || req.body?.branch_id || '').trim() || null,
+          branchCode: finalized.branchCode,
+          branchName: finalized.branchName,
+          sourceSystem,
+          customerName: req.body?.customerName ?? req.body?.customer_name ?? 'Walk-in Guest',
+          customerPhone: req.body?.customerPhone ?? req.body?.customer_phone ?? '',
+          paymentMode: req.body?.paymentMode ?? req.body?.payment_mode ?? 'cash',
+          subtotal: req.body?.subtotal,
+          discount: req.body?.discount ?? req.body?.discountAmount ?? req.body?.discount_amount,
+          tax: req.body?.tax ?? req.body?.taxAmount ?? req.body?.totalTax ?? req.body?.total_tax,
+          grandTotal: req.body?.grandTotal ?? req.body?.grand_total ?? 0,
+          items: Array.isArray(req.body?.items) ? req.body.items : [],
+          billedAt: req.body?.billedAt ?? req.body?.billed_at ?? req.body?.createdAt ?? finalized.finalizedAt
+        });
+        syncedLedgerBillId = upserted.bill?.id || null;
+      } catch (ledgerErr: any) {
+        console.error(
+          `[SMAV Unified Ledger] Failed to upsert finalized external bill ${finalized.centralBillNumber}:`,
+          sanitizeErrorMessage(ledgerErr)
+        );
+      }
+    }
+
     let outboundEventId: string | null = null;
     let outboundSyncStatus: string | null = null;
     if (req.body?.syncToGlossyLooks === true) {
@@ -5765,7 +5828,7 @@ async function handleFinalizeCentralBillNumber(req: express.Request, res: expres
         idempotencyKey: idempotencyKey || finalized.centralBillNumber,
         centralBillId: finalized.centralBillId,
         centralBillNumber: finalized.centralBillNumber,
-        localBillId,
+        localBillId: localBillId || syncedLedgerBillId,
         branchId: resolvedBranchId,
         branchCode: finalized.branchCode,
         branchName: finalized.branchName,
@@ -5795,6 +5858,7 @@ async function handleFinalizeCentralBillNumber(req: express.Request, res: expres
       centralBillId: finalized.centralBillId,
       centralBillNumber: finalized.centralBillNumber,
       billNumber: finalized.centralBillNumber,
+      ...(syncedLedgerBillId ? { ledgerBillId: syncedLedgerBillId } : {}),
       outletId: finalized.outletId,
       branchId: finalized.branchId,
       branchCode: finalized.branchCode,
@@ -5828,6 +5892,9 @@ async function handleFinalizeCentralBillNumber(req: express.Request, res: expres
 
 app.get('/api/pos/branches', (req, res) => handleGetPermittedBranches(req, res));
 app.get('/api/integrations/glossylooks/branches', (req, res) => handleGetPermittedBranches(req, res, 'glossylooks'));
+app.get('/api/integrations/outlets/:outletCode/branches', (req, res) =>
+  handleGetPermittedBranches(req, res, String(req.params.outletCode || '').trim())
+);
 
 app.post('/api/pos/salon/next-bill-number', (req, res) => handleReserveCentralBillNumber(req, res));
 app.post('/api/central/bill-numbers/reserve', (req, res) => handleReserveCentralBillNumber(req, res));
@@ -5838,6 +5905,33 @@ app.post('/api/integrations/glossylooks/bill-numbers/reserve', (req, res) =>
 app.post('/api/central/bill-numbers/finalize', (req, res) => handleFinalizeCentralBillNumber(req, res));
 app.post('/api/integrations/glossylooks/bill-numbers/finalize', (req, res) =>
   handleFinalizeCentralBillNumber(req, res, 'glossylooks')
+);
+
+// Unified Single-Source-of-Truth Billing Ledger & Lifecycle Integration Endpoints
+// (Server-to-server authenticated via X-Integration-Key + HMAC-SHA256; multi-tenant)
+app.get('/api/integrations/glossylooks/ledger', (req, res) =>
+  handleIntegrationLedgerQuery(req, res, 'glossylooks')
+);
+app.get('/api/integrations/outlets/:outletCode/ledger', (req, res) =>
+  handleIntegrationLedgerQuery(req, res, String(req.params.outletCode || '').trim())
+);
+app.post('/api/integrations/glossylooks/bills/upsert', (req, res) =>
+  handleIntegrationBillUpsert(req, res, 'glossylooks')
+);
+app.post('/api/integrations/outlets/:outletCode/bills/upsert', (req, res) =>
+  handleIntegrationBillUpsert(req, res, String(req.params.outletCode || '').trim())
+);
+app.post('/api/integrations/glossylooks/bills/:billId/void', (req, res) =>
+  handleIntegrationBillVoid(req, res, 'glossylooks')
+);
+app.post('/api/integrations/outlets/:outletCode/bills/:billId/void', (req, res) =>
+  handleIntegrationBillVoid(req, res, String(req.params.outletCode || '').trim())
+);
+app.post('/api/integrations/glossylooks/bills/:billId/restore', (req, res) =>
+  handleIntegrationBillRestore(req, res, 'glossylooks')
+);
+app.post('/api/integrations/outlets/:outletCode/bills/:billId/restore', (req, res) =>
+  handleIntegrationBillRestore(req, res, String(req.params.outletCode || '').trim())
 );
 
 // Preallocate a branch-specific range of central bill numbers for offline Android Print Agent devices
@@ -6273,6 +6367,9 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
       bill_id: string | null;
       outbound_event_id: string | null;
       outbound_sync_status: string | null;
+      is_voided?: boolean;
+      deleted_at?: string | null;
+      void_reason?: string | null;
     }> = [];
 
     for (const entry of bills) {
@@ -6339,17 +6436,60 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
         });
       }
 
-      // 1. Check for idempotent replay before insert
+      // 1. Check for idempotent replay or previously soft-deleted record before insert
+      let existingRow: any = null;
       const { data: existingByIdem } = await lookupDb
         .from('smav_salon_bills')
-        .select('id, bill_number, central_bill_id, central_bill_number')
+        .select('id, bill_number, central_bill_id, central_bill_number, is_voided, voided_at, void_reason, edit_version')
+        .eq('outlet_id', session.activeOutlet.id)
         .eq('idempotency_key', cleanIdempotencyKey)
         .maybeSingle();
+      existingRow = existingByIdem || null;
 
-      if (existingByIdem?.id) {
-        persistedBillId = String(existingByIdem.id);
-        canonicalBillNumber = String((existingByIdem as any).central_bill_number || existingByIdem.bill_number || canonicalBillNumber);
-        centralBillId = (existingByIdem as any).central_bill_id ? String((existingByIdem as any).central_bill_id) : centralBillId;
+      if (!existingRow && centralBillId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(centralBillId)) {
+        const { data: existingByCentral } = await lookupDb
+          .from('smav_salon_bills')
+          .select('id, bill_number, central_bill_id, central_bill_number, is_voided, voided_at, void_reason, edit_version')
+          .eq('outlet_id', session.activeOutlet.id)
+          .eq('central_bill_id', centralBillId)
+          .maybeSingle();
+        existingRow = existingByCentral || null;
+      }
+
+      if (!existingRow && canonicalBillNumber) {
+        const { data: existingByNumber } = await lookupDb
+          .from('smav_salon_bills')
+          .select('id, bill_number, central_bill_id, central_bill_number, is_voided, voided_at, void_reason, edit_version')
+          .eq('outlet_id', session.activeOutlet.id)
+          .eq('bill_number', canonicalBillNumber)
+          .maybeSingle();
+        existingRow = existingByNumber || null;
+      }
+
+      // Never allow an offline device to re-upload or reactivate a deleted/voided bill
+      if (existingRow?.id && existingRow.is_voided) {
+        syncedIds.push(bill.billNumber || canonicalBillNumber);
+        syncedBillsResult.push({
+          local_bill_number: String(bill.billNumber || canonicalBillNumber),
+          canonical_bill_number: String(existingRow.central_bill_number || existingRow.bill_number || canonicalBillNumber),
+          central_bill_id: existingRow.central_bill_id ? String(existingRow.central_bill_id) : centralBillId,
+          branch_id: allowedBranch.id,
+          branch_code: allowedBranch.branchCode,
+          branch_name: allowedBranch.name,
+          bill_id: String(existingRow.id),
+          outbound_event_id: null,
+          outbound_sync_status: 'deleted_tombstone',
+          is_voided: true,
+          deleted_at: existingRow.voided_at || null,
+          void_reason: existingRow.void_reason || null
+        });
+        continue;
+      }
+
+      if (existingRow?.id) {
+        persistedBillId = String(existingRow.id);
+        canonicalBillNumber = String(existingRow.central_bill_number || existingRow.bill_number || canonicalBillNumber);
+        centralBillId = existingRow.central_bill_id ? String(existingRow.central_bill_id) : centralBillId;
       } else {
         const normalizedItems = items.map((item: any) => {
           const qty = Math.max(1, Number(item.quantity || 1));
@@ -6622,7 +6762,17 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
         branch_name: allowedBranch.name,
         bill_id: persistedBillId,
         outbound_event_id: outboundEventId,
-        outbound_sync_status: outboundSyncStatus
+        outbound_sync_status: outboundSyncStatus,
+        is_voided: false
+      });
+
+      broadcastLedgerUpdate(session.activeOutlet.id, {
+        action: 'created',
+        billId: persistedBillId,
+        billNumber: canonicalBillNumber,
+        branchId: allowedBranch.id,
+        branchCode: allowedBranch.branchCode,
+        isVoided: false
       });
     }
 
@@ -6863,60 +7013,432 @@ async function locateOutletBillRecord(
   return { found: false, sourceTable: 'memory', row: null };
 }
 
-app.get('/api/pos/ledger/today', requireAuth, async (req, res) => {
-  const session: UserSession = (req as any).userSession;
-  const outletId = session.activeOutlet.id;
-  const category = session.activeOutlet.category;
-  const requestedTz =
-    typeof req.query.timezone === 'string' && req.query.timezone.trim()
-      ? req.query.timezone.trim()
-      : DEFAULT_OUTLET_TIMEZONE;
-  const bounds = getOutletLocalDayBounds(requestedTz, new Date());
-  const db = getLedgerDbClient(session);
+async function upsertExternalBillIntoCentralLedger(params: {
+  db: ReturnType<typeof getCentralSupabaseServiceClient>;
+  outlet: { id: string; code: string; name: string; category?: string | null };
+  centralBillId?: string | null;
+  centralBillNumber: string;
+  externalBillId?: string | null;
+  idempotencyKey?: string | null;
+  branchId?: string | null;
+  branchCode?: string | null;
+  branchName?: string | null;
+  sourceSystem?: string | null;
+  customerName?: string | null;
+  customerPhone?: string | null;
+  paymentMode?: string | null;
+  subtotal?: unknown;
+  discount?: unknown;
+  tax?: unknown;
+  grandTotal?: unknown;
+  items?: unknown[];
+  billedAt?: unknown;
+}): Promise<{ created: boolean; existed: boolean; isVoided: boolean; bill: TransactionLedgerEntry | null }> {
+  const { db, outlet } = params;
+  if (!db) throw new Error('Central service database unavailable.');
+
+  const category = String(outlet.category || 'salon').trim().toLowerCase();
+  const table: 'smav_salon_bills' | 'smav_central_sales' =
+    category === 'salon' ? 'smav_salon_bills' : 'smav_central_sales';
+  const cleanBillNumber = String(params.centralBillNumber || '').trim().toUpperCase();
+  if (!cleanBillNumber) throw new Error('centralBillNumber is required to upsert ledger bill.');
+
+  const cleanExternalId = String(params.externalBillId || '').trim() || null;
+  const cleanIdem = String(params.idempotencyKey || `EXT_${cleanBillNumber}`).trim();
+  const validCentralUuid =
+    params.centralBillId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(params.centralBillId)
+      ? params.centralBillId
+      : null;
+
+  // Deterministic stable lookup within outlet_id (never rely on customer name)
+  let existing: any = null;
+  if (validCentralUuid && table === 'smav_salon_bills') {
+    const { data } = await db
+      .from(table)
+      .select('*')
+      .eq('outlet_id', outlet.id)
+      .eq('central_bill_id', validCentralUuid)
+      .maybeSingle();
+    if (data) existing = data;
+  }
+  if (!existing && cleanExternalId) {
+    try {
+      const { data } = await db
+        .from(table)
+        .select('*')
+        .eq('outlet_id', outlet.id)
+        .eq('external_bill_id', cleanExternalId)
+        .maybeSingle();
+      if (data) existing = data;
+    } catch {}
+  }
+  if (!existing && cleanIdem) {
+    const { data } = await db
+      .from(table)
+      .select('*')
+      .eq('outlet_id', outlet.id)
+      .eq('idempotency_key', cleanIdem)
+      .maybeSingle();
+    if (data) existing = data;
+  }
+  if (!existing) {
+    const { data } = await db
+      .from(table)
+      .select('*')
+      .eq('outlet_id', outlet.id)
+      .eq('bill_number', cleanBillNumber)
+      .maybeSingle();
+    if (data) existing = data;
+  }
+
+  // Never reactivate a soft-deleted bill through an upsert
+  if (existing && (existing.is_voided || existing.deleted_at)) {
+    return {
+      created: false,
+      existed: true,
+      isVoided: true,
+      bill: normalizeLedgerBillRow(existing, table, outlet.id)
+    };
+  }
+
+  const rawItems = Array.isArray(params.items) ? params.items : [];
+  const normalizedItems = rawItems.map((item: any) => {
+    const qty = Math.max(1, Number(item?.quantity ?? item?.qty ?? 1));
+    const unitPrice = Number(item?.unit_price ?? item?.unitPrice ?? item?.price ?? 0);
+    const discountPercent = Number(item?.discount_percent ?? item?.discountPercent ?? 0);
+    const lineTotal = Number(
+      item?.line_total ?? item?.lineTotal ?? item?.total ?? Number((qty * unitPrice * (1 - discountPercent / 100)).toFixed(2))
+    );
+    return {
+      service_id: item?.service_id ?? item?.serviceId ?? item?.id ?? null,
+      service_name: String(item?.service_name ?? item?.serviceName ?? item?.name ?? 'Service').trim(),
+      name: String(item?.service_name ?? item?.serviceName ?? item?.name ?? 'Service').trim(),
+      stylist_id: item?.stylist_id ?? item?.stylistId ?? null,
+      stylist_name: item?.stylist_name ?? item?.stylistName ?? item?.stylist ?? null,
+      quantity: qty,
+      unit_price: Number.isFinite(unitPrice) ? unitPrice : 0,
+      discount_percent: Number.isFinite(discountPercent) ? discountPercent : 0,
+      line_total: Number.isFinite(lineTotal) ? lineTotal : 0
+    };
+  });
+
+  const billedIso = parseSaleTimestampIso(params.billedAt);
+  const cleanName = String(params.customerName || 'Walk-in Guest').trim() || 'Walk-in Guest';
+  const cleanPhone = String(params.customerPhone || '').replace(/\D+/g, '').slice(-10) || String(params.customerPhone || '').trim();
+  const cleanPaymentMode = String(params.paymentMode || 'cash').trim().toLowerCase() || 'cash';
+  const grandTotal = Number.isFinite(Number(params.grandTotal)) ? Number(params.grandTotal) : 0;
+  const subtotal = Number.isFinite(Number(params.subtotal))
+    ? Number(params.subtotal)
+    : normalizedItems.reduce((sum, i) => sum + i.line_total, 0) || grandTotal;
+  const discountAmount = Number.isFinite(Number(params.discount)) ? Number(params.discount) : 0;
+  const totalTax = Number.isFinite(Number(params.tax))
+    ? Number(params.tax)
+    : Math.max(0, Number((grandTotal - Math.max(0, subtotal - discountAmount)).toFixed(2)));
+  const resolvedSource = normalizeSourceSystem(params.sourceSystem || 'glossylooks_admin_pos');
+  const cleanBranchId = String(params.branchId || '').trim() || null;
+  const cleanBranchCode = String(params.branchCode || '').trim().toUpperCase() || null;
+  const cleanBranchName = String(params.branchName || '').trim() || null;
+
+  if (existing?.id) {
+    const patch: Record<string, any> = {
+      customer_name: cleanName,
+      customer_phone: cleanPhone || existing.customer_phone || null,
+      payment_mode: cleanPaymentMode,
+      grand_total: grandTotal,
+      subtotal,
+      discount_amount: discountAmount,
+      total_tax: totalTax,
+      ...(normalizedItems.length > 0 ? { items: normalizedItems } : {}),
+      ...(cleanBranchId ? { branch_id: cleanBranchId } : {}),
+      ...(cleanBranchCode ? { branch_code: cleanBranchCode } : {}),
+      ...(cleanBranchName ? { branch_name: cleanBranchName } : {}),
+      ...(cleanExternalId ? { external_bill_id: cleanExternalId } : {}),
+      updated_at: new Date().toISOString()
+    };
+    let upd = await db.from(table).update(patch).eq('id', existing.id).eq('outlet_id', outlet.id).select('*').maybeSingle();
+    if (upd.error && /column .* does not exist/i.test(upd.error.message || '')) {
+      const { external_bill_id: _e, subtotal: _s, discount_amount: _d, total_tax: _t, updated_at: _u, ...safePatch } = patch;
+      upd = await db.from(table).update(safePatch).eq('id', existing.id).eq('outlet_id', outlet.id).select('*').maybeSingle();
+    }
+    const row = upd.data || { ...existing, ...patch };
+    const normalized = normalizeLedgerBillRow(row, table, outlet.id);
+    broadcastLedgerUpdate(outlet.id, {
+      action: 'upserted',
+      billId: normalized.id,
+      billNumber: normalized.billNumber,
+      branchId: normalized.branchId,
+      branchCode: normalized.branchCode,
+      isVoided: false,
+      syncRevision: normalized.syncRevision ?? null
+    });
+    return { created: false, existed: true, isVoided: false, bill: normalized };
+  }
+
+  const insertPayload: Record<string, any> =
+    table === 'smav_salon_bills'
+      ? {
+          outlet_id: outlet.id,
+          bill_number: cleanBillNumber,
+          central_bill_number: cleanBillNumber,
+          ...(validCentralUuid ? { central_bill_id: validCentralUuid } : {}),
+          idempotency_key: cleanIdem,
+          ...(cleanExternalId ? { external_bill_id: cleanExternalId } : {}),
+          ...(cleanBranchId ? { branch_id: cleanBranchId } : {}),
+          ...(cleanBranchCode ? { branch_code: cleanBranchCode } : {}),
+          ...(cleanBranchName ? { branch_name: cleanBranchName } : {}),
+          source_system: resolvedSource,
+          customer_name: cleanName,
+          customer_phone: cleanPhone || null,
+          payment_mode: cleanPaymentMode,
+          subtotal,
+          discount_amount: discountAmount,
+          total_tax: totalTax,
+          grand_total: grandTotal,
+          items: normalizedItems,
+          created_at: billedIso
+        }
+      : {
+          outlet_id: outlet.id,
+          sale_kind: category === 'restaurant' || category === 'retail' ? category : 'other',
+          idempotency_key: cleanIdem,
+          bill_number: cleanBillNumber,
+          ...(cleanExternalId ? { external_bill_id: cleanExternalId } : {}),
+          customer_name: cleanName,
+          customer_phone: cleanPhone || null,
+          payment_mode: cleanPaymentMode,
+          subtotal,
+          discount_amount: discountAmount,
+          total_tax: totalTax,
+          grand_total: grandTotal,
+          items: normalizedItems,
+          details: {
+            branch_id: cleanBranchId,
+            branch_code: cleanBranchCode,
+            branch_name: cleanBranchName,
+            source_system: resolvedSource,
+            subtotal,
+            discount: discountAmount,
+            total_tax: totalTax
+          },
+          billed_at: billedIso,
+          created_at: billedIso
+        };
+
+  let ins = await db.from(table).insert(insertPayload).select('*').single();
+  if (ins.error && /column .* does not exist/i.test(ins.error.message || '')) {
+    const { external_bill_id: _e, subtotal: _s, discount_amount: _d, total_tax: _t, ...fallbackPayload } = insertPayload;
+    ins = await db.from(table).insert(fallbackPayload).select('*').single();
+  }
+  if (ins.error) {
+    throw new Error(`Failed to persist external bill ${cleanBillNumber}: ${ins.error.message}`);
+  }
+
+  const normalized = normalizeLedgerBillRow(ins.data, table, outlet.id);
+  broadcastLedgerUpdate(outlet.id, {
+    action: 'created',
+    billId: normalized.id,
+    billNumber: normalized.billNumber,
+    branchId: normalized.branchId,
+    branchCode: normalized.branchCode,
+    isVoided: false,
+    syncRevision: normalized.syncRevision ?? null
+  });
+  return { created: true, existed: false, isVoided: false, bill: normalized };
+}
+
+interface UnifiedLedgerTombstone {
+  id: string;
+  billNumber: string;
+  centralBillId: string | null;
+  idempotencyKey: string | null;
+  externalBillId: string | null;
+  isVoided: boolean;
+  deletedAt: string | null;
+  voidReason: string | null;
+  editVersion: number;
+  syncRevision: number | null;
+}
+
+async function queryUnifiedOutletLedger(params: {
+  db: ReturnType<typeof getCentralSupabaseServiceClient> | ReturnType<typeof getCentralSupabaseClient>;
+  outletId: string;
+  outletName: string;
+  outletCategory: string;
+  scope: 'today' | 'history' | 'deleted';
+  timezone?: string;
+  fromDate?: string | null;
+  toDate?: string | null;
+  branchId?: string | null;
+  branchCode?: string | null;
+  search?: string | null;
+  includeTombstones?: boolean;
+  sinceRevision?: number | null;
+  limit?: number;
+}) {
+  const { db, outletId, outletCategory, scope } = params;
+  const resolvedTz = params.timezone?.trim() || DEFAULT_OUTLET_TIMEZONE;
+  const todayBounds = getOutletLocalDayBounds(resolvedTz, new Date());
+  const rangeBounds =
+    scope === 'history' || scope === 'deleted'
+      ? getOutletDateRangeBounds({ fromDate: params.fromDate, toDate: params.toDate, timezone: resolvedTz })
+      : { timezone: todayBounds.timezone, fromDateKey: todayBounds.dateKey, toDateKey: todayBounds.dateKey, startIso: todayBounds.startIso, endIso: todayBounds.endIso };
+
+  const table: 'smav_salon_bills' | 'smav_central_sales' =
+    outletCategory === 'salon' ? 'smav_salon_bills' : 'smav_central_sales';
+  const timeColumn = table === 'smav_salon_bills' ? 'created_at' : 'billed_at';
+  const maxRows = Math.min(Math.max(Number(params.limit || 300), 1), 1000);
+  const branchIdFilter = String(params.branchId || '').trim();
+  const branchCodeFilter = String(params.branchCode || '').trim().toUpperCase();
+  const searchLower = String(params.search || '').trim().toLowerCase();
 
   const entries: TransactionLedgerEntry[] = [];
+  const tombstones: UnifiedLedgerTombstone[] = [];
   const seenKeys = new Set<string>();
+  let latestRevision = 0;
 
-  const pushIfTodayAndActive = (entry: TransactionLedgerEntry) => {
-    if (entry.isVoided) return;
-    if (entry.outletId !== outletId) return;
-    if (!isTimestampInOutletLocalToday(entry.createdAt, bounds.timezone)) return;
-    const dedupeKey = (entry.billNumber || entry.idempotencyKey || entry.id).toLowerCase();
-    if (seenKeys.has(dedupeKey)) return;
+  const trackRev = (rev?: number | null) => {
+    if (typeof rev === 'number' && Number.isFinite(rev) && rev > latestRevision) {
+      latestRevision = rev;
+    }
+  };
+
+  const matchesFilters = (entry: TransactionLedgerEntry): boolean => {
+    if (entry.outletId !== outletId) return false;
+    if (scope === 'today') {
+      if (entry.isVoided) return false;
+      if (!isTimestampInOutletLocalToday(entry.createdAt, todayBounds.timezone)) return false;
+    } else if (scope === 'history') {
+      if (entry.isVoided) return false;
+      if (rangeBounds.startIso && Date.parse(entry.createdAt) < Date.parse(rangeBounds.startIso)) return false;
+      if (rangeBounds.endIso && Date.parse(entry.createdAt) > Date.parse(rangeBounds.endIso)) return false;
+    } else if (scope === 'deleted') {
+      if (!entry.isVoided) return false;
+      if (rangeBounds.startIso && Date.parse(entry.createdAt) < Date.parse(rangeBounds.startIso)) return false;
+      if (rangeBounds.endIso && Date.parse(entry.createdAt) > Date.parse(rangeBounds.endIso)) return false;
+    }
+
+    if (branchIdFilter) {
+      const matchId = (entry.branchId || '').trim() === branchIdFilter;
+      const matchCode = (entry.branchCode || '').trim().toUpperCase() === branchIdFilter.toUpperCase();
+      if (!matchId && !matchCode) return false;
+    }
+    if (branchCodeFilter && (entry.branchCode || '').trim().toUpperCase() !== branchCodeFilter) {
+      return false;
+    }
+    if (searchLower) {
+      const itemsText = entry.items.map((i) => i.name).join(' ').toLowerCase();
+      const stylistsText = entry.stylistNames.join(' ').toLowerCase();
+      const matched =
+        entry.billNumber.toLowerCase().includes(searchLower) ||
+        (entry.centralBillNumber || '').toLowerCase().includes(searchLower) ||
+        (entry.branchName || '').toLowerCase().includes(searchLower) ||
+        (entry.branchCode || '').toLowerCase().includes(searchLower) ||
+        entry.customerName.toLowerCase().includes(searchLower) ||
+        entry.customerPhone.toLowerCase().includes(searchLower) ||
+        entry.paymentMode.toLowerCase().includes(searchLower) ||
+        itemsText.includes(searchLower) ||
+        stylistsText.includes(searchLower);
+      if (!matched) return false;
+    }
+    return true;
+  };
+
+  const pushEntry = (entry: TransactionLedgerEntry) => {
+    trackRev(entry.syncRevision);
+    if (!matchesFilters(entry)) return;
+    const dedupeKey = (entry.id || entry.centralBillId || entry.billNumber || entry.idempotencyKey || '').toLowerCase();
+    if (!dedupeKey || seenKeys.has(dedupeKey)) return;
     seenKeys.add(dedupeKey);
     entries.push(entry);
   };
 
   if (db) {
     try {
-      if (category === 'salon') {
-        const { data, error } = await db
-          .from('smav_salon_bills')
-          .select('*')
-          .eq('outlet_id', outletId)
-          .gte('created_at', bounds.startIso)
-          .lte('created_at', bounds.endIso)
-          .order('created_at', { ascending: false })
-          .limit(300);
-        if (!error && Array.isArray(data)) {
-          for (const row of data) {
-            pushIfTodayAndActive(normalizeLedgerBillRow(row, 'smav_salon_bills', outletId));
-          }
-        }
+      let query = db
+        .from(table)
+        .select('*')
+        .eq('outlet_id', outletId)
+        .order(timeColumn, { ascending: false })
+        .limit(maxRows);
+
+      if (scope === 'today') {
+        query = query.gte(timeColumn, todayBounds.startIso).lte(timeColumn, todayBounds.endIso);
       } else {
-        const query = db
-          .from('smav_central_sales')
-          .select('*')
-          .eq('outlet_id', outletId)
-          .gte('billed_at', bounds.startIso)
-          .lte('billed_at', bounds.endIso)
-          .order('billed_at', { ascending: false })
-          .limit(300);
-        const { data, error } = await query;
-        if (!error && Array.isArray(data)) {
-          for (const row of data) {
-            pushIfTodayAndActive(normalizeLedgerBillRow(row, 'smav_central_sales', outletId));
+        if (rangeBounds.startIso) query = query.gte(timeColumn, rangeBounds.startIso);
+        if (rangeBounds.endIso) query = query.lte(timeColumn, rangeBounds.endIso);
+      }
+      if (scope === 'deleted') {
+        query = query.eq('is_voided', true);
+      }
+
+      const { data, error } = await query;
+      if (!error && Array.isArray(data)) {
+        for (const row of data) {
+          pushEntry(normalizeLedgerBillRow(row, table, outletId));
+        }
+      }
+
+      if (params.includeTombstones) {
+        try {
+          const thirtyDaysAgoIso = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+          let tombQuery = db
+            .from(table)
+            .select('id, bill_number, central_bill_id, central_bill_number, idempotency_key, is_voided, voided_at, void_reason, edit_version, updated_at')
+            .eq('outlet_id', outletId)
+            .eq('is_voided', true)
+            .gte('updated_at', thirtyDaysAgoIso)
+            .order('updated_at', { ascending: false })
+            .limit(300);
+          if (params.sinceRevision && Number.isFinite(params.sinceRevision)) {
+            // Optional delta optimization when Migration 024 sync_revision exists
+            const revAttempt = await db
+              .from(table)
+              .select('id, bill_number, central_bill_id, central_bill_number, idempotency_key, external_bill_id, is_voided, voided_at, deleted_at, void_reason, delete_reason, edit_version, sync_revision')
+              .eq('outlet_id', outletId)
+              .eq('is_voided', true)
+              .gt('sync_revision', params.sinceRevision)
+              .order('sync_revision', { ascending: false })
+              .limit(300);
+            if (!revAttempt.error && Array.isArray(revAttempt.data)) {
+              for (const t of revAttempt.data as any[]) {
+                trackRev(Number(t.sync_revision));
+                tombstones.push({
+                  id: String(t.id),
+                  billNumber: String(t.central_bill_number || t.bill_number || ''),
+                  centralBillId: t.central_bill_id ? String(t.central_bill_id) : null,
+                  idempotencyKey: t.idempotency_key ? String(t.idempotency_key) : null,
+                  externalBillId: t.external_bill_id ? String(t.external_bill_id) : null,
+                  isVoided: true,
+                  deletedAt: t.deleted_at || t.voided_at || null,
+                  voidReason: t.delete_reason || t.void_reason || null,
+                  editVersion: Math.max(1, Number(t.edit_version || 1)),
+                  syncRevision: Number.isFinite(Number(t.sync_revision)) ? Number(t.sync_revision) : null
+                });
+              }
+              tombQuery = null as any;
+            }
           }
+          if (tombQuery) {
+            const { data: tombData, error: tombErr } = await tombQuery;
+            if (!tombErr && Array.isArray(tombData)) {
+              for (const t of tombData as any[]) {
+                tombstones.push({
+                  id: String(t.id),
+                  billNumber: String(t.central_bill_number || t.bill_number || ''),
+                  centralBillId: t.central_bill_id ? String(t.central_bill_id) : null,
+                  idempotencyKey: t.idempotency_key ? String(t.idempotency_key) : null,
+                  externalBillId: null,
+                  isVoided: true,
+                  deletedAt: t.voided_at || null,
+                  voidReason: t.void_reason || null,
+                  editVersion: Math.max(1, Number(t.edit_version || 1)),
+                  syncRevision: null
+                });
+              }
+            }
+          }
+        } catch {
+          // Non-fatal tombstone fetch fallback
         }
       }
     } catch (_err) {
@@ -6924,25 +7446,134 @@ app.get('/api/pos/ledger/today', requireAuth, async (req, res) => {
     }
   }
 
-  // Merge in-memory bills for the active outlet (deduplicated by billNumber)
-  const memSource = category === 'salon' ? syncedBills : [...syncedOrders, ...syncedBills];
+  // Merge in-memory bills for the active outlet (deduplicated)
+  const memSource = outletCategory === 'salon' ? syncedBills : [...syncedOrders, ...syncedBills];
   for (const row of memSource) {
     if (row.outlet_id !== outletId) continue;
-    pushIfTodayAndActive(normalizeLedgerBillRow(row, 'memory', outletId));
+    pushEntry(normalizeLedgerBillRow(row, 'memory', outletId));
   }
 
-  entries.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  entries.sort((a, b) => {
+    if (scope === 'deleted') {
+      const ta = new Date(a.deletedAt || a.voidedAt || a.createdAt).getTime();
+      const tb = new Date(b.deletedAt || b.voidedAt || b.createdAt).getTime();
+      return tb - ta;
+    }
+    return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+  });
+
+  return {
+    outletId,
+    outletName: params.outletName,
+    scope,
+    timezone: todayBounds.timezone,
+    dateKey: todayBounds.dateKey,
+    fromDate: rangeBounds.fromDateKey,
+    toDate: rangeBounds.toDateKey,
+    latestRevision,
+    count: entries.length,
+    totalAmount: Math.round(entries.reduce((acc, e) => acc + e.grandTotal, 0) * 100) / 100,
+    bills: entries,
+    tombstones
+  };
+}
+
+app.get('/api/pos/ledger/today', requireAuth, async (req, res) => {
+  const session: UserSession = (req as any).userSession;
+  const requestedTz =
+    typeof req.query.timezone === 'string' && req.query.timezone.trim()
+      ? req.query.timezone.trim()
+      : DEFAULT_OUTLET_TIMEZONE;
+  const includeTombstones = String(req.query.includeTombstones || req.query.include_tombstones || 'true').toLowerCase() !== 'false';
+  const sinceRevRaw = Number(req.query.sinceRevision ?? req.query.since_revision);
+  const sinceRevision = Number.isFinite(sinceRevRaw) && sinceRevRaw > 0 ? sinceRevRaw : null;
+
+  const result = await queryUnifiedOutletLedger({
+    db: getLedgerDbClient(session),
+    outletId: session.activeOutlet.id,
+    outletName: session.activeOutlet.name,
+    outletCategory: session.activeOutlet.category,
+    scope: 'today',
+    timezone: requestedTz,
+    branchId: typeof req.query.branchId === 'string' ? req.query.branchId : null,
+    branchCode: typeof req.query.branchCode === 'string' ? req.query.branchCode : null,
+    search: typeof req.query.search === 'string' ? req.query.search : null,
+    includeTombstones,
+    sinceRevision
+  });
 
   return res.json({
     success: true,
-    outletId,
-    outletName: session.activeOutlet.name,
-    timezone: bounds.timezone,
-    dateKey: bounds.dateKey,
+    ...result,
     canModifyBills: canModifyBills(session),
-    count: entries.length,
-    totalAmount: Math.round(entries.reduce((acc, e) => acc + e.grandTotal, 0) * 100) / 100,
-    bills: entries
+    canViewHistory: canViewHistoricalAndDeletedBills(session),
+    canRestoreBills: canModifyBills(session)
+  });
+});
+
+// Unified multi-scope ledger endpoint (Today, History, Deleted) with strict server-side RBAC & outlet isolation
+app.get('/api/pos/ledger', requireAuth, async (req, res) => {
+  const session: UserSession = (req as any).userSession;
+  const rawScope = String(req.query.scope || 'today').trim().toLowerCase();
+  const scope: 'today' | 'history' | 'deleted' =
+    rawScope === 'history' || rawScope === 'deleted' ? rawScope : 'today';
+
+  if (scope !== 'today' && !canViewHistoricalAndDeletedBills(session)) {
+    return res.status(403).json({
+      success: false,
+      code: 'FORBIDDEN_HISTORICAL_ACCESS',
+      message: 'Forbidden: POS_BILLING users can view today\'s active bills only. Historical and deleted ledgers require ADMIN, OWNER, or SUPERADMIN.'
+    });
+  }
+
+  let targetOutlet = session.activeOutlet;
+  const requestedOutletId = typeof req.query.outletId === 'string' ? req.query.outletId.trim() : '';
+  if (requestedOutletId && requestedOutletId !== session.activeOutlet.id) {
+    if (session.role !== 'superadmin') {
+      return res.status(403).json({
+        success: false,
+        code: 'FORBIDDEN_CROSS_OUTLET',
+        message: 'Forbidden: Outlet ADMIN/OWNER accounts cannot access records from other outlets.'
+      });
+    }
+    const found = await getRegisteredOutlet(req, requestedOutletId);
+    if (!found) {
+      return res.status(404).json({ success: false, message: 'Requested outlet not found.' });
+    }
+    targetOutlet = found;
+  }
+
+  const requestedTz =
+    typeof req.query.timezone === 'string' && req.query.timezone.trim()
+      ? req.query.timezone.trim()
+      : DEFAULT_OUTLET_TIMEZONE;
+  const includeTombstones = String(req.query.includeTombstones || req.query.include_tombstones || 'false').toLowerCase() === 'true';
+  const sinceRevRaw = Number(req.query.sinceRevision ?? req.query.since_revision);
+  const sinceRevision = Number.isFinite(sinceRevRaw) && sinceRevRaw > 0 ? sinceRevRaw : null;
+
+  const result = await queryUnifiedOutletLedger({
+    db: getLedgerDbClient(session),
+    outletId: targetOutlet.id,
+    outletName: targetOutlet.name,
+    outletCategory: targetOutlet.category,
+    scope,
+    timezone: requestedTz,
+    fromDate: typeof req.query.fromDate === 'string' ? req.query.fromDate : null,
+    toDate: typeof req.query.toDate === 'string' ? req.query.toDate : null,
+    branchId: typeof req.query.branchId === 'string' ? req.query.branchId : null,
+    branchCode: typeof req.query.branchCode === 'string' ? req.query.branchCode : null,
+    search: typeof req.query.search === 'string' ? req.query.search : null,
+    includeTombstones,
+    sinceRevision,
+    limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined
+  });
+
+  return res.json({
+    success: true,
+    ...result,
+    canModifyBills: canModifyBills(session),
+    canViewHistory: canViewHistoricalAndDeletedBills(session),
+    canRestoreBills: canModifyBills(session)
   });
 });
 
@@ -7214,6 +7845,49 @@ app.patch('/api/pos/bills/:billId', requireAuth, async (req, res) => {
     }
   });
 
+  broadcastLedgerUpdate(session.activeOutlet.id, {
+    action: 'edited',
+    billId: updatedEntry.id,
+    billNumber: updatedEntry.billNumber,
+    branchId: updatedEntry.branchId,
+    branchCode: updatedEntry.branchCode,
+    isVoided: false,
+    syncRevision: updatedEntry.syncRevision ?? null
+  });
+
+  const editServiceDb = getCentralSupabaseServiceClient();
+  if (editServiceDb) {
+    void outboundSaleEventCoordinator
+      .enqueueBillLifecycleEvent({
+        db: editServiceDb,
+        eventType: 'central_bill_updated',
+        outletId: session.activeOutlet.id,
+        outletCode: session.activeOutlet.code || 'glossylooks',
+        idempotencyKey: `EDIT_${updatedEntry.billNumber}_v${updatedEntry.editVersion}`,
+        centralBillId: updatedEntry.centralBillId,
+        centralBillNumber: updatedEntry.centralBillNumber || updatedEntry.billNumber,
+        localBillId: updatedEntry.id,
+        branchId: updatedEntry.branchId,
+        branchCode: updatedEntry.branchCode,
+        branchName: updatedEntry.branchName,
+        customerName: updatedEntry.customerName,
+        customerPhone: updatedEntry.customerPhone,
+        paymentMode: updatedEntry.paymentMode,
+        subtotal: updatedEntry.subtotal,
+        discount: updatedEntry.discountAmount,
+        taxAmount: updatedEntry.totalTax,
+        grandTotal: updatedEntry.grandTotal,
+        billedAt: updatedEntry.createdAt,
+        items: updatedEntry.items,
+        isVoided: false,
+        editVersion: updatedEntry.editVersion
+      })
+      .then((resEnqueue) => {
+        if (resEnqueue.enqueued) triggerBackgroundSaleNotificationDispatch();
+      })
+      .catch(() => {});
+  }
+
   return res.json({
     success: true,
     message: `Bill ${updatedEntry.billNumber} updated (v${updatedEntry.editVersion}).`,
@@ -7278,7 +7952,18 @@ async function handleVoidBillRequest(req: express.Request, res: express.Response
   const db = getLedgerDbClient(session);
 
   if (db && located.sourceTable !== 'memory') {
-    const voidPatch: Record<string, any> = {
+    const voidPatchFull: Record<string, any> = {
+      is_voided: true,
+      voided_at: nowIso,
+      voided_by: actorUuid,
+      void_reason: reason,
+      deleted_at: nowIso,
+      deleted_by: actorUuid,
+      deleted_by_name: session.fullName || session.email || session.userId,
+      delete_reason: reason,
+      updated_at: nowIso
+    };
+    const voidPatchCompat: Record<string, any> = {
       is_voided: true,
       voided_at: nowIso,
       voided_by: actorUuid,
@@ -7286,20 +7971,33 @@ async function handleVoidBillRequest(req: express.Request, res: express.Response
       updated_at: nowIso
     };
     if (located.sourceTable === 'smav_central_sales') {
-      voidPatch.details = {
+      const detailPatch = {
         ...(located.row.details && typeof located.row.details === 'object' ? located.row.details : {}),
         is_voided: true,
         voided_at: nowIso,
         voided_by: session.userId,
-        void_reason: reason
+        void_reason: reason,
+        deleted_at: nowIso,
+        deleted_by: session.userId,
+        delete_reason: reason
       };
+      voidPatchFull.details = detailPatch;
+      voidPatchCompat.details = detailPatch;
     }
 
-    const updateRes = await db
+    let updateRes = await db
       .from(located.sourceTable)
-      .update(voidPatch)
+      .update(voidPatchFull)
       .eq('id', located.row.id)
       .eq('outlet_id', session.activeOutlet.id);
+
+    if (updateRes.error && /column .*(deleted_at|deleted_by|delete_reason).* does not exist/i.test(updateRes.error.message || '')) {
+      updateRes = await db
+        .from(located.sourceTable)
+        .update(voidPatchCompat)
+        .eq('id', located.row.id)
+        .eq('outlet_id', session.activeOutlet.id);
+    }
 
     if (updateRes.error) {
       if (/column .*is_voided.* does not exist/i.test(updateRes.error.message || '')) {
@@ -7328,7 +8026,10 @@ async function handleVoidBillRequest(req: express.Request, res: express.Response
         is_voided: true,
         voided_at: nowIso,
         voided_by: session.userId,
-        void_reason: reason
+        void_reason: reason,
+        deleted_at: nowIso,
+        deleted_by: session.userId,
+        delete_reason: reason
       };
     }
   }
@@ -7364,21 +8065,513 @@ async function handleVoidBillRequest(req: express.Request, res: express.Response
       payment_mode: currentEntry.paymentMode,
       items_preserved: currentEntry.items,
       reason,
-      voided_at: nowIso
+      voided_at: nowIso,
+      deleted_at: nowIso
     }
   });
+
+  broadcastLedgerUpdate(session.activeOutlet.id, {
+    action: 'voided',
+    billId: currentEntry.id,
+    billNumber: currentEntry.billNumber,
+    branchId: currentEntry.branchId,
+    branchCode: currentEntry.branchCode,
+    isVoided: true
+  });
+
+  const voidServiceDb = getCentralSupabaseServiceClient();
+  if (voidServiceDb) {
+    void outboundSaleEventCoordinator
+      .enqueueBillLifecycleEvent({
+        db: voidServiceDb,
+        eventType: 'central_bill_voided',
+        outletId: session.activeOutlet.id,
+        outletCode: session.activeOutlet.code || 'glossylooks',
+        idempotencyKey: `VOID_${currentEntry.billNumber}_${nowIso}`,
+        centralBillId: currentEntry.centralBillId,
+        centralBillNumber: currentEntry.centralBillNumber || currentEntry.billNumber,
+        localBillId: currentEntry.id,
+        branchId: currentEntry.branchId,
+        branchCode: currentEntry.branchCode,
+        branchName: currentEntry.branchName,
+        customerName: currentEntry.customerName,
+        customerPhone: currentEntry.customerPhone,
+        paymentMode: currentEntry.paymentMode,
+        subtotal: currentEntry.subtotal,
+        discount: currentEntry.discountAmount,
+        taxAmount: currentEntry.totalTax,
+        grandTotal: currentEntry.grandTotal,
+        billedAt: currentEntry.createdAt,
+        items: currentEntry.items,
+        isVoided: true,
+        deletedAt: nowIso,
+        deletedBy: session.userId,
+        deleteReason: reason,
+        editVersion: currentEntry.editVersion
+      })
+      .then((resEnqueue) => {
+        if (resEnqueue.enqueued) triggerBackgroundSaleNotificationDispatch();
+      })
+      .catch(() => {});
+  }
 
   return res.json({
     success: true,
     message: `Bill ${currentEntry.billNumber} has been voided (audited soft-delete).`,
     billId: currentEntry.id,
     billNumber: currentEntry.billNumber,
-    voidedAt: nowIso
+    voidedAt: nowIso,
+    deletedAt: nowIso
   });
+}
+
+async function handleRestoreBillRequest(req: express.Request, res: express.Response) {
+  const session: UserSession = (req as any).userSession;
+  if (!canModifyBills(session)) {
+    return res.status(403).json({
+      success: false,
+      code: 'FORBIDDEN_BILL_MODIFICATION',
+      message: 'Forbidden: Only SUPERADMIN, ADMIN, or OWNER can restore deleted bills.'
+    });
+  }
+
+  const billId = String(req.params.billId || '').trim();
+  const reason = String(req.body?.reason || '').trim();
+  if (reason.length < 5) {
+    return res.status(400).json({
+      success: false,
+      message: 'A restore reason of at least 5 characters is required for audit compliance.'
+    });
+  }
+
+  const located = await locateOutletBillRecord(session, billId);
+  if (!located.found || !located.row) {
+    return res.status(404).json({ success: false, message: 'Bill not found in the active outlet.' });
+  }
+  if (String(located.row.outlet_id) !== session.activeOutlet.id) {
+    return res.status(403).json({ success: false, message: 'Forbidden: Cross-outlet bill restore is blocked.' });
+  }
+
+  const currentEntry = normalizeLedgerBillRow(located.row, located.sourceTable, session.activeOutlet.id);
+  if (!currentEntry.isVoided) {
+    return res.status(409).json({
+      success: false,
+      code: 'BILL_ALREADY_ACTIVE',
+      message: `Bill ${currentEntry.billNumber} is already active.`
+    });
+  }
+
+  const nowIso = new Date().toISOString();
+  const nextVersion = currentEntry.editVersion + 1;
+  const actorUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(session.userId)
+    ? session.userId
+    : null;
+  const db = getLedgerDbClient(session);
+
+  if (db && located.sourceTable !== 'memory') {
+    const restoreFull: Record<string, any> = {
+      is_voided: false,
+      voided_at: null,
+      deleted_at: null,
+      restored_at: nowIso,
+      restored_by: actorUuid,
+      restored_by_name: session.fullName || session.email || session.userId,
+      restore_reason: reason,
+      edit_version: nextVersion,
+      updated_at: nowIso
+    };
+    const restoreCompat: Record<string, any> = {
+      is_voided: false,
+      voided_at: null,
+      edit_version: nextVersion,
+      updated_at: nowIso
+    };
+    if (located.sourceTable === 'smav_central_sales') {
+      const detailPatch = {
+        ...(located.row.details && typeof located.row.details === 'object' ? located.row.details : {}),
+        is_voided: false,
+        voided_at: null,
+        deleted_at: null,
+        restored_at: nowIso,
+        restored_by: session.userId,
+        restore_reason: reason
+      };
+      restoreFull.details = detailPatch;
+      restoreCompat.details = detailPatch;
+    }
+
+    let upd = await db
+      .from(located.sourceTable)
+      .update(restoreFull)
+      .eq('id', located.row.id)
+      .eq('outlet_id', session.activeOutlet.id);
+    if (upd.error && /column .*(deleted_at|restored_at|restored_by|restore_reason).* does not exist/i.test(upd.error.message || '')) {
+      upd = await db
+        .from(located.sourceTable)
+        .update(restoreCompat)
+        .eq('id', located.row.id)
+        .eq('outlet_id', session.activeOutlet.id);
+    }
+    if (upd.error) {
+      return res.status(500).json({ success: false, message: `Failed to restore bill: ${upd.error.message}` });
+    }
+  }
+
+  for (const list of [syncedBills, syncedOrders]) {
+    const idx = list.findIndex(
+      (r) =>
+        r.outlet_id === session.activeOutlet.id &&
+        (String(r.id) === String(located.row.id) || String(r.bill_number || r.order_number) === currentEntry.billNumber)
+    );
+    if (idx >= 0) {
+      list[idx] = {
+        ...list[idx],
+        is_voided: false,
+        voided_at: null,
+        deleted_at: null,
+        restored_at: nowIso,
+        restored_by: session.userId,
+        restore_reason: reason,
+        edit_version: nextVersion
+      };
+    }
+  }
+
+  await writeTrustedServerAuditLog({
+    userId: session.userId,
+    userEmail: session.email,
+    outletId: session.activeOutlet.id,
+    action: 'BILL_RESTORED',
+    entityType: 'bill',
+    entityId: currentEntry.billNumber || currentEntry.id,
+    details: {
+      actor_role: session.role,
+      bill_id: currentEntry.id,
+      bill_number: currentEntry.billNumber,
+      grand_total: currentEntry.grandTotal,
+      reason,
+      restored_at: nowIso,
+      edit_version: nextVersion
+    }
+  });
+
+  broadcastLedgerUpdate(session.activeOutlet.id, {
+    action: 'restored',
+    billId: currentEntry.id,
+    billNumber: currentEntry.billNumber,
+    branchId: currentEntry.branchId,
+    branchCode: currentEntry.branchCode,
+    isVoided: false
+  });
+
+  const restoreServiceDb = getCentralSupabaseServiceClient();
+  if (restoreServiceDb) {
+    void outboundSaleEventCoordinator
+      .enqueueBillLifecycleEvent({
+        db: restoreServiceDb,
+        eventType: 'central_bill_restored',
+        outletId: session.activeOutlet.id,
+        outletCode: session.activeOutlet.code || 'glossylooks',
+        idempotencyKey: `RESTORE_${currentEntry.billNumber}_v${nextVersion}`,
+        centralBillId: currentEntry.centralBillId,
+        centralBillNumber: currentEntry.centralBillNumber || currentEntry.billNumber,
+        localBillId: currentEntry.id,
+        branchId: currentEntry.branchId,
+        branchCode: currentEntry.branchCode,
+        branchName: currentEntry.branchName,
+        customerName: currentEntry.customerName,
+        customerPhone: currentEntry.customerPhone,
+        paymentMode: currentEntry.paymentMode,
+        subtotal: currentEntry.subtotal,
+        discount: currentEntry.discountAmount,
+        taxAmount: currentEntry.totalTax,
+        grandTotal: currentEntry.grandTotal,
+        billedAt: currentEntry.createdAt,
+        items: currentEntry.items,
+        isVoided: false,
+        restoredAt: nowIso,
+        restoredBy: session.userId,
+        restoreReason: reason,
+        editVersion: nextVersion
+      })
+      .then((resEnqueue) => {
+        if (resEnqueue.enqueued) triggerBackgroundSaleNotificationDispatch();
+      })
+      .catch(() => {});
+  }
+
+  return res.json({
+    success: true,
+    message: `Bill ${currentEntry.billNumber} has been restored to active ledgers.`,
+    billId: currentEntry.id,
+    billNumber: currentEntry.billNumber,
+    restoredAt: nowIso,
+    editVersion: nextVersion
+  });
+}
+
+// Server-to-server Integration Handlers (Glossy Looks Admin & future multi-tenant portals)
+async function handleIntegrationLedgerQuery(req: express.Request, res: express.Response, forcedOutletCode?: string) {
+  try {
+    const auth = await resolveCentralBillAuthContext(req, forcedOutletCode);
+    if (!auth.ok) return res.status(auth.status).json({ success: false, code: auth.code, message: auth.message });
+    const serviceDb = getCentralSupabaseServiceClient();
+    if (!serviceDb) return res.status(503).json({ success: false, message: 'Central service database unavailable.' });
+
+    const rawScope = String(req.query.scope || 'today').trim().toLowerCase();
+    const scope: 'today' | 'history' | 'deleted' =
+      rawScope === 'history' || rawScope === 'deleted' ? rawScope : 'today';
+    const includeTombstones = String(req.query.includeTombstones || req.query.include_tombstones || 'true').toLowerCase() !== 'false';
+    const sinceRevRaw = Number(req.query.sinceRevision ?? req.query.since_revision);
+    const sinceRevision = Number.isFinite(sinceRevRaw) && sinceRevRaw > 0 ? sinceRevRaw : null;
+
+    const result = await queryUnifiedOutletLedger({
+      db: serviceDb,
+      outletId: auth.outlet.id,
+      outletName: auth.outlet.name,
+      outletCategory: auth.outlet.category || 'salon',
+      scope,
+      timezone: typeof req.query.timezone === 'string' ? req.query.timezone : DEFAULT_OUTLET_TIMEZONE,
+      fromDate: typeof req.query.fromDate === 'string' ? req.query.fromDate : null,
+      toDate: typeof req.query.toDate === 'string' ? req.query.toDate : null,
+      branchId: typeof req.query.branchId === 'string' ? req.query.branchId : null,
+      branchCode: typeof req.query.branchCode === 'string' ? req.query.branchCode : null,
+      search: typeof req.query.search === 'string' ? req.query.search : null,
+      includeTombstones,
+      sinceRevision,
+      limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined
+    });
+
+    return res.json({ success: true, ...result });
+  } catch (error: any) {
+    return res.status(500).json({ success: false, message: sanitizeErrorMessage(error) });
+  }
+}
+
+async function handleIntegrationBillUpsert(req: express.Request, res: express.Response, forcedOutletCode?: string) {
+  try {
+    const auth = await resolveCentralBillAuthContext(req, forcedOutletCode);
+    if (!auth.ok) return res.status(auth.status).json({ success: false, code: auth.code, message: auth.message });
+    const serviceDb = getCentralSupabaseServiceClient();
+    if (!serviceDb) return res.status(503).json({ success: false, message: 'Central service database unavailable.' });
+
+    const centralBillNumber = String(
+      req.body?.centralBillNumber || req.body?.central_bill_number || req.body?.billNumber || req.body?.bill_number || ''
+    ).trim().toUpperCase();
+    if (!centralBillNumber) {
+      return res.status(400).json({ success: false, code: 'BILL_NUMBER_REQUIRED', message: 'centralBillNumber is required.' });
+    }
+
+    const result = await upsertExternalBillIntoCentralLedger({
+      db: serviceDb,
+      outlet: auth.outlet,
+      centralBillId: req.body?.centralBillId ?? req.body?.central_bill_id ?? null,
+      centralBillNumber,
+      externalBillId: req.body?.externalBillId ?? req.body?.external_bill_id ?? req.body?.externalOrderId ?? req.body?.external_order_id ?? null,
+      idempotencyKey: req.body?.idempotencyKey ?? req.body?.idempotency_key ?? null,
+      branchId: req.body?.branchId ?? req.body?.branch_id ?? null,
+      branchCode: req.body?.branchCode ?? req.body?.branch_code ?? null,
+      branchName: req.body?.branchName ?? req.body?.branch_name ?? null,
+      sourceSystem: req.body?.sourceSystem ?? req.body?.source_system ?? auth.defaultSourceSystem,
+      customerName: req.body?.customerName ?? req.body?.customer_name ?? 'Walk-in Guest',
+      customerPhone: req.body?.customerPhone ?? req.body?.customer_phone ?? '',
+      paymentMode: req.body?.paymentMode ?? req.body?.payment_mode ?? 'cash',
+      subtotal: req.body?.subtotal,
+      discount: req.body?.discount ?? req.body?.discountAmount ?? req.body?.discount_amount,
+      tax: req.body?.tax ?? req.body?.taxAmount ?? req.body?.totalTax ?? req.body?.total_tax,
+      grandTotal: req.body?.grandTotal ?? req.body?.grand_total ?? 0,
+      items: Array.isArray(req.body?.items) ? req.body.items : [],
+      billedAt: req.body?.billedAt ?? req.body?.billed_at ?? req.body?.createdAt ?? new Date().toISOString()
+    });
+
+    return res.json({ success: true, ...result });
+  } catch (error: any) {
+    return res.status(400).json({ success: false, message: sanitizeErrorMessage(error) });
+  }
+}
+
+async function locateIntegrationOutletBill(
+  serviceDb: NonNullable<ReturnType<typeof getCentralSupabaseServiceClient>>,
+  outletId: string,
+  category: string,
+  identifier: string
+) {
+  const table: 'smav_salon_bills' | 'smav_central_sales' =
+    category === 'salon' ? 'smav_salon_bills' : 'smav_central_sales';
+  const cleanId = String(identifier || '').trim();
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cleanId);
+
+  if (isUuid) {
+    const byId = await serviceDb.from(table).select('*').eq('outlet_id', outletId).eq('id', cleanId).maybeSingle();
+    if (byId.data) return { table, row: byId.data };
+    if (table === 'smav_salon_bills') {
+      const byCentral = await serviceDb.from(table).select('*').eq('outlet_id', outletId).eq('central_bill_id', cleanId).maybeSingle();
+      if (byCentral.data) return { table, row: byCentral.data };
+    }
+  }
+  try {
+    const byExt = await serviceDb.from(table).select('*').eq('outlet_id', outletId).eq('external_bill_id', cleanId).maybeSingle();
+    if (byExt.data) return { table, row: byExt.data };
+  } catch {}
+  const byNo = await serviceDb.from(table).select('*').eq('outlet_id', outletId).eq('bill_number', cleanId).maybeSingle();
+  if (byNo.data) return { table, row: byNo.data };
+  const byIdem = await serviceDb.from(table).select('*').eq('outlet_id', outletId).eq('idempotency_key', cleanId).maybeSingle();
+  if (byIdem.data) return { table, row: byIdem.data };
+  return null;
+}
+
+async function handleIntegrationBillVoid(req: express.Request, res: express.Response, forcedOutletCode?: string) {
+  try {
+    const auth = await resolveCentralBillAuthContext(req, forcedOutletCode);
+    if (!auth.ok) return res.status(auth.status).json({ success: false, code: auth.code, message: auth.message });
+    const serviceDb = getCentralSupabaseServiceClient();
+    if (!serviceDb) return res.status(503).json({ success: false, message: 'Central service database unavailable.' });
+
+    const reason = String(req.body?.reason || '').trim();
+    if (reason.length < 5) {
+      return res.status(400).json({ success: false, message: 'A delete/void reason of at least 5 characters is required.' });
+    }
+    const actorRole = String(req.body?.actorRole || req.body?.actor_role || 'ADMIN').trim().toUpperCase();
+    if (!['SUPERADMIN', 'ADMIN', 'OWNER', 'MANAGER'].includes(actorRole)) {
+      return res.status(403).json({ success: false, code: 'FORBIDDEN_BILL_MODIFICATION', message: 'Only ADMIN, OWNER, or SUPERADMIN can delete bills.' });
+    }
+
+    const found = await locateIntegrationOutletBill(serviceDb, auth.outlet.id, auth.outlet.category || 'salon', String(req.params.billId || ''));
+    if (!found) return res.status(404).json({ success: false, message: 'Bill not found in outlet.' });
+
+    const nowIso = new Date().toISOString();
+    const actorIdRaw = String(req.body?.actorId || req.body?.actor_id || '').trim();
+    const actorUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(actorIdRaw) ? actorIdRaw : null;
+    const actorName = String(req.body?.actorName || req.body?.actor_name || 'External Admin').trim();
+
+    let upd = await serviceDb
+      .from(found.table)
+      .update({
+        is_voided: true,
+        voided_at: nowIso,
+        voided_by: actorUuid,
+        void_reason: reason,
+        deleted_at: nowIso,
+        deleted_by: actorUuid,
+        deleted_by_name: actorName,
+        delete_reason: reason,
+        updated_at: nowIso
+      })
+      .eq('id', found.row.id)
+      .eq('outlet_id', auth.outlet.id);
+    if (upd.error && /column .*(deleted_at|deleted_by|delete_reason).* does not exist/i.test(upd.error.message || '')) {
+      upd = await serviceDb
+        .from(found.table)
+        .update({ is_voided: true, voided_at: nowIso, voided_by: actorUuid, void_reason: reason, updated_at: nowIso })
+        .eq('id', found.row.id)
+        .eq('outlet_id', auth.outlet.id);
+    }
+    if (upd.error) return res.status(500).json({ success: false, message: upd.error.message });
+
+    const entry = normalizeLedgerBillRow(found.row, found.table, auth.outlet.id);
+    await writeTrustedServerAuditLog({
+      userId: actorUuid || 'external_admin',
+      userEmail: actorName,
+      outletId: auth.outlet.id,
+      action: 'BILL_VOIDED_EXTERNAL',
+      entityType: 'bill',
+      entityId: entry.billNumber || entry.id,
+      details: { actor_role: actorRole, actor_name: actorName, bill_id: entry.id, reason, deleted_at: nowIso }
+    });
+
+    broadcastLedgerUpdate(auth.outlet.id, {
+      action: 'voided',
+      billId: entry.id,
+      billNumber: entry.billNumber,
+      branchId: entry.branchId,
+      branchCode: entry.branchCode,
+      isVoided: true
+    });
+
+    return res.json({ success: true, billId: entry.id, billNumber: entry.billNumber, deletedAt: nowIso });
+  } catch (error: any) {
+    return res.status(500).json({ success: false, message: sanitizeErrorMessage(error) });
+  }
+}
+
+async function handleIntegrationBillRestore(req: express.Request, res: express.Response, forcedOutletCode?: string) {
+  try {
+    const auth = await resolveCentralBillAuthContext(req, forcedOutletCode);
+    if (!auth.ok) return res.status(auth.status).json({ success: false, code: auth.code, message: auth.message });
+    const serviceDb = getCentralSupabaseServiceClient();
+    if (!serviceDb) return res.status(503).json({ success: false, message: 'Central service database unavailable.' });
+
+    const reason = String(req.body?.reason || '').trim();
+    if (reason.length < 5) {
+      return res.status(400).json({ success: false, message: 'A restore reason of at least 5 characters is required.' });
+    }
+    const actorRole = String(req.body?.actorRole || req.body?.actor_role || 'ADMIN').trim().toUpperCase();
+    if (!['SUPERADMIN', 'ADMIN', 'OWNER', 'MANAGER'].includes(actorRole)) {
+      return res.status(403).json({ success: false, code: 'FORBIDDEN_BILL_MODIFICATION', message: 'Only ADMIN, OWNER, or SUPERADMIN can restore bills.' });
+    }
+
+    const found = await locateIntegrationOutletBill(serviceDb, auth.outlet.id, auth.outlet.category || 'salon', String(req.params.billId || ''));
+    if (!found) return res.status(404).json({ success: false, message: 'Bill not found in outlet.' });
+
+    const nowIso = new Date().toISOString();
+    const nextVersion = Math.max(1, Number(found.row.edit_version || 1)) + 1;
+    const actorIdRaw = String(req.body?.actorId || req.body?.actor_id || '').trim();
+    const actorUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(actorIdRaw) ? actorIdRaw : null;
+    const actorName = String(req.body?.actorName || req.body?.actor_name || 'External Admin').trim();
+
+    let upd = await serviceDb
+      .from(found.table)
+      .update({
+        is_voided: false,
+        voided_at: null,
+        deleted_at: null,
+        restored_at: nowIso,
+        restored_by: actorUuid,
+        restored_by_name: actorName,
+        restore_reason: reason,
+        edit_version: nextVersion,
+        updated_at: nowIso
+      })
+      .eq('id', found.row.id)
+      .eq('outlet_id', auth.outlet.id);
+    if (upd.error && /column .*(deleted_at|restored_at|restored_by|restore_reason).* does not exist/i.test(upd.error.message || '')) {
+      upd = await serviceDb
+        .from(found.table)
+        .update({ is_voided: false, voided_at: null, edit_version: nextVersion, updated_at: nowIso })
+        .eq('id', found.row.id)
+        .eq('outlet_id', auth.outlet.id);
+    }
+    if (upd.error) return res.status(500).json({ success: false, message: upd.error.message });
+
+    const entry = normalizeLedgerBillRow(found.row, found.table, auth.outlet.id);
+    await writeTrustedServerAuditLog({
+      userId: actorUuid || 'external_admin',
+      userEmail: actorName,
+      outletId: auth.outlet.id,
+      action: 'BILL_RESTORED_EXTERNAL',
+      entityType: 'bill',
+      entityId: entry.billNumber || entry.id,
+      details: { actor_role: actorRole, actor_name: actorName, bill_id: entry.id, reason, restored_at: nowIso, edit_version: nextVersion }
+    });
+
+    broadcastLedgerUpdate(auth.outlet.id, {
+      action: 'restored',
+      billId: entry.id,
+      billNumber: entry.billNumber,
+      branchId: entry.branchId,
+      branchCode: entry.branchCode,
+      isVoided: false
+    });
+
+    return res.json({ success: true, billId: entry.id, billNumber: entry.billNumber, restoredAt: nowIso, editVersion: nextVersion });
+  } catch (error: any) {
+    return res.status(500).json({ success: false, message: sanitizeErrorMessage(error) });
+  }
 }
 
 app.post('/api/pos/bills/:billId/void', requireAuth, handleVoidBillRequest);
 app.delete('/api/pos/bills/:billId', requireAuth, handleVoidBillRequest);
+app.post('/api/pos/bills/:billId/restore', requireAuth, handleRestoreBillRequest);
 
 app.get('/api/salon/services', requireAuth, (req, res) => {
   res.json({ business_id: 'the_glossy_looks', current_revision: salonCatalogRevision, services: salonServices.filter(s => !s.isDeleted && s.isActive) });

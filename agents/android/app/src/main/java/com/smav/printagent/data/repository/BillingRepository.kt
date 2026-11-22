@@ -852,6 +852,48 @@ class BillingRepository(
         Result.success("Bill ${existing.billNumber} voided offline; will sync safely when online.")
     }
 
+    suspend fun restoreSalonBill(
+        billId: String,
+        billNumber: String,
+        reason: String
+    ): Result<String> = withContext(Dispatchers.IO) {
+        val session = sessionManager.getStaffSession()
+            ?: return@withContext Result.failure(IllegalStateException("Active session required."))
+        if (!session.role.isAdminOrAbove()) {
+            return@withContext Result.failure(
+                SecurityException("Forbidden: Only SUPERADMIN, ADMIN, or OWNER can restore deleted bills.")
+            )
+        }
+        val cleanReason = reason.trim()
+        if (cleanReason.length < 5) {
+            return@withContext Result.failure(IllegalArgumentException("Restore reason must be at least 5 characters."))
+        }
+
+        val identifier = billId.ifBlank { billNumber }
+        val payload = JsonObject().apply {
+            addProperty("reason", cleanReason)
+        }
+
+        try {
+            val api = SmavApiClient.create(sessionManager)
+            val resp = api.restoreBill(SmavApiClient.bearer(session.token), identifier, payload)
+            if (!resp.isSuccessful) {
+                return@withContext Result.failure(
+                    IllegalStateException(SmavApiClient.parseErrorMessage(resp, "Unable to restore bill (HTTP ${resp.code()})."))
+                )
+            }
+            val nowMs = System.currentTimeMillis()
+            val local = database.salonBillDao().getBillById(billId)
+                ?: database.salonBillDao().getBillByNumber(billNumber)
+            if (local != null) {
+                database.salonBillDao().markRestored(local.id, nowMs)
+            }
+            Result.success("Bill $billNumber restored to active ledger.")
+        } catch (e: Exception) {
+            Result.failure(IllegalStateException(SmavApiClient.friendlyThrowable(e, "Restoring a bill requires an active connection.")))
+        }
+    }
+
     suspend fun voidRestaurantOrderOfflineOrOnline(
         orderId: String,
         reason: String

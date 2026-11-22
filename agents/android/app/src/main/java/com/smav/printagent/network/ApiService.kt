@@ -176,7 +176,8 @@ data class SyncResponse(
     @SerializedName("success") val success: Boolean,
     @SerializedName("synced_ids") val syncedIds: List<String>,
     @SerializedName("failed_ids") val failedIds: Map<String, String>?,
-    @SerializedName("server_timestamp") val serverTimestamp: Long
+    @SerializedName("server_timestamp") val serverTimestamp: Long,
+    @SerializedName("synced_bills") val syncedBills: List<JsonObject>? = null
 )
 
 interface ApiService {
@@ -459,11 +460,23 @@ interface ApiService {
         @Body request: SyncPrintStatusRequest
     ): Response<SyncResponse>
 
-    // 6. Today-Only Outlet-Local Transaction Ledger, Audited Edit & Soft-Delete (Void)
+    // 6. Unified Multi-Platform Transaction Ledger, Audited Edit, Soft-Delete (Void) & Restore
     @GET("api/pos/ledger/today")
     suspend fun getTodayLedger(
         @Header("Authorization") token: String,
         @Query("timezone") timezone: String = "Asia/Kolkata"
+    ): Response<JsonObject>
+
+    @GET("api/pos/ledger")
+    suspend fun getUnifiedLedger(
+        @Header("Authorization") token: String,
+        @Query("scope") scope: String = "today",
+        @Query("timezone") timezone: String = "Asia/Kolkata",
+        @Query("fromDate") fromDate: String? = null,
+        @Query("toDate") toDate: String? = null,
+        @Query("branchId") branchId: String? = null,
+        @Query("search") search: String? = null,
+        @Query("includeTombstones") includeTombstones: Boolean = true
     ): Response<JsonObject>
 
     @PATCH("api/pos/bills/{billId}")
@@ -475,6 +488,13 @@ interface ApiService {
 
     @POST("api/pos/bills/{billId}/void")
     suspend fun voidBill(
+        @Header("Authorization") token: String,
+        @Path("billId") billId: String,
+        @Body body: JsonObject
+    ): Response<JsonObject>
+
+    @POST("api/pos/bills/{billId}/restore")
+    suspend fun restoreBill(
         @Header("Authorization") token: String,
         @Path("billId") billId: String,
         @Body body: JsonObject

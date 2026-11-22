@@ -392,6 +392,17 @@ export interface TransactionLedgerEntry {
   editReason?: string | null;
   voidedAt?: string | null;
   voidReason?: string | null;
+  deletedAt?: string | null;
+  deletedBy?: string | null;
+  deletedByName?: string | null;
+  deleteReason?: string | null;
+  restoredAt?: string | null;
+  restoredBy?: string | null;
+  restoredByName?: string | null;
+  restoreReason?: string | null;
+  externalBillId?: string | null;
+  syncRevision?: number;
+  updatedAt?: string | null;
 }
 
 export interface CartHeaderSummary {

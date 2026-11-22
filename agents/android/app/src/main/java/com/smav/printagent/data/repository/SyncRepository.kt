@@ -4,13 +4,17 @@ import android.content.Context
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.smav.printagent.data.local.AppDatabase
+import com.smav.printagent.data.local.dao.SalonBillWithItems
 import com.smav.printagent.data.local.entities.SalonBillEntity
+import com.smav.printagent.data.local.entities.SalonBillItemEntity
 import com.smav.printagent.model.BusinessType
 import com.smav.printagent.model.BranchOption
 import com.smav.printagent.network.SmavApiClient
 import com.smav.printagent.network.SyncPrintStatusRequest
 import com.smav.printagent.network.UnauthorizedSessionException
 import com.smav.printagent.network.optBool
+import com.smav.printagent.network.optDouble
+import com.smav.printagent.network.optInt
 import com.smav.printagent.network.optString
 import com.smav.printagent.util.BillIdGenerator
 import kotlinx.coroutines.Dispatchers
@@ -20,6 +24,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.UUID
 
 class SyncRepository(
     private val context: Context,
@@ -30,6 +35,365 @@ class SyncRepository(
         val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
         sdf.timeZone = TimeZone.getTimeZone("UTC")
         return sdf.format(Date(epochMs))
+    }
+
+    private fun parseIsoToEpochMs(iso: String?, fallbackMs: Long = System.currentTimeMillis()): Long {
+        val raw = iso?.trim().orEmpty()
+        if (raw.isBlank()) return fallbackMs
+        val normalized = raw
+            .replace(Regex("\\.(\\d{3})\\d+"), ".$1")
+            .replace(Regex("([+-]\\d{2}):(\\d{2})$"), "$1$2")
+        val patterns = listOf(
+            "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",
+            "yyyy-MM-dd'T'HH:mm:ss'Z'",
+            "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
+            "yyyy-MM-dd'T'HH:mm:ssZ",
+            "yyyy-MM-dd HH:mm:ss"
+        )
+        for (pattern in patterns) {
+            try {
+                val sdf = SimpleDateFormat(pattern, Locale.US).apply {
+                    timeZone = TimeZone.getTimeZone("UTC")
+                }
+                val parsed = sdf.parse(normalized)
+                if (parsed != null) return parsed.time
+            } catch (_: Exception) {
+            }
+        }
+        return fallbackMs
+    }
+
+    private suspend fun findLocalSalonBill(
+        id: String?,
+        centralBillId: String?,
+        idempotencyKey: String?,
+        billNumber: String?
+    ): SalonBillEntity? {
+        val dao = database.salonBillDao()
+        if (!id.isNullOrBlank()) dao.getBillById(id)?.let { return it }
+        if (!centralBillId.isNullOrBlank()) dao.getBillByCentralId(centralBillId)?.let { return it }
+        if (!idempotencyKey.isNullOrBlank()) dao.getBillByIdempotencyKey(idempotencyKey)?.let { return it }
+        if (!billNumber.isNullOrBlank()) dao.getBillByNumber(billNumber)?.let { return it }
+        return null
+    }
+
+    private fun parseRemoteBillToSalonWithItems(
+        obj: JsonObject,
+        activeOutletId: String,
+        existingLocal: SalonBillEntity?,
+        deviceId: String
+    ): SalonBillWithItems? {
+        val remoteId = obj.optString("id")
+        val centralBillNumber = obj.optString("centralBillNumber", "central_bill_number")
+        val billNumber = centralBillNumber.ifBlank { obj.optString("billNumber", "bill_number") }
+        if (billNumber.isBlank()) return null
+
+        val stableId = existingLocal?.id
+            ?: remoteId.takeIf { it.isNotBlank() }
+            ?: UUID.randomUUID().toString()
+        val centralBillId = obj.optString("centralBillId", "central_bill_id").takeIf { it.isNotBlank() }
+            ?: existingLocal?.centralBillId
+        val remoteIdempotency = obj.optString("idempotencyKey", "idempotency_key").takeIf { it.isNotBlank() }
+            ?: existingLocal?.idempotencyKey
+            ?: "CENTRAL_${remoteId.ifBlank { billNumber }}"
+
+        val createdAtMs = parseIsoToEpochMs(
+            obj.optString("createdAt", "created_at"),
+            existingLocal?.createdAtLocal ?: System.currentTimeMillis()
+        )
+        val updatedAtMs = parseIsoToEpochMs(
+            obj.optString("updatedAt", "updated_at", "editedAt", "edited_at"),
+            createdAtMs
+        )
+        val isVoided = obj.optBool("isVoided", false) ||
+            obj.optBool("is_voided", false) ||
+            obj.optString("deletedAt", "deleted_at").isNotBlank()
+        val voidReason = obj.optString("deleteReason", "delete_reason", "voidReason", "void_reason")
+            .takeIf { it.isNotBlank() }
+        val voidedAtRaw = obj.optString("deletedAt", "deleted_at", "voidedAt", "voided_at")
+        val voidedAtMs = if (voidedAtRaw.isNotBlank()) parseIsoToEpochMs(voidedAtRaw, updatedAtMs) else existingLocal?.voidedAtLocal
+        val voidedBy = obj.optString("deletedByName", "deletedBy", "deleted_by", "voidedBy", "voided_by")
+            .takeIf { it.isNotBlank() } ?: existingLocal?.voidedBy
+
+        val subtotal = obj.optDouble("subtotal", default = 0.0)
+        val discountAmount = obj.optDouble("discountAmount", "discount_amount", default = 0.0)
+        val totalTax = obj.optDouble("totalTax", "total_tax", "gstAmount", "gst_amount", default = 0.0)
+        val grandTotal = obj.optDouble("grandTotal", "grand_total", default = 0.0)
+        val cgst = Math.round((totalTax / 2.0) * 100.0) / 100.0
+        val sgst = Math.round((totalTax - cgst) * 100.0) / 100.0
+
+        val branchId = obj.optString("branchId", "branch_id").ifBlank { existingLocal?.branchId ?: activeOutletId }
+        val branchCode = obj.optString("branchCode", "branch_code").ifBlank { existingLocal?.branchCode ?: "MAIN" }
+        val branchName = obj.optString("branchName", "branch_name").takeIf { it.isNotBlank() } ?: existingLocal?.branchName
+
+        val billEntity = SalonBillEntity(
+            id = stableId,
+            billNumber = billNumber,
+            businessId = activeOutletId,
+            branchId = branchId,
+            branchCode = branchCode,
+            deviceId = existingLocal?.deviceId ?: deviceId,
+            localRecordId = existingLocal?.localRecordId ?: stableId,
+            idempotencyKey = remoteIdempotency,
+            customerName = obj.optString("customerName", "customer_name").ifBlank { "Walk-in Guest" },
+            customerPhone = obj.optString("customerPhone", "customer_phone").takeIf { it.isNotBlank() },
+            paymentMode = obj.optString("paymentMode", "payment_mode").ifBlank { "upi" }.lowercase(Locale.ENGLISH),
+            subtotal = subtotal,
+            discountPercent = existingLocal?.discountPercent ?: 0.0,
+            discountAmount = discountAmount,
+            cgstRate = existingLocal?.cgstRate ?: 9.0,
+            cgstAmount = cgst,
+            sgstRate = existingLocal?.sgstRate ?: 9.0,
+            sgstAmount = sgst,
+            totalTax = totalTax,
+            grandTotal = grandTotal,
+            roundOff = existingLocal?.roundOff ?: 0.0,
+            catalogRevisionAtSale = existingLocal?.catalogRevisionAtSale ?: 100L,
+            notes = existingLocal?.notes,
+            syncStatus = "SYNCED",
+            syncError = null,
+            createdAtLocal = createdAtMs,
+            createdAtServer = createdAtMs,
+            isVoided = isVoided,
+            voidReason = if (isVoided) voidReason else null,
+            voidedAtLocal = if (isVoided) voidedAtMs else null,
+            voidedBy = if (isVoided) voidedBy else null,
+            editVersion = obj.optInt("editVersion", "edit_version", default = existingLocal?.editVersion ?: 1).coerceAtLeast(1),
+            editReason = obj.optString("editReason", "edit_reason").takeIf { it.isNotBlank() } ?: existingLocal?.editReason,
+            updatedAtLocal = updatedAtMs,
+            conflictMessage = null,
+            centralBillId = centralBillId,
+            branchName = branchName,
+            sourceSystem = obj.optString("sourceSystem", "source_system").ifBlank { existingLocal?.sourceSystem ?: "central_smav" }
+        )
+
+        val itemsArray = obj.getAsJsonArray("items")
+        val items = mutableListOf<SalonBillItemEntity>()
+        if (itemsArray != null) {
+            for (idx in 0 until itemsArray.size()) {
+                val itemEl = itemsArray.get(idx)
+                if (!itemEl.isJsonObject) continue
+                val itObj = itemEl.asJsonObject
+                val qty = itObj.optInt("quantity", "qty", default = 1).coerceAtLeast(1)
+                val unitPrice = itObj.optDouble("unitPrice", "unit_price", "price", default = 0.0)
+                val lineTotal = itObj.optDouble("lineTotal", "line_total", "totalAmount", "total_amount", default = unitPrice * qty)
+                val gstPct = itObj.optDouble("gstPercent", "gst_percent", default = 18.0)
+                val discPct = itObj.optDouble("discountPercent", "discount_percent", default = 0.0)
+                val lineGross = unitPrice * qty
+                val lineDisc = Math.round(lineGross * (discPct / 100.0) * 100.0) / 100.0
+                val lineTaxable = (lineGross - lineDisc).coerceAtLeast(0.0)
+                val lineGst = Math.round(lineTaxable * (gstPct / 100.0) * 100.0) / 100.0
+                items.add(
+                    SalonBillItemEntity(
+                        id = "${stableId}_item_$idx",
+                        billId = stableId,
+                        serviceId = itObj.optString("serviceId", "service_id", "id").ifBlank { "svc_$idx" },
+                        serviceName = itObj.optString("name", "serviceName", "service_name").ifBlank { "Service" },
+                        categoryName = itObj.optString("category", "categoryName", "category_name").ifBlank { "Salon" },
+                        stylistId = itObj.optString("stylistId", "stylist_id").takeIf { it.isNotBlank() },
+                        stylistName = itObj.optString("stylistName", "stylist_name", "stylist").takeIf { it.isNotBlank() },
+                        quantity = qty,
+                        unitPrice = unitPrice,
+                        discountAmount = lineDisc,
+                        taxableAmount = lineTaxable,
+                        gstPercent = gstPct,
+                        gstAmount = lineGst,
+                        totalAmount = if (lineTotal > 0.0) lineTotal else Math.round((lineTaxable + lineGst) * 100.0) / 100.0
+                    )
+                )
+            }
+        }
+        return SalonBillWithItems(billEntity, items)
+    }
+
+    private suspend fun applyTombstonesToRoom(tombstones: JsonArray?) {
+        if (tombstones == null) return
+        val dao = database.salonBillDao()
+        for (i in 0 until tombstones.size()) {
+            val el = tombstones.get(i)
+            if (!el.isJsonObject) continue
+            val t = el.asJsonObject
+            val existing = findLocalSalonBill(
+                id = t.optString("id"),
+                centralBillId = t.optString("centralBillId", "central_bill_id"),
+                idempotencyKey = t.optString("idempotencyKey", "idempotency_key"),
+                billNumber = t.optString("billNumber", "bill_number")
+            ) ?: continue
+            val deletedAtMs = parseIsoToEpochMs(t.optString("deletedAt", "deleted_at"), System.currentTimeMillis())
+            val reason = t.optString("deleteReason", "delete_reason", "voidReason", "void_reason").ifBlank { "Deleted on another device" }
+            dao.markVoidedSynced(
+                id = existing.id,
+                reason = reason,
+                voidedAt = deletedAtMs,
+                voidedBy = "central_sync"
+            )
+        }
+    }
+
+    /**
+     * Pulls today's authoritative central ledger + deletion tombstones into Room SQLite so
+     * bills created on Glossy Looks Admin, SMAV Web, or another POS device immediately appear
+     * in Android "Bills & Reprint" and deleted bills disappear consistently.
+     */
+    suspend fun pullRemoteLedgerIntoRoom(scope: String = "today"): Result<Int> = withContext(Dispatchers.IO) {
+        val session = sessionManager.getStaffSession()
+            ?: return@withContext Result.failure(IllegalStateException("Please sign in to refresh bills."))
+        val activeOutletId = session.businessId
+        if (activeOutletId.isBlank() || session.businessType != BusinessType.SALON) {
+            return@withContext Result.success(0)
+        }
+
+        val api = SmavApiClient.create(sessionManager)
+        val bearer = SmavApiClient.bearer(session.token)
+        try {
+            val response = api.getUnifiedLedger(
+                token = bearer,
+                scope = scope,
+                timezone = "Asia/Kolkata",
+                includeTombstones = true
+            )
+            if (response.code() == 401) {
+                sessionManager.clearSession()
+                return@withContext Result.failure(
+                    UnauthorizedSessionException(SmavApiClient.parseErrorMessage(response, "Session expired. Please sign in again."))
+                )
+            }
+            val body = response.body()
+            if (!response.isSuccessful || body == null || !body.optBool("success", false)) {
+                return@withContext Result.failure(
+                    IOException(SmavApiClient.parseErrorMessage(response, "Unable to refresh central billing ledger."))
+                )
+            }
+
+            // 1. Apply deletion tombstones first so deleted bills vanish from local Today cache
+            applyTombstonesToRoom(body.getAsJsonArray("tombstones"))
+
+            // 2. Upsert every authoritative active bill + line items into Room
+            val billsArray = body.getAsJsonArray("bills") ?: JsonArray()
+            val seenBillNumbers = mutableSetOf<String>()
+            val seenIds = mutableSetOf<String>()
+            var upsertedCount = 0
+
+            for (i in 0 until billsArray.size()) {
+                val el = billsArray.get(i)
+                if (!el.isJsonObject) continue
+                val obj = el.asJsonObject
+                val existing = findLocalSalonBill(
+                    id = obj.optString("id"),
+                    centralBillId = obj.optString("centralBillId", "central_bill_id"),
+                    idempotencyKey = obj.optString("idempotencyKey", "idempotency_key"),
+                    billNumber = obj.optString("centralBillNumber", "billNumber", "bill_number")
+                )
+                val parsed = parseRemoteBillToSalonWithItems(
+                    obj = obj,
+                    activeOutletId = activeOutletId,
+                    existingLocal = existing,
+                    deviceId = sessionManager.deviceId
+                ) ?: continue
+
+                database.salonBillDao().replaceBillAndItems(parsed.bill, parsed.items)
+                seenBillNumbers.add(parsed.bill.billNumber)
+                seenIds.add(parsed.bill.id)
+                upsertedCount += 1
+            }
+
+            // 3. Reconcile any previously SYNCED local today bill that is no longer active on server
+            //    (protects against missed tombstones without ever touching PENDING/offline bills)
+            if (scope == "today") {
+                val startOfDayMs = BillIdGenerator.getStartOfTodayMillis()
+                val localSyncedToday = database.salonBillDao().getTodaySyncedBillsForOutlet(activeOutletId, startOfDayMs)
+                for (localBill in localSyncedToday) {
+                    if (localBill.id !in seenIds && localBill.billNumber !in seenBillNumbers) {
+                        database.salonBillDao().markVoidedSynced(
+                            id = localBill.id,
+                            reason = localBill.voidReason ?: "Removed from active central ledger",
+                            voidedAt = System.currentTimeMillis(),
+                            voidedBy = "central_sync"
+                        )
+                    }
+                }
+            }
+
+            Result.success(upsertedCount)
+        } catch (u: UnauthorizedSessionException) {
+            Result.failure(u)
+        } catch (e: Exception) {
+            Result.failure(IOException(SmavApiClient.friendlyThrowable(e, "Could not sync remote bills right now.")))
+        }
+    }
+
+    /**
+     * Fetches authorized History or Deleted bills directly from the central single source of truth
+     * (enforced by server-side RBAC: ADMIN/OWNER/SUPERADMIN only).
+     */
+    suspend fun fetchRemoteLedger(
+        scope: String,
+        fromDate: String? = null,
+        toDate: String? = null,
+        branchId: String? = null,
+        search: String? = null
+    ): Result<List<SalonBillWithItems>> = withContext(Dispatchers.IO) {
+        val session = sessionManager.getStaffSession()
+            ?: return@withContext Result.failure(IllegalStateException("Please sign in first."))
+        val activeOutletId = session.businessId
+        val api = SmavApiClient.create(sessionManager)
+        val bearer = SmavApiClient.bearer(session.token)
+        try {
+            val response = api.getUnifiedLedger(
+                token = bearer,
+                scope = scope,
+                timezone = "Asia/Kolkata",
+                fromDate = fromDate?.takeIf { it.isNotBlank() },
+                toDate = toDate?.takeIf { it.isNotBlank() },
+                branchId = branchId?.takeIf { it.isNotBlank() },
+                search = search?.takeIf { it.isNotBlank() },
+                includeTombstones = true
+            )
+            if (response.code() == 401) {
+                sessionManager.clearSession()
+                return@withContext Result.failure(
+                    UnauthorizedSessionException(SmavApiClient.parseErrorMessage(response, "Session expired. Please sign in again."))
+                )
+            }
+            val body = response.body()
+            if (!response.isSuccessful || body == null || !body.optBool("success", false)) {
+                return@withContext Result.failure(
+                    IOException(SmavApiClient.parseErrorMessage(response, "Unable to load $scope bills (HTTP ${response.code()})."))
+                )
+            }
+            applyTombstonesToRoom(body.getAsJsonArray("tombstones"))
+            val billsArray = body.getAsJsonArray("bills") ?: JsonArray()
+            val result = mutableListOf<SalonBillWithItems>()
+            for (i in 0 until billsArray.size()) {
+                val el = billsArray.get(i)
+                if (!el.isJsonObject) continue
+                val obj = el.asJsonObject
+                val existing = findLocalSalonBill(
+                    id = obj.optString("id"),
+                    centralBillId = obj.optString("centralBillId", "central_bill_id"),
+                    idempotencyKey = obj.optString("idempotencyKey", "idempotency_key"),
+                    billNumber = obj.optString("centralBillNumber", "billNumber", "bill_number")
+                )
+                val parsed = parseRemoteBillToSalonWithItems(
+                    obj = obj,
+                    activeOutletId = activeOutletId,
+                    existingLocal = existing,
+                    deviceId = sessionManager.deviceId
+                ) ?: continue
+                result.add(parsed)
+            }
+            Result.success(result.sortedByDescending { it.bill.createdAtLocal })
+        } catch (u: UnauthorizedSessionException) {
+            Result.failure(u)
+        } catch (e: Exception) {
+            if (scope == "deleted") {
+                val localDeleted = database.salonBillDao().getDeletedBillsForOutlet(activeOutletId).map { b ->
+                    SalonBillWithItems(b, database.salonBillDao().getItemsForBill(b.id))
+                }
+                if (localDeleted.isNotEmpty()) return@withContext Result.success(localDeleted)
+            }
+            Result.failure(IOException(SmavApiClient.friendlyThrowable(e, "Unable to load $scope bills.")))
+        }
     }
 
     /**
@@ -224,6 +588,27 @@ class SyncRepository(
                         body.syncedIds.forEach { syncedId ->
                             database.salonBillDao().updateSyncStatus(syncedId, "SYNCED", null, body.serverTimestamp)
                         }
+                        // Apply any server deletion tombstones returned during offline bill upload
+                        // so an offline device never resurrects a soft-deleted bill.
+                        body.syncedBills?.forEach { sb ->
+                            if (sb.optBool("is_voided", false) || sb.optString("deleted_at").isNotBlank()) {
+                                val existing = findLocalSalonBill(
+                                    id = sb.optString("bill_id"),
+                                    centralBillId = sb.optString("central_bill_id"),
+                                    idempotencyKey = sb.optString("idempotency_key"),
+                                    billNumber = sb.optString("bill_number")
+                                )
+                                if (existing != null) {
+                                    val delMs = parseIsoToEpochMs(sb.optString("deleted_at"), System.currentTimeMillis())
+                                    database.salonBillDao().markVoidedSynced(
+                                        id = existing.id,
+                                        reason = sb.optString("void_reason").ifBlank { "Deleted on central server" },
+                                        voidedAt = delMs,
+                                        voidedBy = "central_sync"
+                                    )
+                                }
+                            }
+                        }
                         totalSynced += body.syncedIds.size
                     }
                 }
@@ -367,6 +752,11 @@ class SyncRepository(
                 runCatching {
                     api.syncPrintStatus(bearer, SyncPrintStatusRequest(pendingPrints))
                 }
+            }
+
+            // 5. Pull authoritative Today's active bills + deletion tombstones from central server
+            if (session.businessType == BusinessType.SALON) {
+                runCatching { pullRemoteLedgerIntoRoom("today") }
             }
 
             Result.success(totalSynced)

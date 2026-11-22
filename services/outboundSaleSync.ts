@@ -26,9 +26,15 @@ export interface OutboundSaleItemPayload {
   line_total: number;
 }
 
+export type OutboundSaleEventType =
+  | 'central_bill_finalized'
+  | 'central_bill_updated'
+  | 'central_bill_voided'
+  | 'central_bill_restored';
+
 export interface CentralBillFinalizedPayload {
   event_id: string;
-  event_type: 'central_bill_finalized';
+  event_type: OutboundSaleEventType;
   idempotency_key: string;
   central_bill_id: string | null;
   central_bill_number: string;
@@ -55,13 +61,21 @@ export interface CentralBillFinalizedPayload {
   billed_at: string;
   source_system: CentralBillSourceSystem;
   items: OutboundSaleItemPayload[];
+  is_voided?: boolean;
+  deleted_at?: string | null;
+  deleted_by?: string | null;
+  delete_reason?: string | null;
+  restored_at?: string | null;
+  restored_by?: string | null;
+  restore_reason?: string | null;
+  edit_version?: number;
 }
 
 export interface OutboundSaleEventRecord {
   id: string;
   outlet_id: string;
   outlet_code: string;
-  event_type: 'central_bill_finalized';
+  event_type: OutboundSaleEventType;
   idempotency_key: string;
   central_bill_id: string | null;
   central_bill_number: string;
@@ -523,6 +537,131 @@ export class OutboundSaleEventCoordinator {
     };
   }
 
+  /**
+   * Best-effort durable enqueue for bill edit, soft-delete (void), and restore lifecycle
+   * events so external admin portals (e.g. Glossy Looks Admin) stay synchronized.
+   */
+  public async enqueueBillLifecycleEvent(params: {
+    db: SupabaseClient | null;
+    eventType: 'central_bill_updated' | 'central_bill_voided' | 'central_bill_restored';
+    outletId: string;
+    outletCode: string;
+    idempotencyKey: string;
+    centralBillId?: string | null;
+    centralBillNumber: string;
+    localBillId?: string | null;
+    branchId?: string | null;
+    branchCode?: string | null;
+    branchName?: string | null;
+    customerName?: string | null;
+    customerPhone?: string | null;
+    paymentMode?: string | null;
+    subtotal?: number | null;
+    discount?: number | null;
+    taxAmount?: number | null;
+    grandTotal?: number;
+    billedAt?: string | null;
+    items?: Array<Record<string, any>>;
+    isVoided: boolean;
+    deletedAt?: string | null;
+    deletedBy?: string | null;
+    deleteReason?: string | null;
+    restoredAt?: string | null;
+    restoredBy?: string | null;
+    restoreReason?: string | null;
+    editVersion?: number;
+  }): Promise<{ enqueued: boolean; eventId?: string; skippedReason?: string }> {
+    if (!params.db) return { enqueued: false, skippedReason: 'service_db_unavailable' };
+    const targetUrl = await this.resolveTargetUrl(params.db, params.outletId);
+    const urlCheck = isSafeHttpsWebhookUrl(targetUrl);
+    if (!urlCheck.ok || !urlCheck.normalized) {
+      return { enqueued: false, skippedReason: urlCheck.reason || 'no_valid_webhook_url' };
+    }
+
+    const eventId = crypto.randomUUID();
+    const cleanBranchCode = normalizeDynamicBranchCode(params.branchCode || '') || 'MAIN';
+    const cleanBranchId = String(params.branchId || '').trim();
+    const basePayload = buildCentralBillFinalizedPayload({
+      eventId,
+      idempotencyKey: params.idempotencyKey,
+      centralBillId: params.centralBillId ?? null,
+      centralBillNumber: params.centralBillNumber,
+      outletId: params.outletId,
+      outletCode: params.outletCode || 'glossylooks',
+      branchId: cleanBranchId || cleanBranchCode,
+      branchCode: cleanBranchCode,
+      branchName: params.branchName || cleanBranchCode,
+      customerName: params.customerName,
+      customerPhone: params.customerPhone,
+      paymentMode: params.paymentMode,
+      subtotal: params.subtotal,
+      discount: params.discount,
+      taxAmount: params.taxAmount,
+      grandTotal: params.grandTotal ?? 0,
+      billedAt: params.billedAt,
+      sourceSystem: 'smav_web_pos',
+      items: Array.isArray(params.items) ? params.items : [],
+    });
+
+    const payload: CentralBillFinalizedPayload = {
+      ...basePayload,
+      event_type: params.eventType,
+      is_voided: params.isVoided,
+      deleted_at: params.deletedAt || null,
+      deleted_by: params.deletedBy || null,
+      delete_reason: params.deleteReason || null,
+      restored_at: params.restoredAt || null,
+      restored_by: params.restoredBy || null,
+      restore_reason: params.restoreReason || null,
+      edit_version: params.editVersion,
+    };
+
+    const validCentralUuid =
+      params.centralBillId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(params.centralBillId)
+        ? params.centralBillId
+        : null;
+
+    const nowIso = new Date().toISOString();
+    const insertRow = {
+      id: eventId,
+      outlet_id: params.outletId,
+      outlet_code: payload.outlet_code,
+      event_type: params.eventType,
+      idempotency_key: params.idempotencyKey,
+      central_bill_id: validCentralUuid,
+      central_bill_number: payload.central_bill_number,
+      local_bill_id: params.localBillId || null,
+      branch_id: cleanBranchId || null,
+      branch_code: payload.branch_code,
+      branch_name: payload.branch_name,
+      target_url: urlCheck.normalized,
+      payload,
+      status: 'pending',
+      attempts: 0,
+      max_attempts: 8,
+      next_retry_at: nowIso,
+    };
+
+    const insRes = await params.db
+      .from('smav_outbound_sale_events')
+      .upsert(insertRow, {
+        onConflict: 'outlet_id,event_type,idempotency_key',
+        ignoreDuplicates: true,
+      })
+      .select('id')
+      .maybeSingle();
+
+    if (insRes.error) {
+      // Non-fatal if Migration 024 hasn't widened the event_type check constraint yet
+      console.warn(
+        `[SMAV Outbound Lifecycle Sync] Unable to enqueue ${params.eventType} for ${params.centralBillNumber}: ${sanitizeOutboundError(insRes.error)}`
+      );
+      return { enqueued: false, skippedReason: sanitizeOutboundError(insRes.error) };
+    }
+
+    return { enqueued: true, eventId: String(insRes.data?.id || eventId) };
+  }
+
   public async dispatchDueOutboundSaleEvents(
     db: SupabaseClient | null,
     options?: { limit?: number; fetchImpl?: typeof fetch; nowMs?: number }
@@ -587,10 +726,11 @@ export class OutboundSaleEventCoordinator {
       }
 
       const resolvedBranchId = rec.branch_id || rec.payload.branch_id || rec.payload.local_branch_id || '';
+      const resolvedEventType: OutboundSaleEventType = rec.event_type || rec.payload.event_type || 'central_bill_finalized';
       const bodyObj: CentralBillFinalizedPayload = {
         ...rec.payload,
         event_id: rec.id,
-        event_type: 'central_bill_finalized',
+        event_type: resolvedEventType,
         idempotency_key: rec.idempotency_key,
         central_bill_id: rec.central_bill_id ?? rec.payload.central_bill_id ?? null,
         central_bill_number: rec.central_bill_number,

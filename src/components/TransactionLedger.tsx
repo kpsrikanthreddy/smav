@@ -5,11 +5,13 @@ import {
   Eye,
   Printer,
   RefreshCw,
+  RotateCcw,
   Search,
   Trash2,
   X,
 } from 'lucide-react';
 import {
+  OutletBranchOption,
   Stylist,
   TransactionLedgerEntry,
   TransactionLedgerItem,
@@ -80,10 +82,17 @@ export const TransactionLedger: React.FC<TransactionLedgerProps> = ({
   const [timezone, setTimezone] = useState<string>('Asia/Kolkata');
   const [dateKey, setDateKey] = useState<string>('');
   const [serverCanModify, setServerCanModify] = useState<boolean>(false);
+  const [serverCanViewHistory, setServerCanViewHistory] = useState<boolean>(false);
+  const [serverCanRestore, setServerCanRestore] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [bannerMessage, setBannerMessage] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState<string>('');
+  const [scope, setScope] = useState<'today' | 'history' | 'deleted'>('today');
+  const [fromDate, setFromDate] = useState<string>('');
+  const [toDate, setToDate] = useState<string>('');
+  const [branchFilter, setBranchFilter] = useState<string>('');
+  const [branchOptions, setBranchOptions] = useState<OutletBranchOption[]>([]);
 
   // Clickable Services / Items Detail Modal
   const [detailEntry, setDetailEntry] = useState<TransactionLedgerEntry | null>(null);
@@ -106,39 +115,136 @@ export const TransactionLedger: React.FC<TransactionLedgerProps> = ({
   const [voidError, setVoidError] = useState<string | null>(null);
   const [isVoiding, setIsVoiding] = useState(false);
 
-  // Role check: SUPERADMIN, ADMIN, and authorized MANAGER (mapped to admin) can edit/void. POS_BILLING cannot.
+  // Authorized Restore Modal state
+  const [restoreTarget, setRestoreTarget] = useState<TransactionLedgerEntry | null>(null);
+  const [restoreReason, setRestoreReason] = useState('');
+  const [restoreConfirmed, setRestoreConfirmed] = useState(false);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
+  const [isRestoring, setIsRestoring] = useState(false);
+
+  // Role check: SUPERADMIN, ADMIN, and authorized OWNER/MANAGER can view history/deleted and edit/void/restore. POS_BILLING is strictly Today-only.
   const roleAllowedInUi =
     session.role === 'superadmin' ||
     session.role === 'admin' ||
     getVisibleRole(session.displayRole || session.role) === 'SUPERADMIN' ||
     getVisibleRole(session.displayRole || session.role) === 'ADMIN';
   const canModify = roleAllowedInUi && serverCanModify;
+  const canViewHistory = roleAllowedInUi && serverCanViewHistory;
+  const canRestore = roleAllowedInUi && serverCanRestore;
+  const effectiveScope: 'today' | 'history' | 'deleted' = roleAllowedInUi ? scope : 'today';
 
-  const loadLedger = useCallback(async () => {
-    setLoading(true);
+  // Reset scope to today if role loses history privilege or outlet changes
+  useEffect(() => {
+    if (!roleAllowedInUi && scope !== 'today') {
+      setScope('today');
+    }
+  }, [roleAllowedInUi, scope]);
+
+  // Load branches for optional branch filtering across multi-branch outlets
+  useEffect(() => {
+    let active = true;
+    const loadBranches = async () => {
+      try {
+        const res = await fetch('/api/pos/branches', {
+          headers: { Authorization: `Bearer ${session.token}` },
+        });
+        const data = await res.json().catch(() => ({}));
+        if (active && res.ok && Array.isArray(data.branches)) {
+          setBranchOptions(data.branches);
+        }
+      } catch {
+        // Non-fatal: branch filter still derives from loaded bills
+      }
+    };
+    void loadBranches();
+    return () => {
+      active = false;
+    };
+  }, [session.token, session.activeOutlet.id]);
+
+  const loadLedger = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     setError(null);
     try {
-      const res = await fetch('/api/pos/ledger/today?timezone=Asia%2FKolkata', {
+      const params = new URLSearchParams();
+      params.set('scope', effectiveScope);
+      params.set('timezone', 'Asia/Kolkata');
+      params.set('includeTombstones', 'true');
+      if (branchFilter) params.set('branchId', branchFilter);
+      if (effectiveScope !== 'today') {
+        if (fromDate) params.set('fromDate', fromDate);
+        if (toDate) params.set('toDate', toDate);
+      }
+
+      const res = await fetch(`/api/pos/ledger?${params.toString()}`, {
         headers: { Authorization: `Bearer ${session.token}` },
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok || data.success === false) {
-        throw new Error(data.message || `Failed to load today's ledger (HTTP ${res.status})`);
+        throw new Error(data.message || `Failed to load transaction ledger (HTTP ${res.status})`);
       }
       setEntries(Array.isArray(data.bills) ? data.bills : []);
       if (data.timezone) setTimezone(data.timezone);
       if (data.dateKey) setDateKey(data.dateKey);
       setServerCanModify(Boolean(data.canModifyBills));
+      setServerCanViewHistory(Boolean(data.canViewHistory));
+      setServerCanRestore(Boolean(data.canRestoreBills));
     } catch (err: any) {
-      setError(err?.message || "Could not load today's transaction ledger.");
+      setError(err?.message || 'Could not load transaction ledger.');
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
-  }, [session.token, session.activeOutlet.id]);
+  }, [session.token, session.activeOutlet.id, effectiveScope, branchFilter, fromDate, toDate]);
 
   useEffect(() => {
     void loadLedger();
   }, [loadLedger, refreshTrigger]);
+
+  // Real-time SSE sync for cross-platform bill creation, edit, soft-delete, and restore
+  useEffect(() => {
+    const outletId = session.activeOutlet?.id;
+    if (!outletId || typeof EventSource === 'undefined') return;
+    let source: EventSource | null = null;
+    try {
+      source = new EventSource(`/api/realtime/catalog-events?outlet_id=${encodeURIComponent(outletId)}`);
+      source.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload?.type === 'LEDGER_UPDATED') {
+            void loadLedger(true);
+          }
+        } catch {
+          // Ignore malformed keepalive packets
+        }
+      };
+    } catch {
+      // Fallback gracefully to manual refresh if SSE is unavailable
+    }
+    return () => {
+      source?.close();
+    };
+  }, [session.activeOutlet?.id, loadLedger]);
+
+  const availableBranches = useMemo(() => {
+    const map = new Map<string, { id: string; label: string }>();
+    for (const b of branchOptions) {
+      if (b.id) {
+        map.set(b.id, {
+          id: b.id,
+          label: b.branchCode ? `${b.branchName || b.name || b.branchCode} (${b.branchCode})` : (b.branchName || b.name || b.id),
+        });
+      }
+    }
+    for (const row of entries) {
+      if (row.branchId && !map.has(row.branchId)) {
+        map.set(row.branchId, {
+          id: row.branchId,
+          label: row.branchCode ? `${row.branchName || row.branchCode} (${row.branchCode})` : (row.branchName || row.branchId),
+        });
+      }
+    }
+    return Array.from(map.values());
+  }, [branchOptions, entries]);
 
   const filteredEntries = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -320,7 +426,47 @@ export const TransactionLedger: React.FC<TransactionLedgerProps> = ({
       setIsVoiding(false);
     }
   };
+  const handleConfirmRestore = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!restoreTarget || !canRestore) return;
+    if (!restoreConfirmed) {
+      setRestoreError('Please confirm that you want to restore this bill.');
+      return;
+    }
+    if (restoreReason.trim().length < 5) {
+      setRestoreError('Please enter a mandatory restore reason (at least 5 characters).');
+      return;
+    }
 
+    setIsRestoring(true);
+    setRestoreError(null);
+    try {
+      const res = await fetch(`/api/pos/bills/${encodeURIComponent(restoreTarget.id || restoreTarget.billNumber)}/restore`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.token}`,
+        },
+        body: JSON.stringify({
+          reason: restoreReason.trim(),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) {
+        throw new Error(data.message || `Failed to restore bill (HTTP ${res.status})`);
+      }
+      setRestoreTarget(null);
+      setRestoreReason('');
+      setRestoreConfirmed(false);
+      setBannerMessage(data.message || `Bill ${restoreTarget.billNumber} restored to active ledger.`);
+      await loadLedger();
+      onLedgerMutated?.();
+    } catch (err: any) {
+      setRestoreError(err?.message || 'Could not restore bill.');
+    } finally {
+      setIsRestoring(false);
+    }
+  };
   const renderItemsSummaryButton = (entry: TransactionLedgerEntry) => {
     const firstItem = entry.items[0]?.name || 'View details';
     const extraCount = Math.max(0, entry.items.length - 1);
@@ -345,16 +491,50 @@ export const TransactionLedger: React.FC<TransactionLedgerProps> = ({
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div>
           <h3 className="text-base font-bold text-[#2F3033]">
-            Transaction Ledger — Today Only
+            {effectiveScope === 'today'
+              ? 'Transaction Ledger — Today'
+              : effectiveScope === 'history'
+                ? 'Transaction Ledger — Historical Bills'
+                : 'Transaction Ledger — Deleted / Voided Bills'}
           </h3>
           <p className="text-xs text-[#6F737D]">
-            {dateKey ? `${dateKey} (${timezone})` : timezone} · {filteredEntries.length} bill
-            {filteredEntries.length === 1 ? '' : 's'} · ₹{todayTotal.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-            <span className="ml-1.5 text-[#8A8F99]">· Historical bills remain preserved in Reports.</span>
+            {effectiveScope === 'today'
+              ? `${dateKey ? `${dateKey} (${timezone})` : timezone} · `
+              : `${timezone} · `}
+            {filteredEntries.length} bill{filteredEntries.length === 1 ? '' : 's'} · ₹
+            {todayTotal.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            {!canViewHistory && (
+              <span className="ml-1.5 text-[#8A8F99]">· Showing today&apos;s active bills only.</span>
+            )}
           </p>
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
+          {canViewHistory && (
+            <div className="inline-flex rounded-xl border border-[#E5E7EC] bg-[#F5F6FA] p-0.5">
+              {(
+                [
+                  { id: 'today', label: 'Today' },
+                  { id: 'history', label: 'History' },
+                  { id: 'deleted', label: 'Deleted' },
+                ] as const
+              ).map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setScope(tab.id)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer ${
+                    effectiveScope === tab.id
+                      ? 'bg-[#2F3033] text-white shadow-xs'
+                      : 'text-[#6F737D] hover:text-[#2F3033]'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+          )}
+
           <div className="relative">
             <Search className="w-3.5 h-3.5 text-[#8A8F99] absolute left-3 top-1/2 -translate-y-1/2" />
             <input
@@ -377,6 +557,70 @@ export const TransactionLedger: React.FC<TransactionLedgerProps> = ({
         </div>
       </div>
 
+      {(availableBranches.length > 1 || (canViewHistory && effectiveScope !== 'today')) && (
+        <div className="flex flex-wrap items-end gap-2.5 pt-1 border-t border-[#F0F1F5]">
+          {availableBranches.length > 1 && (
+            <div>
+              <label className="block text-[10px] font-semibold uppercase tracking-wide text-[#6F737D] mb-1">
+                Branch
+              </label>
+              <select
+                value={branchFilter}
+                onChange={(e) => setBranchFilter(e.target.value)}
+                className="min-h-[34px] rounded-xl bg-[#F5F6FA] border border-[#E5E7EC] px-2.5 text-xs text-[#2F3033] focus:outline-none focus:bg-white focus:border-[#FF1B7A]"
+              >
+                <option value="">All Branches</option>
+                {availableBranches.map((b) => (
+                  <option key={b.id} value={b.id}>
+                    {b.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {canViewHistory && effectiveScope !== 'today' && (
+            <>
+              <div>
+                <label className="block text-[10px] font-semibold uppercase tracking-wide text-[#6F737D] mb-1">
+                  From Date (IST)
+                </label>
+                <input
+                  type="date"
+                  value={fromDate}
+                  onChange={(e) => setFromDate(e.target.value)}
+                  className="min-h-[34px] rounded-xl bg-[#F5F6FA] border border-[#E5E7EC] px-2.5 text-xs text-[#2F3033] focus:outline-none focus:bg-white focus:border-[#FF1B7A]"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] font-semibold uppercase tracking-wide text-[#6F737D] mb-1">
+                  To Date (IST)
+                </label>
+                <input
+                  type="date"
+                  value={toDate}
+                  onChange={(e) => setToDate(e.target.value)}
+                  className="min-h-[34px] rounded-xl bg-[#F5F6FA] border border-[#E5E7EC] px-2.5 text-xs text-[#2F3033] focus:outline-none focus:bg-white focus:border-[#FF1B7A]"
+                />
+              </div>
+              {(fromDate || toDate || branchFilter) && (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => {
+                    setFromDate('');
+                    setToDate('');
+                    setBranchFilter('');
+                  }}
+                >
+                  Clear Filters
+                </Button>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
       {bannerMessage && (
         <div className="flex items-center justify-between gap-2 rounded-xl border border-[#BBF7D0] bg-[#ECFDF5] px-3.5 py-2.5 text-xs font-medium text-[#15803D]">
           <span>{bannerMessage}</span>
@@ -398,11 +642,21 @@ export const TransactionLedger: React.FC<TransactionLedgerProps> = ({
       )}
 
       {loading && entries.length === 0 ? (
-        <div className="py-10 text-center text-xs text-[#6F737D]">Loading today&apos;s bills…</div>
+        <div className="py-10 text-center text-xs text-[#6F737D]">Loading bills…</div>
       ) : filteredEntries.length === 0 ? (
         <EmptyState
-          title="No bills recorded for today yet"
-          description="Bills generated today in this outlet's local timezone will appear here automatically."
+          title={
+            effectiveScope === 'today'
+              ? 'No bills recorded for today yet'
+              : effectiveScope === 'deleted'
+                ? 'No deleted bills found'
+                : 'No historical bills match the selected filters'
+          }
+          description={
+            effectiveScope === 'today'
+              ? "Active bills generated today across all connected platforms (IST) will appear here automatically."
+              : 'Adjust the date range, branch filter, or search query to inspect other records.'
+          }
         />
       ) : (
         <ResponsiveTable
@@ -419,6 +673,11 @@ export const TransactionLedger: React.FC<TransactionLedgerProps> = ({
                         (v{row.editVersion})
                       </span>
                     )}
+                    {row.isVoided && (
+                      <span className="ml-1.5 text-[10px] font-sans font-bold text-[#B91C1C]">
+                        · DELETED
+                      </span>
+                    )}
                   </div>
                   {(row.branchName || row.branchCode || row.isLegacyBill) && (
                     <div className="flex items-center gap-1.5 text-[10px] text-[#6F737D]">
@@ -428,6 +687,11 @@ export const TransactionLedger: React.FC<TransactionLedgerProps> = ({
                       {row.isLegacyBill && (
                         <span className="font-semibold text-[#B45309]">· Legacy</span>
                       )}
+                    </div>
+                  )}
+                  {row.isVoided && (row.deleteReason || row.voidReason) && (
+                    <div className="text-[10px] text-[#B91C1C] max-w-[220px] truncate" title={row.deleteReason || row.voidReason || ''}>
+                      Reason: {row.deleteReason || row.voidReason}
                     </div>
                   )}
                 </div>
@@ -497,7 +761,7 @@ export const TransactionLedger: React.FC<TransactionLedgerProps> = ({
               align: 'right',
               render: (row) => (
                 <div className="inline-flex items-center justify-end gap-1.5">
-                  {onPrintCopy && (
+                  {onPrintCopy && !row.isVoided && (
                     <button
                       type="button"
                       onClick={() => onPrintCopy(row)}
@@ -508,7 +772,7 @@ export const TransactionLedger: React.FC<TransactionLedgerProps> = ({
                       <span className="hidden xl:inline">Print</span>
                     </button>
                   )}
-                  {canModify && (
+                  {canModify && !row.isVoided && (
                     <>
                       <button
                         type="button"
@@ -534,6 +798,22 @@ export const TransactionLedger: React.FC<TransactionLedgerProps> = ({
                         <span className="hidden xl:inline">Void</span>
                       </button>
                     </>
+                  )}
+                  {canRestore && row.isVoided && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRestoreTarget(row);
+                        setRestoreReason('');
+                        setRestoreConfirmed(false);
+                        setRestoreError(null);
+                      }}
+                      title="Restore Bill to Active Ledger"
+                      className="min-h-[32px] inline-flex items-center gap-1 rounded-lg border border-[#BBF7D0] bg-[#ECFDF5] hover:bg-[#D1FAE5] px-2.5 py-1 text-[11px] font-semibold text-[#15803D] transition cursor-pointer"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      <span>Restore</span>
+                    </button>
                   )}
                 </div>
               ),
@@ -583,7 +863,7 @@ export const TransactionLedger: React.FC<TransactionLedgerProps> = ({
               )}
 
               <div className="flex items-center gap-2 pt-1 border-t border-[#F0F1F5]">
-                {onPrintCopy && (
+                {onPrintCopy && !row.isVoided && (
                   <Button
                     size="sm"
                     variant="secondary"
@@ -593,7 +873,7 @@ export const TransactionLedger: React.FC<TransactionLedgerProps> = ({
                     Print Copy
                   </Button>
                 )}
-                {canModify && (
+                {canModify && !row.isVoided && (
                   <>
                     <Button
                       size="sm"
@@ -617,6 +897,21 @@ export const TransactionLedger: React.FC<TransactionLedgerProps> = ({
                       Void
                     </Button>
                   </>
+                )}
+                {canRestore && row.isVoided && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => {
+                      setRestoreTarget(row);
+                      setRestoreReason('');
+                      setRestoreConfirmed(false);
+                      setRestoreError(null);
+                    }}
+                    leftIcon={<RotateCcw className="w-3.5 h-3.5 text-[#15803D]" />}
+                  >
+                    Restore Bill
+                  </Button>
                 )}
               </div>
             </div>
@@ -1061,6 +1356,107 @@ export const TransactionLedger: React.FC<TransactionLedgerProps> = ({
               </Button>
               <Button type="submit" variant="danger" disabled={isVoiding}>
                 {isVoiding ? 'Voiding…' : 'Confirm Void Bill'}
+              </Button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Authorized Restore Soft-Deleted Bill Confirmation Modal */}
+      {restoreTarget && canRestore && (
+        <div
+          className="fixed inset-0 z-50 bg-black/40 backdrop-blur-[1px] flex items-center justify-center p-4"
+          onClick={() => !isRestoring && setRestoreTarget(null)}
+        >
+          <form
+            onSubmit={handleConfirmRestore}
+            className="bg-white rounded-2xl border border-[#BBF7D0] shadow-xl max-w-md w-full p-5 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h4 className="text-base font-bold text-[#15803D]">
+                  Restore Bill · {restoreTarget.centralBillNumber || restoreTarget.billNumber}
+                </h4>
+                <p className="text-xs text-[#6F737D] mt-1">
+                  Restoring this bill returns it to active ledgers across SMAV Web, SMAV Android, and connected portals while preserving the original invoice number and audit history.
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={isRestoring}
+                onClick={() => setRestoreTarget(null)}
+                className="p-1.5 rounded-lg text-[#6F737D] hover:bg-[#F5F6FA] cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {restoreError && (
+              <div className="rounded-xl border border-[#FECACA] bg-[#FEF2F2] px-3 py-2 text-xs font-medium text-[#B91C1C]">
+                {restoreError}
+              </div>
+            )}
+
+            <div className="bg-[#F5F6FA] rounded-xl p-3 text-xs space-y-1">
+              <div className="flex justify-between">
+                <span className="text-[#6F737D]">Customer</span>
+                <span className="font-semibold text-[#2F3033]">{restoreTarget.customerName}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-[#6F737D]">Amount</span>
+                <span className="font-bold text-[#2F3033] tabular-nums">
+                  ₹{restoreTarget.grandTotal.toFixed(2)} ({restoreTarget.paymentMode.toUpperCase()})
+                </span>
+              </div>
+              {(restoreTarget.deleteReason || restoreTarget.voidReason) && (
+                <div className="flex justify-between gap-2">
+                  <span className="text-[#6F737D]">Previous Delete Reason</span>
+                  <span className="font-medium text-[#B91C1C] text-right">
+                    {restoreTarget.deleteReason || restoreTarget.voidReason}
+                  </span>
+                </div>
+              )}
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-semibold text-[#6F737D] mb-1">
+                Mandatory Restore Reason (min 5 characters)
+              </label>
+              <textarea
+                required
+                minLength={5}
+                rows={2}
+                value={restoreReason}
+                onChange={(e) => setRestoreReason(e.target.value)}
+                placeholder="e.g., Bill was voided by mistake; payment verified in UPI statement"
+                className={BASE_INPUT_CLASS}
+              />
+            </div>
+
+            <label className="flex items-start gap-2 text-xs text-[#2F3033] cursor-pointer">
+              <input
+                type="checkbox"
+                checked={restoreConfirmed}
+                onChange={(e) => setRestoreConfirmed(e.target.checked)}
+                className="mt-0.5 accent-[#15803D]"
+              />
+              <span>
+                I confirm restoring bill <span className="font-mono font-bold">{restoreTarget.centralBillNumber || restoreTarget.billNumber}</span> and recording my user ID in the audit trail.
+              </span>
+            </label>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-[#F0F1F5]">
+              <Button
+                type="button"
+                variant="secondary"
+                disabled={isRestoring}
+                onClick={() => setRestoreTarget(null)}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" disabled={isRestoring}>
+                {isRestoring ? 'Restoring…' : 'Confirm Restore Bill'}
               </Button>
             </div>
           </form>

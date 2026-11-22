@@ -14,11 +14,13 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.smav.printagent.data.local.AppDatabase
+import com.smav.printagent.data.local.dao.SalonBillWithItems
 import com.smav.printagent.data.local.entities.RestaurantOrderEntity
 import com.smav.printagent.data.local.entities.RestaurantOrderItemEntity
 import com.smav.printagent.data.local.entities.RetailBillEntity
@@ -32,6 +34,8 @@ import com.smav.printagent.network.UnauthorizedSessionException
 import com.smav.printagent.ui.components.*
 import com.smav.printagent.ui.theme.*
 import com.smav.printagent.util.BillIdGenerator
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.Locale
 
@@ -740,14 +744,28 @@ fun RecentBillsScreen(
     billingRepo: BillingRepository,
     sessionManager: SessionManager
 ) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
+    val syncRepo = remember(context, database, sessionManager) { SyncRepository(context, database, sessionManager) }
     var feedback by remember { mutableStateOf<String?>(null) }
     var errorBanner by remember { mutableStateOf<String?>(null) }
     var detailDialog by remember { mutableStateOf<LedgerDetailDialogState?>(null) }
 
     val canModify = remember(session.role) { session.role.isAdminOrAbove() }
     val startOfTodayMs = remember(session.businessId) { BillIdGenerator.getStartOfTodayMillis() }
+
+    // Role-gated ledger scope: POS_BILLING is strictly locked to "today"
+    var activeScope by remember(session.businessId, canModify) { mutableStateOf("today") }
+    var fromDateFilter by remember(session.businessId) { mutableStateOf("") }
+    var toDateFilter by remember(session.businessId) { mutableStateOf("") }
+    var selectedBranchId by remember(session.businessId) { mutableStateOf("") }
+    var isRefreshing by remember { mutableStateOf(false) }
+    var remoteScopedBills by remember { mutableStateOf<List<SalonBillWithItems>>(emptyList()) }
+
+    val permittedBranches = remember(session.businessId) {
+        sessionManager.getPermittedBranches(session.businessId).filter { it.isActive }
+    }
 
     val salonBills by database.salonBillDao()
         .getTodayActiveBillsForOutlet(session.businessId, startOfTodayMs)
@@ -762,6 +780,53 @@ fun RecentBillsScreen(
     var salonItemsByBill by remember { mutableStateOf<Map<String, List<SalonBillItemEntity>>>(emptyMap()) }
     var restItemsByOrder by remember { mutableStateOf<Map<String, List<RestaurantOrderItemEntity>>>(emptyMap()) }
     var retailItemsByBill by remember { mutableStateOf<Map<String, List<RetailBillItemEntity>>>(emptyMap()) }
+
+    suspend fun refreshLedgerFromCentral(showToast: Boolean = false) {
+        if (session.businessType != BusinessType.SALON) return
+        isRefreshing = true
+        val effectiveScope = if (canModify) activeScope else "today"
+        if (effectiveScope == "today") {
+            val res = syncRepo.pullRemoteLedgerIntoRoom("today")
+            res.onSuccess { count ->
+                errorBanner = null
+                if (showToast) {
+                    feedback = "Synced $count active bill(s) for today."
+                }
+            }.onFailure { err ->
+                if (showToast) {
+                    errorBanner = err.message ?: "Unable to refresh bills (showing local cache)."
+                }
+            }
+        } else {
+            val res = syncRepo.fetchRemoteLedger(
+                scope = effectiveScope,
+                fromDate = fromDateFilter,
+                toDate = toDateFilter,
+                branchId = selectedBranchId
+            )
+            res.onSuccess { list ->
+                remoteScopedBills = list
+                errorBanner = null
+                if (showToast) {
+                    feedback = "Loaded ${list.size} ${if (effectiveScope == "deleted") "deleted" else "historical"} bill(s)."
+                }
+            }.onFailure { err ->
+                errorBanner = err.message ?: "Unable to load $effectiveScope bills."
+            }
+        }
+        isRefreshing = false
+    }
+
+    // Immediate pull on screen open / scope / filter change + 20s periodic refresh while open
+    LaunchedEffect(session.businessId, activeScope, fromDateFilter, toDateFilter, selectedBranchId) {
+        refreshLedgerFromCentral(showToast = false)
+        while (isActive && session.businessType == BusinessType.SALON) {
+            delay(20_000L)
+            if (activeScope == "today") {
+                refreshLedgerFromCentral(showToast = false)
+            }
+        }
+    }
 
     LaunchedEffect(salonBills) {
         val loaded = mutableMapOf<String, List<SalonBillItemEntity>>()
@@ -787,7 +852,7 @@ fun RecentBillsScreen(
         retailItemsByBill = loaded
     }
 
-    // Role-gated Edit & Void dialog state (only reachable by SUPERADMIN / ADMIN / authorized MANAGER)
+    // Role-gated Edit, Void & Restore dialog state (only reachable by SUPERADMIN / ADMIN / OWNER)
     var editingSalonBill by remember { mutableStateOf<SalonBillEntity?>(null) }
     var editCustomerName by remember { mutableStateOf("") }
     var editCustomerPhone by remember { mutableStateOf("") }
@@ -805,6 +870,11 @@ fun RecentBillsScreen(
     var voidConfirmed by remember { mutableStateOf(false) }
     var voidSaving by remember { mutableStateOf(false) }
 
+    var restoreTargetBill by remember { mutableStateOf<SalonBillEntity?>(null) }
+    var restoreReason by remember { mutableStateOf("") }
+    var restoreConfirmed by remember { mutableStateOf(false) }
+    var restoreSaving by remember { mutableStateOf(false) }
+
     val branch = remember(session) {
         Outlet(
             id = session.businessId,
@@ -820,37 +890,93 @@ fun RecentBillsScreen(
     }
 
     if (session.businessType == BusinessType.SALON) {
+        val effectiveScope = if (canModify) activeScope else "today"
+        val displayedSalonBills = remember(effectiveScope, salonBills, remoteScopedBills, selectedBranchId) {
+            if (effectiveScope == "today") {
+                if (selectedBranchId.isBlank()) salonBills
+                else salonBills.filter { it.branchId == selectedBranchId || it.branchCode.equals(selectedBranchId, ignoreCase = true) }
+            } else {
+                remoteScopedBills.map { it.bill }
+            }
+        }
+        val displayedSalonItems = remember(effectiveScope, salonItemsByBill, remoteScopedBills) {
+            if (effectiveScope == "today") salonItemsByBill
+            else remoteScopedBills.associate { it.bill.id to it.items }
+        }
+
         SalonBillsReprintScreenContent(
-            salonBills = salonBills,
-            salonItemsByBill = salonItemsByBill,
+            salonBills = displayedSalonBills,
+            salonItemsByBill = displayedSalonItems,
             businessName = session.businessName,
             canModify = canModify,
+            activeScope = effectiveScope,
+            isRefreshing = isRefreshing,
+            branches = permittedBranches,
+            selectedBranchId = selectedBranchId,
+            fromDate = fromDateFilter,
+            toDate = toDateFilter,
             feedback = feedback,
             errorBanner = errorBanner,
+            onRefresh = {
+                scope.launch { refreshLedgerFromCentral(showToast = true) }
+            },
+            onScopeChange = { newScope ->
+                if (canModify) {
+                    activeScope = newScope
+                }
+            },
+            onBranchFilterChange = { branchId ->
+                selectedBranchId = branchId
+            },
+            onDateRangeChange = { from, to ->
+                fromDateFilter = from
+                toDateFilter = to
+            },
             onReprint = { bill ->
                 scope.launch {
                     errorBanner = null
+                    // Ensure remote bill exists in local Room cache before reprinting
+                    if (database.salonBillDao().getBillById(bill.id) == null) {
+                        val items = displayedSalonItems[bill.id].orEmpty()
+                        database.salonBillDao().replaceBillAndItems(bill, items)
+                    }
                     val r = billingRepo.reprintSalonBill(bill.id, branch, session.userName)
                     feedback = r.fold({ "Printed copy for ${bill.billNumber}" }, { null })
                     if (r.isFailure) errorBanner = "Print failed: ${r.exceptionOrNull()?.message}"
                 }
             },
             onEdit = { bill, lineItems ->
-                editingSalonBill = bill
-                editCustomerName = bill.customerName.orEmpty()
-                editCustomerPhone = bill.customerPhone.orEmpty()
-                editPaymentMode = bill.paymentMode.lowercase(Locale.ENGLISH)
-                editDiscountText = String.format(Locale.ENGLISH, "%.2f", bill.discountAmount)
-                editItems = lineItems
-                editReason = ""
-                editConfirmed = false
+                scope.launch {
+                    if (database.salonBillDao().getBillById(bill.id) == null) {
+                        database.salonBillDao().replaceBillAndItems(bill, lineItems)
+                    }
+                    editingSalonBill = bill
+                    editCustomerName = bill.customerName.orEmpty()
+                    editCustomerPhone = bill.customerPhone.orEmpty()
+                    editPaymentMode = bill.paymentMode.lowercase(Locale.ENGLISH)
+                    editDiscountText = String.format(Locale.ENGLISH, "%.2f", bill.discountAmount)
+                    editItems = lineItems
+                    editReason = ""
+                    editConfirmed = false
+                }
             },
             onVoid = { bill ->
-                voidTargetId = bill.id
-                voidTargetNumber = bill.billNumber
-                voidTargetType = BusinessType.SALON
-                voidReason = ""
-                voidConfirmed = false
+                scope.launch {
+                    if (database.salonBillDao().getBillById(bill.id) == null) {
+                        val items = displayedSalonItems[bill.id].orEmpty()
+                        database.salonBillDao().replaceBillAndItems(bill, items)
+                    }
+                    voidTargetId = bill.id
+                    voidTargetNumber = bill.billNumber
+                    voidTargetType = BusinessType.SALON
+                    voidReason = ""
+                    voidConfirmed = false
+                }
+            },
+            onRestore = { bill ->
+                restoreTargetBill = bill
+                restoreReason = ""
+                restoreConfirmed = false
             }
         )
     } else {
@@ -1134,6 +1260,7 @@ fun RecentBillsScreen(
                     res.onSuccess { updated ->
                         feedback = "Updated ${updated.billNumber} (Rs. ${String.format(Locale.ENGLISH, "%.2f", updated.grandTotal)})."
                         editingSalonBill = null
+                        refreshLedgerFromCentral(showToast = false)
                     }.onFailure { err ->
                         errorBanner = err.message ?: "Unable to edit bill."
                     }
@@ -1256,6 +1383,7 @@ fun RecentBillsScreen(
                     res.onSuccess { msgText ->
                         feedback = msgText
                         voidTargetId = null
+                        refreshLedgerFromCentral(showToast = false)
                     }.onFailure { err ->
                         errorBanner = err.message ?: "Unable to void bill."
                     }
@@ -1275,6 +1403,51 @@ fun RecentBillsScreen(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(checked = voidConfirmed, onCheckedChange = { voidConfirmed = it })
                 Text("I confirm voiding bill $voidTargetNumber with this audit reason.", color = SmavColors.TextSecondary, fontSize = 12.sp)
+            }
+        }
+    }
+
+    // Role-Gated Audited Restore Dialog (ADMIN / OWNER / SUPERADMIN only)
+    val restoreBill = restoreTargetBill
+    if (canModify && restoreBill != null) {
+        MobileFormDialog(
+            title = "Restore Bill • ${restoreBill.billNumber}",
+            onDismiss = { if (!restoreSaving) restoreTargetBill = null },
+            confirmText = "Confirm Restore",
+            confirmEnabled = !restoreSaving && restoreConfirmed && restoreReason.trim().length >= 5,
+            isSaving = restoreSaving,
+            onConfirm = {
+                restoreSaving = true
+                errorBanner = null
+                scope.launch {
+                    val res = billingRepo.restoreSalonBill(
+                        billId = restoreBill.id,
+                        billNumber = restoreBill.billNumber,
+                        reason = restoreReason
+                    )
+                    res.onSuccess { msgText ->
+                        feedback = msgText
+                        restoreTargetBill = null
+                        refreshLedgerFromCentral(showToast = false)
+                    }.onFailure { err ->
+                        errorBanner = err.message ?: "Unable to restore bill."
+                    }
+                    restoreSaving = false
+                }
+            }
+        ) {
+            SmavSuccessBannerCard("Restoring ${restoreBill.billNumber} returns it to active ledgers across all platforms while keeping its original invoice number and audit log.")
+            OutlinedTextField(
+                value = restoreReason,
+                onValueChange = { restoreReason = it },
+                label = { Text("Mandatory Restore Reason * (min 5 chars)") },
+                colors = smavOutlinedFieldColors(),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(checked = restoreConfirmed, onCheckedChange = { restoreConfirmed = it })
+                Text("I confirm restoring bill ${restoreBill.billNumber} with this audit reason.", color = SmavColors.TextSecondary, fontSize = 12.sp)
             }
         }
     }

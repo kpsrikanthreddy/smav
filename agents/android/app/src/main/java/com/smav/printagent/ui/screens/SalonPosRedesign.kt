@@ -1844,7 +1844,7 @@ private fun FinalizeSalonBillDialog(
 }
 
 // -------------------------------------------------------------------------------------------------
-// SALON BILLS & REPRINT VIEW (TODAY ONLY IN ASIA/KOLKATA, CLEAN SS4 CARD LIST + DETAILS DIALOG)
+// SALON BILLS & REPRINT VIEW (UNIFIED CENTRAL LEDGER — TODAY FOR POS_BILLING; TODAY/HISTORY/DELETED FOR ADMINS)
 // -------------------------------------------------------------------------------------------------
 @Composable
 internal fun SalonBillsReprintScreenContent(
@@ -1852,22 +1852,53 @@ internal fun SalonBillsReprintScreenContent(
     salonItemsByBill: Map<String, List<SalonBillItemEntity>>,
     businessName: String,
     canModify: Boolean,
+    activeScope: String = "today",
+    isRefreshing: Boolean = false,
+    branches: List<BranchOption> = emptyList(),
+    selectedBranchId: String = "",
+    fromDate: String = "",
+    toDate: String = "",
     feedback: String?,
     errorBanner: String?,
+    onRefresh: () -> Unit = {},
+    onScopeChange: (String) -> Unit = {},
+    onBranchFilterChange: (String) -> Unit = {},
+    onDateRangeChange: (String, String) -> Unit = { _, _ -> },
     onReprint: (SalonBillEntity) -> Unit,
     onEdit: (SalonBillEntity, List<SalonBillItemEntity>) -> Unit,
-    onVoid: (SalonBillEntity) -> Unit
+    onVoid: (SalonBillEntity) -> Unit,
+    onRestore: (SalonBillEntity) -> Unit = {}
 ) {
     var searchQuery by remember { mutableStateOf("") }
     var selectedBillForDetails by remember { mutableStateOf<SalonBillEntity?>(null) }
+    var fromInput by remember(fromDate) { mutableStateOf(fromDate) }
+    var toInput by remember(toDate) { mutableStateOf(toDate) }
 
-    // Strictly filter to today's Asia/Kolkata bills only (never show historical bills)
-    val todayBills = remember(salonBills, searchQuery) {
-        filterTodaySalonBillsAsiaKolkata(
-            bills = salonBills,
-            nowMs = System.currentTimeMillis(),
-            searchQuery = searchQuery
-        )
+    val effectiveScope = if (canModify) activeScope else "today"
+
+    // For Today scope, strictly enforce Asia/Kolkata today + active-only filter.
+    // For History/Deleted (admin-only), filter locally by search query while preserving newest-first order.
+    val displayedBills = remember(salonBills, searchQuery, effectiveScope, salonItemsByBill) {
+        if (effectiveScope == "today") {
+            filterTodaySalonBillsAsiaKolkata(
+                bills = salonBills,
+                nowMs = System.currentTimeMillis(),
+                searchQuery = searchQuery
+            ).sortedByDescending { it.createdAtLocal }
+        } else {
+            val q = searchQuery.trim().lowercase(Locale.ENGLISH)
+            salonBills.filter { bill ->
+                if (q.isBlank()) return@filter true
+                val itemsText = salonItemsByBill[bill.id].orEmpty()
+                    .joinToString(" ") { "${it.serviceName} ${it.stylistName.orEmpty()}" }
+                    .lowercase(Locale.ENGLISH)
+                bill.billNumber.lowercase(Locale.ENGLISH).contains(q) ||
+                    (bill.customerName ?: "").lowercase(Locale.ENGLISH).contains(q) ||
+                    (bill.customerPhone ?: "").lowercase(Locale.ENGLISH).contains(q) ||
+                    (bill.branchName ?: bill.branchCode).lowercase(Locale.ENGLISH).contains(q) ||
+                    itemsText.contains(q)
+            }.sortedByDescending { it.createdAtLocal }
+        }
     }
 
     Column(
@@ -1880,16 +1911,162 @@ internal fun SalonBillsReprintScreenContent(
             shadowElevation = 1.dp,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Box(
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 10.dp)
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                SearchField(
-                    query = searchQuery,
-                    onQueryChange = { searchQuery = it },
-                    placeholder = "Search bill number or customer..."
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Box(modifier = Modifier.weight(1f)) {
+                        SearchField(
+                            query = searchQuery,
+                            onQueryChange = { searchQuery = it },
+                            placeholder = "Search bill, customer, phone..."
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = onRefresh,
+                        enabled = !isRefreshing,
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, SmavColors.Border),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                        modifier = Modifier.height(44.dp)
+                    ) {
+                        if (isRefreshing) {
+                            CircularProgressIndicator(
+                                strokeWidth = 2.dp,
+                                color = SmavColors.AccentPink,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Default.Refresh,
+                                contentDescription = "Refresh Ledger",
+                                tint = SmavColors.AccentPink,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                }
+
+                // Role-gated Today | History | Deleted switcher (strictly hidden for POS_BILLING)
+                if (canModify) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf(
+                            "today" to "Today",
+                            "history" to "History",
+                            "deleted" to "Deleted"
+                        ).forEach { (scopeId, label) ->
+                            val selected = effectiveScope == scopeId
+                            Surface(
+                                onClick = { onScopeChange(scopeId) },
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (selected) SmavColors.TextPrimary else SmavColors.Background,
+                                border = BorderStroke(1.dp, if (selected) SmavColors.TextPrimary else SmavColors.Border),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(
+                                    text = label,
+                                    color = if (selected) Color.White else SmavColors.TextSecondary,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.padding(vertical = 8.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Optional multi-branch filter chips
+                if (branches.size > 1) {
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        item(key = "branch_all") {
+                            val selected = selectedBranchId.isBlank()
+                            Surface(
+                                onClick = { onBranchFilterChange("") },
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (selected) SmavColors.AccentPink else SmavColors.Background,
+                                border = BorderStroke(1.dp, if (selected) SmavColors.AccentPink else SmavColors.Border)
+                            ) {
+                                Text(
+                                    text = "All Branches",
+                                    color = if (selected) Color.White else SmavColors.TextSecondary,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                )
+                            }
+                        }
+                        items(branches, key = { it.id }) { b ->
+                            val selected = selectedBranchId == b.id
+                            Surface(
+                                onClick = { onBranchFilterChange(b.id) },
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (selected) SmavColors.AccentPink else SmavColors.Background,
+                                border = BorderStroke(1.dp, if (selected) SmavColors.AccentPink else SmavColors.Border)
+                            ) {
+                                Text(
+                                    text = "${b.displayName} (${b.branchCode})",
+                                    color = if (selected) Color.White else SmavColors.TextSecondary,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Date range inputs (YYYY-MM-DD in IST) for authorized History / Deleted tabs
+                if (canModify && effectiveScope != "today") {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = fromInput,
+                            onValueChange = { fromInput = it.take(10) },
+                            placeholder = { Text("From YYYY-MM-DD", fontSize = 11.sp) },
+                            singleLine = true,
+                            textStyle = LocalTextStyle.current.copy(fontSize = 12.sp),
+                            shape = RoundedCornerShape(10.dp),
+                            colors = smavOutlinedFieldColors(),
+                            modifier = Modifier.weight(1f)
+                        )
+                        OutlinedTextField(
+                            value = toInput,
+                            onValueChange = { toInput = it.take(10) },
+                            placeholder = { Text("To YYYY-MM-DD", fontSize = 11.sp) },
+                            singleLine = true,
+                            textStyle = LocalTextStyle.current.copy(fontSize = 12.sp),
+                            shape = RoundedCornerShape(10.dp),
+                            colors = smavOutlinedFieldColors(),
+                            modifier = Modifier.weight(1f)
+                        )
+                        Button(
+                            onClick = { onDateRangeChange(fromInput.trim(), toInput.trim()) },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = SmavColors.TextPrimary,
+                                contentColor = Color.White
+                            ),
+                            shape = RoundedCornerShape(10.dp),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                            modifier = Modifier.height(44.dp)
+                        ) {
+                            Text("Go", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
             }
         }
         HorizontalDivider(color = SmavColors.Border)
@@ -1908,22 +2085,43 @@ internal fun SalonBillsReprintScreenContent(
                 item(key = "error_banner") { ErrorBannerCard(errorBanner) }
             }
 
-            if (todayBills.isEmpty()) {
-                item(key = "empty_today_bills") {
+            if (displayedBills.isEmpty()) {
+                item(key = "empty_ledger_bills") {
                     EmptyStateCard(
-                        title = "No Bills Today",
-                        subtitle = "Today's bills for $businessName (IST) will appear here after billing.",
+                        title = when (effectiveScope) {
+                            "history" -> "No Historical Bills Found"
+                            "deleted" -> "No Deleted Bills"
+                            else -> "No Bills Today"
+                        },
+                        subtitle = when (effectiveScope) {
+                            "history" -> "Adjust date range, branch, or search to inspect earlier bills for $businessName."
+                            "deleted" -> "Soft-deleted bills for $businessName appear here for authorized admins."
+                            else -> "Today's active bills for $businessName (IST) across all platforms appear here."
+                        },
                         icon = Icons.Default.ReceiptLong
                     )
                 }
             } else {
-                items(todayBills, key = { it.id }) { bill ->
+                items(displayedBills, key = { "${effectiveScope}_${it.id}_${it.billNumber}" }) { bill ->
                     val displayCustomer = bill.customerName?.trim()?.takeIf { it.isNotBlank() } ?: "Walk-in Guest"
+                    val displayPhone = bill.customerPhone?.trim()?.takeIf { it.isNotBlank() }
+                    val lineItems = salonItemsByBill[bill.id].orEmpty()
+                    val stylistsText = lineItems.mapNotNull { it.stylistName?.trim()?.takeIf { n -> n.isNotBlank() } }
+                        .distinct()
+                        .joinToString(", ") { formatSalonStaffName(it) }
+                    val servicesText = lineItems.joinToString(", ") {
+                        if (it.quantity > 1) "${it.serviceName} ×${it.quantity}" else it.serviceName
+                    }
+                    val resolvedBranch = bill.branchName?.takeIf { it.isNotBlank() } ?: bill.branchCode
+
                     Card(
                         onClick = { selectedBillForDetails = bill },
                         modifier = Modifier.fillMaxWidth(),
                         colors = CardDefaults.cardColors(containerColor = SmavColors.Surface),
-                        border = BorderStroke(1.dp, SmavColors.Border),
+                        border = BorderStroke(
+                            1.dp,
+                            if (bill.isVoided) SmavColors.DangerText.copy(alpha = 0.45f) else SmavColors.Border
+                        ),
                         shape = RoundedCornerShape(14.dp),
                         elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
                     ) {
@@ -1931,7 +2129,7 @@ internal fun SalonBillsReprintScreenContent(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(14.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
@@ -1939,8 +2137,8 @@ internal fun SalonBillsReprintScreenContent(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
-                                    text = bill.billNumber,
-                                    color = SmavColors.TextPrimary,
+                                    text = bill.billNumber + if (bill.isVoided) " • DELETED" else "",
+                                    color = if (bill.isVoided) SmavColors.DangerText else SmavColors.TextPrimary,
                                     fontSize = 15.sp,
                                     fontWeight = FontWeight.Bold,
                                     maxLines = 1,
@@ -1951,15 +2149,51 @@ internal fun SalonBillsReprintScreenContent(
                                     text = formatSalonRupee(bill.grandTotal),
                                     style = SmavNumericStyles.Price,
                                     fontSize = 16.sp,
-                                    color = SmavColors.TextPrimary
+                                    color = if (bill.isVoided) SmavColors.TextSecondary else SmavColors.TextPrimary
                                 )
                             }
 
                             Text(
-                                text = BillIdGenerator.getFormattedDateTime(bill.createdAtLocal),
+                                text = buildString {
+                                    append(BillIdGenerator.getFormattedDateTime(bill.createdAtLocal))
+                                    if (resolvedBranch.isNotBlank()) append(" • $resolvedBranch")
+                                    append(" • ${bill.paymentMode.uppercase(Locale.ENGLISH)}")
+                                },
                                 color = SmavColors.TextSecondary,
-                                fontSize = 12.sp
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
+
+                            if (servicesText.isNotBlank()) {
+                                Text(
+                                    text = servicesText,
+                                    color = SmavColors.TextPrimary,
+                                    fontSize = 12.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+
+                            if (stylistsText.isNotBlank()) {
+                                Text(
+                                    text = "Stylist: $stylistsText",
+                                    color = SmavColors.InfoText,
+                                    fontSize = 11.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+
+                            if (bill.isVoided && !bill.voidReason.isNullOrBlank()) {
+                                Text(
+                                    text = "Delete reason: ${bill.voidReason}",
+                                    color = SmavColors.DangerText,
+                                    fontSize = 11.sp,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
 
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
@@ -1967,7 +2201,7 @@ internal fun SalonBillsReprintScreenContent(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
-                                    text = "Customer: $displayCustomer",
+                                    text = if (displayPhone != null) "$displayCustomer • $displayPhone" else "Customer: $displayCustomer",
                                     color = SmavColors.TextPrimary,
                                     fontSize = 13.sp,
                                     fontWeight = FontWeight.Medium,
@@ -1979,21 +2213,40 @@ internal fun SalonBillsReprintScreenContent(
                                         .clickable { selectedBillForDetails = bill }
                                 )
 
-                                Button(
-                                    onClick = { onReprint(bill) },
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = SmavColors.AccentPink,
-                                        contentColor = Color.White
-                                    ),
-                                    shape = RoundedCornerShape(10.dp),
-                                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
-                                    modifier = Modifier.height(36.dp)
-                                ) {
-                                    Text(
-                                        text = "Reprint",
-                                        fontSize = 13.sp,
-                                        fontWeight = FontWeight.Bold
-                                    )
+                                if (bill.isVoided && canModify) {
+                                    Button(
+                                        onClick = { onRestore(bill) },
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = SmavColors.StepperGreen,
+                                            contentColor = Color.White
+                                        ),
+                                        shape = RoundedCornerShape(10.dp),
+                                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                                        modifier = Modifier.height(36.dp)
+                                    ) {
+                                        Text(
+                                            text = "Restore",
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                } else if (!bill.isVoided) {
+                                    Button(
+                                        onClick = { onReprint(bill) },
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = SmavColors.AccentPink,
+                                            contentColor = Color.White
+                                        ),
+                                        shape = RoundedCornerShape(10.dp),
+                                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
+                                        modifier = Modifier.height(36.dp)
+                                    ) {
+                                        Text(
+                                            text = "Reprint",
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -2016,8 +2269,8 @@ internal fun SalonBillsReprintScreenContent(
             title = {
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(
-                        text = bill.billNumber,
-                        color = SmavColors.TextPrimary,
+                        text = bill.billNumber + if (bill.isVoided) " (DELETED)" else "",
+                        color = if (bill.isVoided) SmavColors.DangerText else SmavColors.TextPrimary,
                         fontWeight = FontWeight.Bold,
                         fontSize = 16.sp
                     )
@@ -2054,6 +2307,9 @@ internal fun SalonBillsReprintScreenContent(
                         color = SmavColors.TextSecondary,
                         fontSize = 12.sp
                     )
+                    if (bill.isVoided && !bill.voidReason.isNullOrBlank()) {
+                        SmavWarningBannerCard("Deleted reason: ${bill.voidReason}")
+                    }
 
                     HorizontalDivider(color = SmavColors.Border)
 
@@ -2121,31 +2377,46 @@ internal fun SalonBillsReprintScreenContent(
             },
             confirmButton = {
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    if (canModify) {
-                        TextButton(onClick = {
-                            selectedBillForDetails = null
-                            onEdit(bill, lineItems)
-                        }) {
-                            Text("Edit", color = SmavColors.InfoText, fontWeight = FontWeight.SemiBold)
+                    if (bill.isVoided && canModify) {
+                        Button(
+                            onClick = {
+                                selectedBillForDetails = null
+                                onRestore(bill)
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = SmavColors.StepperGreen,
+                                contentColor = Color.White
+                            )
+                        ) {
+                            Text("Restore", fontWeight = FontWeight.Bold)
                         }
-                        TextButton(onClick = {
-                            selectedBillForDetails = null
-                            onVoid(bill)
-                        }) {
-                            Text("Void", color = SmavColors.DangerText, fontWeight = FontWeight.SemiBold)
+                    } else if (!bill.isVoided) {
+                        if (canModify) {
+                            TextButton(onClick = {
+                                selectedBillForDetails = null
+                                onEdit(bill, lineItems)
+                            }) {
+                                Text("Edit", color = SmavColors.InfoText, fontWeight = FontWeight.SemiBold)
+                            }
+                            TextButton(onClick = {
+                                selectedBillForDetails = null
+                                onVoid(bill)
+                            }) {
+                                Text("Void", color = SmavColors.DangerText, fontWeight = FontWeight.SemiBold)
+                            }
                         }
-                    }
-                    Button(
-                        onClick = {
-                            onReprint(bill)
-                            selectedBillForDetails = null
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = SmavColors.AccentPink,
-                            contentColor = Color.White
-                        )
-                    ) {
-                        Text("Reprint", fontWeight = FontWeight.Bold)
+                        Button(
+                            onClick = {
+                                onReprint(bill)
+                                selectedBillForDetails = null
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = SmavColors.AccentPink,
+                                contentColor = Color.White
+                            )
+                        ) {
+                            Text("Reprint", fontWeight = FontWeight.Bold)
+                        }
                     }
                 }
             },
