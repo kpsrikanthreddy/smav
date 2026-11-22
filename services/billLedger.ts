@@ -45,9 +45,13 @@ export interface TransactionLedgerEntry {
   paymentMode: string;
   subtotal: number;
   discountAmount: number;
+  discount?: number;
   totalTax: number;
+  taxAmount?: number;
   grandTotal: number;
   createdAt: string;
+  billedAt?: string;
+  status?: 'FINALIZED' | 'VOIDED';
   stylistNames: string[];
   editVersion: number;
   isVoided: boolean;
@@ -64,6 +68,7 @@ export interface TransactionLedgerEntry {
   restoredByName?: string | null;
   restoreReason?: string | null;
   externalBillId?: string | null;
+  externalOrderId?: string | null;
   syncRevision?: number;
   updatedAt?: string | null;
   editHistory?: BillEditAuditSnapshot[];
@@ -220,8 +225,8 @@ export function getOutletDateRangeBounds(params: {
 
 /**
  * RBAC check for Edit / Void / Restore & Historical/Deleted Ledger access.
- * Allowed: SUPERADMIN, ADMIN, OWNER, and authorized MANAGER (mapped to ADMIN in SMAV).
- * Blocked: POS_BILLING, STAFF, STYLIST, RECEPTIONIST, INVENTORY_STAFF.
+ * Allowed: SUPERADMIN, ADMIN, OWNER only.
+ * Blocked: MANAGER (mapped to POS_BILLING), POS_BILLING, STAFF, STYLIST, RECEPTIONIST, INVENTORY_STAFF.
  */
 export function canModifyBills(session?: {
   role?: string | null;
@@ -238,12 +243,9 @@ export function canModifyBills(session?: {
   if (role === 'superadmin' || displayRole === 'SUPERADMIN') return true;
   if (role === 'admin' || displayRole === 'ADMIN' || outletRole === 'ADMIN' || sourceRole === 'ADMIN') return true;
   if (
-    outletRole === 'MANAGER' ||
     outletRole === 'OWNER' ||
-    displayRole === 'MANAGER' ||
     displayRole === 'OWNER' ||
-    sourceRole === 'OWNER' ||
-    sourceRole === 'MANAGER'
+    sourceRole === 'OWNER'
   ) {
     return true;
   }
@@ -495,12 +497,17 @@ export function normalizeLedgerBillRow(
   const branchName =
     String(row.branch_name || row.branchName || details.branch_name || details.branchName || '').trim() || null;
 
+  const isVoided = Boolean(row.is_voided ?? row.isVoided ?? Boolean(row.deleted_at || row.deletedAt));
+  const canonicalId = String(row.id || rawBillNumber || '');
+  const canonicalCentralBillId = String(row.central_bill_id || row.centralBillId || row.id || rawBillNumber || '') || null;
+  const externalOrderId = row.external_bill_id || row.externalBillId || row.external_order_id || row.externalOrderId || null;
+
   return {
-    id: String(row.id || rawBillNumber || ''),
+    id: canonicalId,
     sourceTable,
     outletId: String(row.outlet_id || row.outletId || fallbackOutletId),
     billNumber: rawBillNumber,
-    centralBillId: row.central_bill_id || row.centralBillId || null,
+    centralBillId: canonicalCentralBillId,
     centralBillNumber: centralBillNumber ? String(centralBillNumber) : null,
     branchId: row.branch_id || row.branchId || null,
     branchCode,
@@ -514,12 +521,16 @@ export function normalizeLedgerBillRow(
     paymentMode: String(row.payment_mode || row.paymentMode || 'cash').trim().toLowerCase(),
     subtotal,
     discountAmount,
+    discount: discountAmount,
     totalTax,
+    taxAmount: totalTax,
     grandTotal,
     createdAt,
+    billedAt: createdAt,
+    status: isVoided ? 'VOIDED' : 'FINALIZED',
     stylistNames: extractStylistNames(items),
     editVersion: Math.max(1, Number(row.edit_version ?? row.editVersion ?? 1)),
-    isVoided: Boolean(row.is_voided ?? row.isVoided ?? Boolean(row.deleted_at || row.deletedAt)),
+    isVoided,
     editedAt: row.edited_at || row.editedAt || null,
     editReason: row.edit_reason || row.editReason || null,
     voidedAt: row.voided_at || row.voidedAt || row.deleted_at || row.deletedAt || null,
@@ -532,7 +543,8 @@ export function normalizeLedgerBillRow(
     restoredBy: row.restored_by || row.restoredBy || null,
     restoredByName: row.restored_by_name || row.restoredByName || null,
     restoreReason: row.restore_reason || row.restoreReason || null,
-    externalBillId: row.external_bill_id || row.externalBillId || null,
+    externalBillId: externalOrderId,
+    externalOrderId,
     syncRevision: Number.isFinite(Number(row.sync_revision ?? row.syncRevision))
       ? Number(row.sync_revision ?? row.syncRevision)
       : undefined,

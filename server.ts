@@ -1085,7 +1085,7 @@ export class SmavAuthGateway implements IAuthProvider {
 
                 const rawOutletRole = String(m.role || '').toUpperCase();
                 const isOutletAdmin = rawOutletRole
-                  ? ['ADMIN', 'OWNER', 'MANAGER'].includes(rawOutletRole)
+                  ? ['ADMIN', 'OWNER'].includes(rawOutletRole)
                   : platformRole === 'ADMIN';
                 const outletUserRole: UserRole = isOutletAdmin ? 'admin' : 'staff';
                 const visibleRole = displayRoleFor(outletUserRole);
@@ -1537,7 +1537,7 @@ export class SmavAuthGateway implements IAuthProvider {
             };
           }
           const rawOutletRole = String(roleRow.role || 'STAFF').toUpperCase();
-          const refreshedRole: UserRole = ['ADMIN', 'OWNER', 'MANAGER'].includes(rawOutletRole) ? 'admin' : 'staff';
+          const refreshedRole: UserRole = ['ADMIN', 'OWNER'].includes(rawOutletRole) ? 'admin' : 'staff';
           session.role = refreshedRole;
           session.displayRole = displayRoleFor(refreshedRole);
           session.permissions = permissionsForRole(refreshedRole);
@@ -2366,7 +2366,7 @@ app.get('/api/auth/outlets', requireAuth, async (req, res) => {
         const memberships: UserOutletMembership[] = (outletRows || []).map(r => {
           const o = outletFromRow(r);
           const m = (roleRows || []).find((mem: any) => mem.outlet_id === r.id);
-          const isOutletAdmin = ['ADMIN', 'OWNER', 'MANAGER'].includes(String(m?.role || '').toUpperCase());
+          const isOutletAdmin = ['ADMIN', 'OWNER'].includes(String(m?.role || '').toUpperCase());
           const outletRole: UserRole = isOutletAdmin ? 'admin' : 'staff';
           return {
             outletId: o.id,
@@ -2450,7 +2450,7 @@ app.post('/api/auth/switch-outlet', requireAuth, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access denied: You are not assigned to this outlet.' });
     }
 
-    const isOutletAdmin = ['ADMIN', 'OWNER', 'MANAGER'].includes(String(matchedRole.role || '').toUpperCase());
+    const isOutletAdmin = ['ADMIN', 'OWNER'].includes(String(matchedRole.role || '').toUpperCase());
     const nextRole: UserRole = isOutletAdmin ? 'admin' : 'staff';
     const updated = await smavGateway.switchAuthenticatedOutlet(session.token, targetOutlet, nextRole);
 
@@ -3509,7 +3509,7 @@ app.post('/api/outlet-users', requireAuth, requireAdmin, async (req, res) => {
   if (requestedRole === 'SUPERADMIN') {
     return res.status(403).json({ success: false, message: 'Forbidden: SUPERADMIN role cannot be assigned through user management.' });
   }
-  const normalizedRole: 'ADMIN' | 'STAFF' = requestedRole === 'ADMIN' || requestedRole === 'OWNER' || requestedRole === 'MANAGER' ? 'ADMIN' : 'STAFF';
+  const normalizedRole: 'ADMIN' | 'STAFF' = requestedRole === 'ADMIN' || requestedRole === 'OWNER' ? 'ADMIN' : 'STAFF';
   if (normalizedRole === 'ADMIN' && session.role !== 'superadmin') {
     return res.status(403).json({ success: false, message: 'Forbidden: Only SUPERADMIN can assign ADMIN roles.' });
   }
@@ -3590,7 +3590,7 @@ app.put('/api/outlet-users/:userId', requireAuth, requireAdmin, async (req, res)
     if (rUpper === 'SUPERADMIN') {
       return res.status(403).json({ success: false, message: 'Forbidden: SUPERADMIN role cannot be modified here.' });
     }
-    normalizedRole = rUpper === 'ADMIN' || rUpper === 'OWNER' || rUpper === 'MANAGER' ? 'ADMIN' : 'STAFF';
+    normalizedRole = rUpper === 'ADMIN' || rUpper === 'OWNER' ? 'ADMIN' : 'STAFF';
     if (normalizedRole === 'ADMIN' && session.role !== 'superadmin') {
       return res.status(403).json({ success: false, message: 'Forbidden: Only SUPERADMIN can assign ADMIN roles.' });
     }
@@ -5407,11 +5407,12 @@ const centralBillNumberCoordinator = new CentralBillNumberCoordinator();
 const outboundSaleEventCoordinator = new OutboundSaleEventCoordinator();
 
 function extractRawBodyForHmac(req: express.Request): string {
-  if (typeof (req as any).rawBody === 'string') {
-    return (req as any).rawBody;
-  }
+  // GET and HEAD requests sign `${timestamp}.` (empty body — never path or query string)
   if (req.method === 'GET' || req.method === 'HEAD') {
     return '';
+  }
+  if (typeof (req as any).rawBody === 'string') {
+    return (req as any).rawBody;
   }
   if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
     return JSON.stringify(req.body);
@@ -5551,15 +5552,62 @@ async function resolveCentralBillAuthContext(
     return { ok: false, status: 404, code: 'OUTLET_NOT_FOUND', message: `Outlet "${cleanOutletCode}" not found.` };
   }
 
-  const callerRole = String(req.body?.actorRole || req.body?.userRole || 'admin').trim().toLowerCase();
+  // Enforce strict outlet tenant boundary when integration caller passes outletCode or outletId
+  const explicitOutletCode = String(req.query?.outletCode || req.body?.outletCode || '').trim().toLowerCase();
+  if (forcedOutletCode && explicitOutletCode && explicitOutletCode !== cleanOutletCode) {
+    return {
+      ok: false,
+      status: 403,
+      code: 'OUTLET_MISMATCH',
+      message: `Forbidden: Cross-outlet request "${explicitOutletCode}" is not permitted on outlet "${cleanOutletCode}".`
+    };
+  }
+  const explicitOutletId = String(req.query?.outletId || req.body?.outletId || '').trim();
+  if (explicitOutletId && explicitOutletId !== matchedOutlet.id) {
+    return {
+      ok: false,
+      status: 403,
+      code: 'OUTLET_MISMATCH',
+      message: 'Forbidden: Requested outletId does not match the authenticated integration outlet.'
+    };
+  }
+
+  const callerRole = String(
+    req.body?.actorRole ||
+      req.body?.actor_role ||
+      req.body?.userRole ||
+      req.query?.actorRole ||
+      req.query?.actor_role ||
+      req.query?.userRole ||
+      req.headers['x-actor-role'] ||
+      'admin'
+  )
+    .trim()
+    .toLowerCase();
+
+  const parseQueryList = (val: unknown): string[] => {
+    if (Array.isArray(val)) return val.map((v) => String(v || '').trim()).filter(Boolean);
+    if (typeof val === 'string' && val.trim()) {
+      return val.split(',').map((v) => v.trim()).filter(Boolean);
+    }
+    return [];
+  };
+
   const callerAssignedIds = Array.isArray(req.body?.assignedBranchIds)
     ? req.body.assignedBranchIds.map((v: unknown) => String(v || '').trim()).filter(Boolean)
-    : [];
-  const callerAssignedCodes = Array.isArray(req.body?.assignedBranchCodes)
-    ? req.body.assignedBranchCodes.map((v: unknown) => String(v || '').trim().toUpperCase()).filter(Boolean)
-    : [];
+    : parseQueryList(req.query?.assignedBranchIds);
+  const callerAssignedCodes: string[] = (
+    Array.isArray(req.body?.assignedBranchCodes)
+      ? req.body.assignedBranchCodes.map((v: unknown) => String(v || '').trim())
+      : parseQueryList(req.query?.assignedBranchCodes)
+  )
+    .map((v: string) => v.toUpperCase())
+    .filter(Boolean);
   const callerHasExplicit =
-    Array.isArray(req.body?.assignedBranchIds) || Array.isArray(req.body?.assignedBranchCodes);
+    Array.isArray(req.body?.assignedBranchIds) ||
+    Array.isArray(req.body?.assignedBranchCodes) ||
+    req.query?.assignedBranchIds !== undefined ||
+    req.query?.assignedBranchCodes !== undefined;
 
   return {
     ok: true,
@@ -5702,6 +5750,7 @@ async function handleReserveCentralBillNumber(req: express.Request, res: express
 
     return res.json({
       success: true,
+      reservationId: reserved.centralBillId,
       centralBillId: reserved.centralBillId,
       centralBillNumber: reserved.centralBillNumber,
       billNumber: reserved.centralBillNumber,
@@ -5735,19 +5784,44 @@ async function handleFinalizeCentralBillNumber(req: express.Request, res: expres
     const auth = await resolveCentralBillAuthContext(req, forcedOutletCode);
     if (!auth.ok) return res.status(auth.status).json({ success: false, code: auth.code, message: auth.message });
 
-    const centralBillNumber = String(
+    let centralBillNumber = String(
       req.body?.centralBillNumber || req.body?.central_bill_number || req.body?.billNumber || req.body?.bill_number || ''
     ).trim().toUpperCase();
+    const reservationId = String(
+      req.body?.reservationId || req.body?.reservation_id || req.body?.centralBillId || req.body?.central_bill_id || ''
+    ).trim() || null;
     const idempotencyKey = String(req.body?.idempotencyKey || req.body?.idempotency_key || '').trim() || null;
     const localBillId = String(req.body?.localBillId || req.body?.local_bill_id || '').trim() || null;
     const externalOrderId = String(req.body?.externalOrderId || req.body?.external_order_id || '').trim() || null;
     const sourceSystem = normalizeSourceSystem(req.body?.sourceSystem || req.body?.source_system || auth.defaultSourceSystem);
 
-    if (!centralBillNumber) {
-      return res.status(400).json({ success: false, code: 'CENTRAL_BILL_NUMBER_REQUIRED', message: 'centralBillNumber is required.' });
+    const serviceDb = getCentralSupabaseServiceClient();
+    if (!centralBillNumber && reservationId && serviceDb && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(reservationId)) {
+      const { data: reservedRow } = await serviceDb
+        .from('smav_central_bill_numbers')
+        .select('central_bill_number, outlet_id')
+        .eq('id', reservationId)
+        .maybeSingle();
+      if (reservedRow) {
+        if (String((reservedRow as any).outlet_id) !== auth.outlet.id) {
+          return res.status(403).json({
+            success: false,
+            code: 'OUTLET_MISMATCH',
+            message: 'Reservation does not belong to the authenticated outlet.'
+          });
+        }
+        centralBillNumber = String((reservedRow as any).central_bill_number || '').trim().toUpperCase();
+      }
     }
 
-    const serviceDb = getCentralSupabaseServiceClient();
+    if (!centralBillNumber) {
+      return res.status(400).json({
+        success: false,
+        code: 'CENTRAL_BILL_NUMBER_REQUIRED',
+        message: 'centralBillNumber (or a valid reservationId) is required.'
+      });
+    }
+
     const finalized = await centralBillNumberCoordinator.finalizeCentralBillNumber({
       db: serviceDb,
       outletId: auth.outlet.id,
@@ -5855,11 +5929,13 @@ async function handleFinalizeCentralBillNumber(req: express.Request, res: expres
 
     return res.json({
       success: true,
+      id: finalized.centralBillId,
       centralBillId: finalized.centralBillId,
       centralBillNumber: finalized.centralBillNumber,
       billNumber: finalized.centralBillNumber,
       ...(syncedLedgerBillId ? { ledgerBillId: syncedLedgerBillId } : {}),
       outletId: finalized.outletId,
+      outletCode: auth.outlet.code,
       branchId: finalized.branchId,
       branchCode: finalized.branchCode,
       branchName: finalized.branchName,
@@ -6530,7 +6606,7 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
           ...(typeof bill.subtotal === 'number' ? { subtotal: bill.subtotal } : {}),
           ...(typeof bill.discount === 'number' ? { discount_amount: bill.discount } : {}),
           ...(typeof bill.tax === 'number' ? { total_tax: bill.tax } : {}),
-          ...(validCentralBillUuid ? { central_bill_id: validCentralBillUuid } : {}),
+          ...(validCentralBillUuid ? { id: validCentralBillUuid, central_bill_id: validCentralBillUuid } : {}),
           central_bill_number: canonicalBillNumber,
           ...(canonicalBranchId ? { branch_id: canonicalBranchId } : {}),
           branch_code: allowedBranch.branchCode,
@@ -7050,16 +7126,31 @@ async function upsertExternalBillIntoCentralLedger(params: {
       ? params.centralBillId
       : null;
 
-  // Deterministic stable lookup within outlet_id (never rely on customer name)
+  // Deterministic stable lookup within outlet_id (never rely on customer name):
+  // 1. centralBillId (matches central_bill_id or id)
+  // 2. externalOrderId / externalBillId
+  // 3. idempotencyKey
+  // 4. immutable billNumber / central_bill_number
   let existing: any = null;
-  if (validCentralUuid && table === 'smav_salon_bills') {
-    const { data } = await db
-      .from(table)
-      .select('*')
-      .eq('outlet_id', outlet.id)
-      .eq('central_bill_id', validCentralUuid)
-      .maybeSingle();
-    if (data) existing = data;
+  if (validCentralUuid) {
+    if (table === 'smav_salon_bills') {
+      const { data } = await db
+        .from(table)
+        .select('*')
+        .eq('outlet_id', outlet.id)
+        .eq('central_bill_id', validCentralUuid)
+        .maybeSingle();
+      if (data) existing = data;
+    }
+    if (!existing) {
+      const { data } = await db
+        .from(table)
+        .select('*')
+        .eq('outlet_id', outlet.id)
+        .eq('id', validCentralUuid)
+        .maybeSingle();
+      if (data) existing = data;
+    }
   }
   if (!existing && cleanExternalId) {
     try {
@@ -7090,6 +7181,15 @@ async function upsertExternalBillIntoCentralLedger(params: {
       .maybeSingle();
     if (data) existing = data;
   }
+  if (!existing && table === 'smav_salon_bills') {
+    const { data } = await db
+      .from(table)
+      .select('*')
+      .eq('outlet_id', outlet.id)
+      .eq('central_bill_number', cleanBillNumber)
+      .maybeSingle();
+    if (data) existing = data;
+  }
 
   // Never reactivate a soft-deleted bill through an upsert
   if (existing && (existing.is_voided || existing.deleted_at)) {
@@ -7106,6 +7206,10 @@ async function upsertExternalBillIntoCentralLedger(params: {
     const qty = Math.max(1, Number(item?.quantity ?? item?.qty ?? 1));
     const unitPrice = Number(item?.unit_price ?? item?.unitPrice ?? item?.price ?? 0);
     const discountPercent = Number(item?.discount_percent ?? item?.discountPercent ?? 0);
+    const gstPercentRaw = item?.gst_percent ?? item?.gstPercent;
+    const gstPercent = gstPercentRaw !== undefined && gstPercentRaw !== null && Number.isFinite(Number(gstPercentRaw))
+      ? Number(gstPercentRaw)
+      : undefined;
     const lineTotal = Number(
       item?.line_total ?? item?.lineTotal ?? item?.total ?? Number((qty * unitPrice * (1 - discountPercent / 100)).toFixed(2))
     );
@@ -7118,6 +7222,7 @@ async function upsertExternalBillIntoCentralLedger(params: {
       quantity: qty,
       unit_price: Number.isFinite(unitPrice) ? unitPrice : 0,
       discount_percent: Number.isFinite(discountPercent) ? discountPercent : 0,
+      ...(gstPercent !== undefined ? { gst_percent: gstPercent } : {}),
       line_total: Number.isFinite(lineTotal) ? lineTotal : 0
     };
   });
@@ -7140,6 +7245,7 @@ async function upsertExternalBillIntoCentralLedger(params: {
   const cleanBranchName = String(params.branchName || '').trim() || null;
 
   if (existing?.id) {
+    // Preserve immutable bill_number and central_bill_number — never overwrite them on upsert
     const patch: Record<string, any> = {
       customer_name: cleanName,
       customer_phone: cleanPhone || existing.customer_phone || null,
@@ -7164,7 +7270,7 @@ async function upsertExternalBillIntoCentralLedger(params: {
     const normalized = normalizeLedgerBillRow(row, table, outlet.id);
     broadcastLedgerUpdate(outlet.id, {
       action: 'upserted',
-      billId: normalized.id,
+      billId: normalized.centralBillId || normalized.id,
       billNumber: normalized.billNumber,
       branchId: normalized.branchId,
       branchCode: normalized.branchCode,
@@ -7174,13 +7280,28 @@ async function upsertExternalBillIntoCentralLedger(params: {
     return { created: false, existed: true, isVoided: false, bill: normalized };
   }
 
+  // Verify centralBillId exists in smav_central_bill_numbers before assigning the FK column.
+  // When verified, set both id and central_bill_id to the same permanent UUID so all platforms share one ID.
+  let verifiedCentralUuid: string | null = null;
+  if (validCentralUuid && table === 'smav_salon_bills') {
+    const { data: centralNumRow } = await db
+      .from('smav_central_bill_numbers')
+      .select('id')
+      .eq('id', validCentralUuid)
+      .eq('outlet_id', outlet.id)
+      .maybeSingle();
+    if (centralNumRow?.id) {
+      verifiedCentralUuid = validCentralUuid;
+    }
+  }
+
   const insertPayload: Record<string, any> =
     table === 'smav_salon_bills'
       ? {
+          ...(verifiedCentralUuid ? { id: verifiedCentralUuid, central_bill_id: verifiedCentralUuid } : {}),
           outlet_id: outlet.id,
           bill_number: cleanBillNumber,
           central_bill_number: cleanBillNumber,
-          ...(validCentralUuid ? { central_bill_id: validCentralUuid } : {}),
           idempotency_key: cleanIdem,
           ...(cleanExternalId ? { external_bill_id: cleanExternalId } : {}),
           ...(cleanBranchId ? { branch_id: cleanBranchId } : {}),
@@ -7236,7 +7357,7 @@ async function upsertExternalBillIntoCentralLedger(params: {
   const normalized = normalizeLedgerBillRow(ins.data, table, outlet.id);
   broadcastLedgerUpdate(outlet.id, {
     action: 'created',
-    billId: normalized.id,
+    billId: normalized.centralBillId || normalized.id,
     billNumber: normalized.billNumber,
     branchId: normalized.branchId,
     branchCode: normalized.branchCode,
@@ -7583,7 +7704,7 @@ app.patch('/api/pos/bills/:billId', requireAuth, async (req, res) => {
     return res.status(403).json({
       success: false,
       code: 'FORBIDDEN_BILL_MODIFICATION',
-      message: 'Forbidden: Only SUPERADMIN, ADMIN, or authorized MANAGER can edit bills. POS_BILLING cannot modify bills.'
+      message: 'Forbidden: Only SUPERADMIN, ADMIN, or OWNER can edit bills. POS_BILLING cannot modify bills.'
     });
   }
 
@@ -7864,9 +7985,10 @@ app.patch('/api/pos/bills/:billId', requireAuth, async (req, res) => {
         outletId: session.activeOutlet.id,
         outletCode: session.activeOutlet.code || 'glossylooks',
         idempotencyKey: `EDIT_${updatedEntry.billNumber}_v${updatedEntry.editVersion}`,
-        centralBillId: updatedEntry.centralBillId,
+        centralBillId: updatedEntry.centralBillId || updatedEntry.id,
         centralBillNumber: updatedEntry.centralBillNumber || updatedEntry.billNumber,
         localBillId: updatedEntry.id,
+        externalOrderId: updatedEntry.externalBillId || null,
         branchId: updatedEntry.branchId,
         branchCode: updatedEntry.branchCode,
         branchName: updatedEntry.branchName,
@@ -7901,7 +8023,7 @@ async function handleVoidBillRequest(req: express.Request, res: express.Response
     return res.status(403).json({
       success: false,
       code: 'FORBIDDEN_BILL_MODIFICATION',
-      message: 'Forbidden: Only SUPERADMIN, ADMIN, or authorized MANAGER can void bills. POS_BILLING cannot delete or void bills.'
+      message: 'Forbidden: Only SUPERADMIN, ADMIN, or OWNER can void bills. POS_BILLING cannot delete or void bills.'
     });
   }
 
@@ -8088,9 +8210,10 @@ async function handleVoidBillRequest(req: express.Request, res: express.Response
         outletId: session.activeOutlet.id,
         outletCode: session.activeOutlet.code || 'glossylooks',
         idempotencyKey: `VOID_${currentEntry.billNumber}_${nowIso}`,
-        centralBillId: currentEntry.centralBillId,
+        centralBillId: currentEntry.centralBillId || currentEntry.id,
         centralBillNumber: currentEntry.centralBillNumber || currentEntry.billNumber,
         localBillId: currentEntry.id,
+        externalOrderId: currentEntry.externalBillId || null,
         branchId: currentEntry.branchId,
         branchCode: currentEntry.branchCode,
         branchName: currentEntry.branchName,
@@ -8273,9 +8396,10 @@ async function handleRestoreBillRequest(req: express.Request, res: express.Respo
         outletId: session.activeOutlet.id,
         outletCode: session.activeOutlet.code || 'glossylooks',
         idempotencyKey: `RESTORE_${currentEntry.billNumber}_v${nextVersion}`,
-        centralBillId: currentEntry.centralBillId,
+        centralBillId: currentEntry.centralBillId || currentEntry.id,
         centralBillNumber: currentEntry.centralBillNumber || currentEntry.billNumber,
         localBillId: currentEntry.id,
+        externalOrderId: currentEntry.externalBillId || null,
         branchId: currentEntry.branchId,
         branchCode: currentEntry.branchCode,
         branchName: currentEntry.branchName,
@@ -8321,6 +8445,38 @@ async function handleIntegrationLedgerQuery(req: express.Request, res: express.R
     const rawScope = String(req.query.scope || 'today').trim().toLowerCase();
     const scope: 'today' | 'history' | 'deleted' =
       rawScope === 'history' || rawScope === 'deleted' ? rawScope : 'today';
+
+    // Enforce Today-vs-History/Deleted RBAC when integration caller passes actorRole
+    const actorCanViewHistory = ['superadmin', 'admin', 'owner'].includes(String(auth.userRole || '').toLowerCase());
+    if ((scope === 'history' || scope === 'deleted') && !actorCanViewHistory) {
+      return res.status(403).json({
+        success: false,
+        code: 'FORBIDDEN_HISTORICAL_ACCESS',
+        message: 'Forbidden: POS_BILLING and branch manager roles can only access today\'s active bills.'
+      });
+    }
+
+    const requestedBranchId = typeof req.query.branchId === 'string' ? req.query.branchId.trim() || null : null;
+    const requestedBranchCode = typeof req.query.branchCode === 'string' ? req.query.branchCode.trim() || null : null;
+    if (!actorCanViewHistory && auth.hasExplicitAssignments) {
+      const allowedIds = new Set(auth.assignedBranchIds.map((b) => b.toLowerCase()));
+      const allowedCodes = new Set(auth.assignedBranchCodes.map((b) => b.toUpperCase()));
+      if (requestedBranchId && allowedIds.size > 0 && !allowedIds.has(requestedBranchId.toLowerCase())) {
+        return res.status(403).json({
+          success: false,
+          code: 'BRANCH_NOT_PERMITTED',
+          message: 'Forbidden: Requested branch is outside the caller\'s assigned branches.'
+        });
+      }
+      if (requestedBranchCode && allowedCodes.size > 0 && !allowedCodes.has(requestedBranchCode.toUpperCase())) {
+        return res.status(403).json({
+          success: false,
+          code: 'BRANCH_NOT_PERMITTED',
+          message: 'Forbidden: Requested branchCode is outside the caller\'s assigned branches.'
+        });
+      }
+    }
+
     const includeTombstones = String(req.query.includeTombstones || req.query.include_tombstones || 'true').toLowerCase() !== 'false';
     const sinceRevRaw = Number(req.query.sinceRevision ?? req.query.since_revision);
     const sinceRevision = Number.isFinite(sinceRevRaw) && sinceRevRaw > 0 ? sinceRevRaw : null;
@@ -8332,17 +8488,35 @@ async function handleIntegrationLedgerQuery(req: express.Request, res: express.R
       outletCategory: auth.outlet.category || 'salon',
       scope,
       timezone: typeof req.query.timezone === 'string' ? req.query.timezone : DEFAULT_OUTLET_TIMEZONE,
-      fromDate: typeof req.query.fromDate === 'string' ? req.query.fromDate : null,
-      toDate: typeof req.query.toDate === 'string' ? req.query.toDate : null,
-      branchId: typeof req.query.branchId === 'string' ? req.query.branchId : null,
-      branchCode: typeof req.query.branchCode === 'string' ? req.query.branchCode : null,
+      fromDate: scope === 'today' ? null : typeof req.query.fromDate === 'string' ? req.query.fromDate : null,
+      toDate: scope === 'today' ? null : typeof req.query.toDate === 'string' ? req.query.toDate : null,
+      branchId: requestedBranchId,
+      branchCode: requestedBranchCode,
       search: typeof req.query.search === 'string' ? req.query.search : null,
       includeTombstones,
       sinceRevision,
       limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined
     });
 
-    return res.json({ success: true, ...result });
+    // If caller is non-admin with explicit branch assignments and didn't filter to a single branch, scope bills strictly
+    if (!actorCanViewHistory && auth.hasExplicitAssignments) {
+      const allowedIds = new Set(auth.assignedBranchIds.map((b) => b.toLowerCase()));
+      const allowedCodes = new Set(auth.assignedBranchCodes.map((b) => b.toUpperCase()));
+      const filteredBills = result.bills.filter((b) => {
+        const bId = String(b.branchId || '').toLowerCase();
+        const bCode = String(b.branchCode || '').toUpperCase();
+        return (bId && allowedIds.has(bId)) || (bCode && allowedCodes.has(bCode));
+      });
+      result.bills = filteredBills;
+      result.count = filteredBills.length;
+      result.totalAmount = Number(filteredBills.reduce((s, b) => s + Number(b.grandTotal || 0), 0).toFixed(2));
+    }
+
+    return res.json({
+      success: true,
+      outletCode: auth.outlet.code,
+      ...result
+    });
   } catch (error: any) {
     return res.status(500).json({ success: false, message: sanitizeErrorMessage(error) });
   }
@@ -8365,7 +8539,7 @@ async function handleIntegrationBillUpsert(req: express.Request, res: express.Re
     const result = await upsertExternalBillIntoCentralLedger({
       db: serviceDb,
       outlet: auth.outlet,
-      centralBillId: req.body?.centralBillId ?? req.body?.central_bill_id ?? null,
+      centralBillId: req.body?.centralBillId ?? req.body?.central_bill_id ?? req.body?.reservationId ?? req.body?.reservation_id ?? null,
       centralBillNumber,
       externalBillId: req.body?.externalBillId ?? req.body?.external_bill_id ?? req.body?.externalOrderId ?? req.body?.external_order_id ?? null,
       idempotencyKey: req.body?.idempotencyKey ?? req.body?.idempotency_key ?? null,
@@ -8384,7 +8558,16 @@ async function handleIntegrationBillUpsert(req: express.Request, res: express.Re
       billedAt: req.body?.billedAt ?? req.body?.billed_at ?? req.body?.createdAt ?? new Date().toISOString()
     });
 
-    return res.json({ success: true, ...result });
+    const canonicalCentralBillId = result.bill?.centralBillId || result.bill?.id || null;
+    return res.json({
+      success: true,
+      centralBillId: canonicalCentralBillId,
+      id: canonicalCentralBillId,
+      billNumber: result.bill?.billNumber || centralBillNumber,
+      centralBillNumber: result.bill?.centralBillNumber || result.bill?.billNumber || centralBillNumber,
+      status: result.isVoided ? 'VOIDED' : 'FINALIZED',
+      ...result
+    });
   } catch (error: any) {
     return res.status(400).json({ success: false, message: sanitizeErrorMessage(error) });
   }
@@ -8401,20 +8584,29 @@ async function locateIntegrationOutletBill(
   const cleanId = String(identifier || '').trim();
   const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cleanId);
 
+  // 1. centralBillId / id
   if (isUuid) {
-    const byId = await serviceDb.from(table).select('*').eq('outlet_id', outletId).eq('id', cleanId).maybeSingle();
-    if (byId.data) return { table, row: byId.data };
     if (table === 'smav_salon_bills') {
       const byCentral = await serviceDb.from(table).select('*').eq('outlet_id', outletId).eq('central_bill_id', cleanId).maybeSingle();
       if (byCentral.data) return { table, row: byCentral.data };
     }
+    const byId = await serviceDb.from(table).select('*').eq('outlet_id', outletId).eq('id', cleanId).maybeSingle();
+    if (byId.data) return { table, row: byId.data };
   }
+  // 2. immutable billNumber / central_bill_number
+  const upperBillNo = cleanId.toUpperCase();
+  const byNo = await serviceDb.from(table).select('*').eq('outlet_id', outletId).eq('bill_number', upperBillNo).maybeSingle();
+  if (byNo.data) return { table, row: byNo.data };
+  if (table === 'smav_salon_bills') {
+    const byCentralNo = await serviceDb.from(table).select('*').eq('outlet_id', outletId).eq('central_bill_number', upperBillNo).maybeSingle();
+    if (byCentralNo.data) return { table, row: byCentralNo.data };
+  }
+  // 3. externalOrderId / external_bill_id
   try {
     const byExt = await serviceDb.from(table).select('*').eq('outlet_id', outletId).eq('external_bill_id', cleanId).maybeSingle();
     if (byExt.data) return { table, row: byExt.data };
   } catch {}
-  const byNo = await serviceDb.from(table).select('*').eq('outlet_id', outletId).eq('bill_number', cleanId).maybeSingle();
-  if (byNo.data) return { table, row: byNo.data };
+  // 4. idempotencyKey
   const byIdem = await serviceDb.from(table).select('*').eq('outlet_id', outletId).eq('idempotency_key', cleanId).maybeSingle();
   if (byIdem.data) return { table, row: byIdem.data };
   return null;
@@ -8427,17 +8619,32 @@ async function handleIntegrationBillVoid(req: express.Request, res: express.Resp
     const serviceDb = getCentralSupabaseServiceClient();
     if (!serviceDb) return res.status(503).json({ success: false, message: 'Central service database unavailable.' });
 
-    const reason = String(req.body?.reason || '').trim();
-    if (reason.length < 5) {
-      return res.status(400).json({ success: false, message: 'A delete/void reason of at least 5 characters is required.' });
-    }
     const actorRole = String(req.body?.actorRole || req.body?.actor_role || 'ADMIN').trim().toUpperCase();
-    if (!['SUPERADMIN', 'ADMIN', 'OWNER', 'MANAGER'].includes(actorRole)) {
-      return res.status(403).json({ success: false, code: 'FORBIDDEN_BILL_MODIFICATION', message: 'Only ADMIN, OWNER, or SUPERADMIN can delete bills.' });
+    if (!['SUPERADMIN', 'ADMIN', 'OWNER'].includes(actorRole)) {
+      return res.status(403).json({ success: false, code: 'FORBIDDEN_BILL_MODIFICATION', message: 'Only ADMIN, OWNER, or SUPERADMIN can void/delete bills.' });
     }
 
+    const suppliedReason = String(req.body?.reason || '').trim();
+    const reason = suppliedReason || 'Voided via Glossy Looks Admin';
+
     const found = await locateIntegrationOutletBill(serviceDb, auth.outlet.id, auth.outlet.category || 'salon', String(req.params.billId || ''));
-    if (!found) return res.status(404).json({ success: false, message: 'Bill not found in outlet.' });
+    if (!found) return res.status(404).json({ success: false, code: 'BILL_NOT_FOUND', message: 'Bill not found in outlet.' });
+
+    const existingEntry = normalizeLedgerBillRow(found.row, found.table, auth.outlet.id);
+    const canonicalCentralBillId = existingEntry.centralBillId || existingEntry.id;
+
+    // Idempotent replay: repeated void on an already-voided bill succeeds without duplicating side effects
+    if (existingEntry.isVoided) {
+      return res.json({
+        success: true,
+        idempotentReplay: true,
+        centralBillId: canonicalCentralBillId,
+        billId: existingEntry.id,
+        billNumber: existingEntry.billNumber,
+        status: 'VOIDED',
+        deletedAt: existingEntry.deletedAt || existingEntry.voidedAt
+      });
+    }
 
     const nowIso = new Date().toISOString();
     const actorIdRaw = String(req.body?.actorId || req.body?.actor_id || '').trim();
@@ -8468,27 +8675,34 @@ async function handleIntegrationBillVoid(req: express.Request, res: express.Resp
     }
     if (upd.error) return res.status(500).json({ success: false, message: upd.error.message });
 
-    const entry = normalizeLedgerBillRow(found.row, found.table, auth.outlet.id);
     await writeTrustedServerAuditLog({
       userId: actorUuid || 'external_admin',
       userEmail: actorName,
       outletId: auth.outlet.id,
       action: 'BILL_VOIDED_EXTERNAL',
       entityType: 'bill',
-      entityId: entry.billNumber || entry.id,
-      details: { actor_role: actorRole, actor_name: actorName, bill_id: entry.id, reason, deleted_at: nowIso }
+      entityId: existingEntry.billNumber || existingEntry.id,
+      details: { actor_role: actorRole, actor_name: actorName, bill_id: existingEntry.id, central_bill_id: canonicalCentralBillId, reason, deleted_at: nowIso }
     });
 
     broadcastLedgerUpdate(auth.outlet.id, {
       action: 'voided',
-      billId: entry.id,
-      billNumber: entry.billNumber,
-      branchId: entry.branchId,
-      branchCode: entry.branchCode,
+      billId: canonicalCentralBillId,
+      billNumber: existingEntry.billNumber,
+      branchId: existingEntry.branchId,
+      branchCode: existingEntry.branchCode,
       isVoided: true
     });
 
-    return res.json({ success: true, billId: entry.id, billNumber: entry.billNumber, deletedAt: nowIso });
+    return res.json({
+      success: true,
+      idempotentReplay: false,
+      centralBillId: canonicalCentralBillId,
+      billId: existingEntry.id,
+      billNumber: existingEntry.billNumber,
+      status: 'VOIDED',
+      deletedAt: nowIso
+    });
   } catch (error: any) {
     return res.status(500).json({ success: false, message: sanitizeErrorMessage(error) });
   }
@@ -8501,17 +8715,33 @@ async function handleIntegrationBillRestore(req: express.Request, res: express.R
     const serviceDb = getCentralSupabaseServiceClient();
     if (!serviceDb) return res.status(503).json({ success: false, message: 'Central service database unavailable.' });
 
-    const reason = String(req.body?.reason || '').trim();
-    if (reason.length < 5) {
-      return res.status(400).json({ success: false, message: 'A restore reason of at least 5 characters is required.' });
-    }
     const actorRole = String(req.body?.actorRole || req.body?.actor_role || 'ADMIN').trim().toUpperCase();
-    if (!['SUPERADMIN', 'ADMIN', 'OWNER', 'MANAGER'].includes(actorRole)) {
+    if (!['SUPERADMIN', 'ADMIN', 'OWNER'].includes(actorRole)) {
       return res.status(403).json({ success: false, code: 'FORBIDDEN_BILL_MODIFICATION', message: 'Only ADMIN, OWNER, or SUPERADMIN can restore bills.' });
     }
 
+    const suppliedReason = String(req.body?.reason || '').trim();
+    const reason = suppliedReason || 'Restored via Glossy Looks Admin';
+
     const found = await locateIntegrationOutletBill(serviceDb, auth.outlet.id, auth.outlet.category || 'salon', String(req.params.billId || ''));
-    if (!found) return res.status(404).json({ success: false, message: 'Bill not found in outlet.' });
+    if (!found) return res.status(404).json({ success: false, code: 'BILL_NOT_FOUND', message: 'Bill not found in outlet.' });
+
+    const existingEntry = normalizeLedgerBillRow(found.row, found.table, auth.outlet.id);
+    const canonicalCentralBillId = existingEntry.centralBillId || existingEntry.id;
+
+    // Idempotent replay: repeated restore on an already-active bill succeeds without creating a new bill number
+    if (!existingEntry.isVoided) {
+      return res.json({
+        success: true,
+        idempotentReplay: true,
+        centralBillId: canonicalCentralBillId,
+        billId: existingEntry.id,
+        billNumber: existingEntry.billNumber,
+        status: 'FINALIZED',
+        restoredAt: existingEntry.restoredAt || null,
+        editVersion: existingEntry.editVersion
+      });
+    }
 
     const nowIso = new Date().toISOString();
     const nextVersion = Math.max(1, Number(found.row.edit_version || 1)) + 1;
@@ -8543,27 +8773,35 @@ async function handleIntegrationBillRestore(req: express.Request, res: express.R
     }
     if (upd.error) return res.status(500).json({ success: false, message: upd.error.message });
 
-    const entry = normalizeLedgerBillRow(found.row, found.table, auth.outlet.id);
     await writeTrustedServerAuditLog({
       userId: actorUuid || 'external_admin',
       userEmail: actorName,
       outletId: auth.outlet.id,
       action: 'BILL_RESTORED_EXTERNAL',
       entityType: 'bill',
-      entityId: entry.billNumber || entry.id,
-      details: { actor_role: actorRole, actor_name: actorName, bill_id: entry.id, reason, restored_at: nowIso, edit_version: nextVersion }
+      entityId: existingEntry.billNumber || existingEntry.id,
+      details: { actor_role: actorRole, actor_name: actorName, bill_id: existingEntry.id, central_bill_id: canonicalCentralBillId, reason, restored_at: nowIso, edit_version: nextVersion }
     });
 
     broadcastLedgerUpdate(auth.outlet.id, {
       action: 'restored',
-      billId: entry.id,
-      billNumber: entry.billNumber,
-      branchId: entry.branchId,
-      branchCode: entry.branchCode,
+      billId: canonicalCentralBillId,
+      billNumber: existingEntry.billNumber,
+      branchId: existingEntry.branchId,
+      branchCode: existingEntry.branchCode,
       isVoided: false
     });
 
-    return res.json({ success: true, billId: entry.id, billNumber: entry.billNumber, restoredAt: nowIso, editVersion: nextVersion });
+    return res.json({
+      success: true,
+      idempotentReplay: false,
+      centralBillId: canonicalCentralBillId,
+      billId: existingEntry.id,
+      billNumber: existingEntry.billNumber,
+      status: 'FINALIZED',
+      restoredAt: nowIso,
+      editVersion: nextVersion
+    });
   } catch (error: any) {
     return res.status(500).json({ success: false, message: sanitizeErrorMessage(error) });
   }

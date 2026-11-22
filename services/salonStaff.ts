@@ -242,8 +242,8 @@ export function mapAuthoritativeGlossyRoleToSmav(rawRole: unknown): {
       return {
         canonicalRole: 'MANAGER',
         displayRole: 'Manager',
-        smavRole: 'ADMIN',
-        contractRole: 'ADMIN',
+        smavRole: 'STAFF',
+        contractRole: 'POS_BILLING',
         edgeRoleHint: 'MANAGER',
         isProtectedSuperadmin: false,
       };

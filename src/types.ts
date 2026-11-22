@@ -5,7 +5,7 @@ export type BusinessCategory = 'restaurant' | 'salon' | 'retail' | 'other';
 export function getVisibleRole(role?: string): VisibleRole {
   const r = (role || '').trim().toLowerCase();
   if (r === 'superadmin') return 'SUPERADMIN';
-  if (r === 'admin' || r === 'owner' || r === 'manager') return 'ADMIN';
+  if (r === 'admin' || r === 'owner') return 'ADMIN';
   return 'POS_BILLING';
 }
 
@@ -382,9 +382,13 @@ export interface TransactionLedgerEntry {
   paymentMode: string;
   subtotal: number;
   discountAmount: number;
+  discount?: number;
   totalTax: number;
+  taxAmount?: number;
   grandTotal: number;
   createdAt: string;
+  billedAt?: string;
+  status?: 'FINALIZED' | 'VOIDED';
   stylistNames: string[];
   editVersion: number;
   isVoided: boolean;
@@ -401,6 +405,7 @@ export interface TransactionLedgerEntry {
   restoredByName?: string | null;
   restoreReason?: string | null;
   externalBillId?: string | null;
+  externalOrderId?: string | null;
   syncRevision?: number;
   updatedAt?: string | null;
 }

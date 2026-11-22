@@ -56,13 +56,13 @@ enum class UserRole(val code: String, val label: String, val visibleRole: String
     ADMIN("admin", "Outlet Administrator", "ADMIN"),
     STAFF("staff", "POS Billing Staff", "POS_BILLING"),
     OWNER("owner", "Outlet Administrator", "ADMIN"),
-    MANAGER("manager", "Branch Manager", "ADMIN"),
+    MANAGER("manager", "Branch Manager", "POS_BILLING"),
     CASHIER("cashier", "POS Billing Cashier", "POS_BILLING"),
     SALON_RECEPTIONIST("salon_receptionist", "Salon Receptionist", "POS_BILLING");
 
     fun isSuperadmin(): Boolean = this == SUPERADMIN
-    fun isAdminOrAbove(): Boolean = this == SUPERADMIN || this == ADMIN || this == OWNER || this == MANAGER
-    fun isAdminOnly(): Boolean = this == ADMIN || this == OWNER || this == MANAGER
+    fun isAdminOrAbove(): Boolean = this == SUPERADMIN || this == ADMIN || this == OWNER
+    fun isAdminOnly(): Boolean = this == ADMIN || this == OWNER
 
     companion object {
         fun fromBackend(role: String?, displayRole: String? = null): UserRole {
@@ -70,7 +70,8 @@ enum class UserRole(val code: String, val label: String, val visibleRole: String
             val normRole = (role ?: "").trim().lowercase(Locale.ENGLISH)
             return when {
                 normDisplay == "SUPERADMIN" || normRole == "superadmin" -> SUPERADMIN
-                normDisplay == "ADMIN" || normRole == "admin" || normRole == "owner" || normRole == "manager" -> ADMIN
+                normDisplay == "ADMIN" || normRole == "admin" || normRole == "owner" -> ADMIN
+                normRole == "manager" -> MANAGER
                 normRole == "cashier" -> CASHIER
                 normRole == "salon_receptionist" -> SALON_RECEPTIONIST
                 else -> STAFF

@@ -179,7 +179,7 @@ AS $$
       WHERE r.user_id = (SELECT auth.uid())
         AND r.outlet_id = p_outlet_id
         AND COALESCE(r.is_active, true) = true
-        AND UPPER(COALESCE(r.role, '')) IN ('ADMIN', 'OWNER', 'MANAGER')
+        AND UPPER(COALESCE(r.role, '')) IN ('ADMIN', 'OWNER')
     );
 $$;
 
@@ -208,10 +208,10 @@ DROP POLICY IF EXISTS "smav_salon_bills_update_admin" ON public.smav_salon_bills
 CREATE POLICY "smav_salon_bills_select_role_scoped" ON public.smav_salon_bills
 FOR SELECT TO authenticated
 USING (
-  -- SUPERADMIN & outlet ADMIN / OWNER / MANAGER: full active, historical & deleted access within authorized outlet
+  -- SUPERADMIN & outlet ADMIN / OWNER: full active, historical & deleted access within authorized outlet
   public.smav_user_is_outlet_admin(outlet_id)
   OR (
-    -- POS_BILLING / STAFF: today's active bills only (Asia/Kolkata) within assigned outlet
+    -- POS_BILLING / MANAGER / STAFF: today's active bills only (Asia/Kolkata) within assigned outlet
     public.smav_user_is_outlet_member(outlet_id)
     AND COALESCE(is_voided, false) = false
     AND deleted_at IS NULL
@@ -219,7 +219,7 @@ USING (
   )
 );
 
--- Only SUPERADMIN & authorized outlet ADMIN / OWNER / MANAGER can edit, soft-delete, or restore
+-- Only SUPERADMIN & authorized outlet ADMIN / OWNER can edit, soft-delete, or restore
 CREATE POLICY "smav_salon_bills_update_admin" ON public.smav_salon_bills
 FOR UPDATE TO authenticated
 USING (public.smav_user_is_outlet_admin(outlet_id))

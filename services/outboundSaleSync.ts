@@ -35,10 +35,12 @@ export type OutboundSaleEventType =
 export interface CentralBillFinalizedPayload {
   event_id: string;
   event_type: OutboundSaleEventType;
+  event_timestamp?: string;
   idempotency_key: string;
   central_bill_id: string | null;
   central_bill_number: string;
   bill_number: string;
+  status?: 'FINALIZED' | 'VOIDED';
   outlet_id: string;
   outlet_code: string;
   branch_id: string;
@@ -69,6 +71,15 @@ export interface CentralBillFinalizedPayload {
   restored_by?: string | null;
   restore_reason?: string | null;
   edit_version?: number;
+  // Canonical camelCase mirrors for cross-consumer compatibility
+  eventId?: string;
+  eventType?: OutboundSaleEventType;
+  eventTimestamp?: string;
+  centralBillId?: string | null;
+  billNumber?: string;
+  externalOrderId?: string | null;
+  outletId?: string;
+  outletCode?: string;
 }
 
 export interface OutboundSaleEventRecord {
@@ -229,22 +240,27 @@ export function buildCentralBillFinalizedPayload(params: {
       : Math.max(0, roundMoney(grandTotal - paidAmount, 0));
 
   const paymentStatus = String(params.paymentStatus || '').trim().toLowerCase() || (dueAmount > 0 ? 'partial' : 'paid');
+  const eventTimestamp = new Date().toISOString();
+  const normalizedOutletCode = String(params.outletCode || 'glossylooks').trim().toLowerCase() || 'glossylooks';
+  const normalizedExternalOrderId = params.externalOrderId ? String(params.externalOrderId).trim() : null;
 
   return {
     event_id: params.eventId,
     event_type: 'central_bill_finalized',
+    event_timestamp: eventTimestamp,
     idempotency_key: params.idempotencyKey,
     central_bill_id: params.centralBillId,
     central_bill_number: params.centralBillNumber,
     bill_number: params.centralBillNumber,
+    status: 'FINALIZED',
     outlet_id: params.outletId,
-    outlet_code: String(params.outletCode || 'glossylooks').trim().toLowerCase() || 'glossylooks',
+    outlet_code: normalizedOutletCode,
     branch_id: cleanBranchId,
     branch_code: cleanBranchCode,
     branch_name: cleanBranchName,
     local_branch_id: cleanBranchId,
     external_branch_id: cleanBranchId,
-    external_order_id: params.externalOrderId ? String(params.externalOrderId).trim() : null,
+    external_order_id: normalizedExternalOrderId,
     customer_name: String(params.customerName || '').trim() || 'Walk-in Customer',
     customer_phone: String(params.customerPhone || '').trim(),
     cashier_name: String(params.cashierName || '').trim() || 'SMAV Counter',
@@ -256,9 +272,17 @@ export function buildCentralBillFinalizedPayload(params: {
     grand_total: grandTotal,
     paid_amount: paidAmount,
     due_amount: dueAmount,
-    billed_at: params.billedAt || new Date().toISOString(),
+    billed_at: params.billedAt || eventTimestamp,
     source_system: normalizeSourceSystem(params.sourceSystem),
     items: normalizedItems,
+    eventId: params.eventId,
+    eventType: 'central_bill_finalized',
+    eventTimestamp,
+    centralBillId: params.centralBillId,
+    billNumber: params.centralBillNumber,
+    externalOrderId: normalizedExternalOrderId,
+    outletId: params.outletId,
+    outletCode: normalizedOutletCode,
   };
 }
 
@@ -550,6 +574,7 @@ export class OutboundSaleEventCoordinator {
     centralBillId?: string | null;
     centralBillNumber: string;
     localBillId?: string | null;
+    externalOrderId?: string | null;
     branchId?: string | null;
     branchCode?: string | null;
     branchName?: string | null;
@@ -579,18 +604,22 @@ export class OutboundSaleEventCoordinator {
     }
 
     const eventId = crypto.randomUUID();
+    const nowIso = new Date().toISOString();
     const cleanBranchCode = normalizeDynamicBranchCode(params.branchCode || '') || 'MAIN';
     const cleanBranchId = String(params.branchId || '').trim();
+    const canonicalPayloadCentralId =
+      String(params.centralBillId || params.localBillId || '').trim() || null;
     const basePayload = buildCentralBillFinalizedPayload({
       eventId,
       idempotencyKey: params.idempotencyKey,
-      centralBillId: params.centralBillId ?? null,
+      centralBillId: canonicalPayloadCentralId,
       centralBillNumber: params.centralBillNumber,
       outletId: params.outletId,
       outletCode: params.outletCode || 'glossylooks',
       branchId: cleanBranchId || cleanBranchCode,
       branchCode: cleanBranchCode,
       branchName: params.branchName || cleanBranchCode,
+      externalOrderId: params.externalOrderId || null,
       customerName: params.customerName,
       customerPhone: params.customerPhone,
       paymentMode: params.paymentMode,
@@ -606,6 +635,10 @@ export class OutboundSaleEventCoordinator {
     const payload: CentralBillFinalizedPayload = {
       ...basePayload,
       event_type: params.eventType,
+      eventType: params.eventType,
+      event_timestamp: nowIso,
+      eventTimestamp: nowIso,
+      status: params.isVoided ? 'VOIDED' : 'FINALIZED',
       is_voided: params.isVoided,
       deleted_at: params.deletedAt || null,
       deleted_by: params.deletedBy || null,
@@ -616,19 +649,32 @@ export class OutboundSaleEventCoordinator {
       edit_version: params.editVersion,
     };
 
-    const validCentralUuid =
+    const candidateCentralUuid =
       params.centralBillId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(params.centralBillId)
         ? params.centralBillId
         : null;
 
-    const nowIso = new Date().toISOString();
+    // smav_outbound_sale_events.central_bill_id references smav_central_bill_numbers(id).
+    // Only populate the FK column when the UUID exists in smav_central_bill_numbers; payload always retains canonical ID.
+    let dbFkCentralUuid: string | null = null;
+    if (candidateCentralUuid) {
+      const checkFk = await params.db
+        .from('smav_central_bill_numbers')
+        .select('id')
+        .eq('id', candidateCentralUuid)
+        .maybeSingle();
+      if (!checkFk.error && checkFk.data?.id) {
+        dbFkCentralUuid = candidateCentralUuid;
+      }
+    }
+
     const insertRow = {
       id: eventId,
       outlet_id: params.outletId,
       outlet_code: payload.outlet_code,
       event_type: params.eventType,
       idempotency_key: params.idempotencyKey,
-      central_bill_id: validCentralUuid,
+      central_bill_id: dbFkCentralUuid,
       central_bill_number: payload.central_bill_number,
       local_bill_id: params.localBillId || null,
       branch_id: cleanBranchId || null,
@@ -727,19 +773,36 @@ export class OutboundSaleEventCoordinator {
 
       const resolvedBranchId = rec.branch_id || rec.payload.branch_id || rec.payload.local_branch_id || '';
       const resolvedEventType: OutboundSaleEventType = rec.event_type || rec.payload.event_type || 'central_bill_finalized';
+      const resolvedCentralBillId =
+        rec.central_bill_id ?? rec.payload.central_bill_id ?? rec.local_bill_id ?? null;
+      const resolvedEventTimestamp = rec.payload.event_timestamp || rec.created_at || new Date(nowMs).toISOString();
+      const resolvedStatus: 'FINALIZED' | 'VOIDED' =
+        resolvedEventType === 'central_bill_voided' || rec.payload.is_voided ? 'VOIDED' : 'FINALIZED';
       const bodyObj: CentralBillFinalizedPayload = {
         ...rec.payload,
         event_id: rec.id,
         event_type: resolvedEventType,
+        event_timestamp: resolvedEventTimestamp,
         idempotency_key: rec.idempotency_key,
-        central_bill_id: rec.central_bill_id ?? rec.payload.central_bill_id ?? null,
+        central_bill_id: resolvedCentralBillId,
         central_bill_number: rec.central_bill_number,
         bill_number: rec.central_bill_number,
+        status: resolvedStatus,
+        outlet_id: rec.outlet_id,
+        outlet_code: rec.outlet_code || rec.payload.outlet_code || 'glossylooks',
         branch_id: resolvedBranchId,
         branch_code: rec.branch_code || rec.payload.branch_code,
         branch_name: rec.branch_name || rec.payload.branch_name,
         local_branch_id: resolvedBranchId,
         external_branch_id: resolvedBranchId,
+        eventId: rec.id,
+        eventType: resolvedEventType,
+        eventTimestamp: resolvedEventTimestamp,
+        centralBillId: resolvedCentralBillId,
+        billNumber: rec.central_bill_number,
+        externalOrderId: rec.payload.external_order_id ?? null,
+        outletId: rec.outlet_id,
+        outletCode: rec.outlet_code || rec.payload.outlet_code || 'glossylooks',
       };
       const rawBody = JSON.stringify(bodyObj);
       const timestamp = String(Math.floor(nowMs / 1000));

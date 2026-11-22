@@ -332,8 +332,7 @@ export function resolvePermittedBranchesForUser(params: {
   const isPrivileged =
     roleLower === 'superadmin' ||
     roleLower === 'admin' ||
-    roleLower === 'owner' ||
-    roleLower === 'manager';
+    roleLower === 'owner';
 
   const normalizedAssignedIds = Array.isArray(params.assignedBranchIds)
     ? Array.from(
