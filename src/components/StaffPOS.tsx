@@ -62,6 +62,18 @@ interface StaffPOSProps {
 }
 
 const normalizeGroup = (value?: string | null) => (value || '').trim() || 'General';
+const INVALID_MOBILE_NUMBER_MESSAGE = 'Please enter a valid 10-digit mobile number.';
+const isValidTenDigitMobile = (value: string) => /^\d{10}$/.test(value.trim());
+
+const salonCategorySortPriority = (categoryName: string): number => {
+  const normalized = categoryName.trim().toLowerCase().replace(/\s+/g, ' ');
+  if (normalized === 'all') return 0;
+  if (normalized === 'salon' || normalized.startsWith('salon ')) return 1;
+  if (normalized === 'makeup') return 2;
+  if (normalized === 'nails art' || normalized === 'nail art' || normalized === 'nails') return 3;
+  if (normalized.includes('makeup')) return 4;
+  return 5;
+};
 
 const salonSubcategoryLabel = (item: Pick<SalonService, 'name' | 'subcategory'>) => {
   const source = `${item.subcategory || ''} ${item.name || ''}`
@@ -131,6 +143,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
   const [salonCart, setSalonCart] = useState<SalonCartItem[]>([]);
   const [customerName, setCustomerName] = useState('');
   const [customerPhone, setCustomerPhone] = useState('');
+  const [customerPhoneTouched, setCustomerPhoneTouched] = useState(false);
   const [paymentMode, setPaymentMode] = useState('upi');
 
   const stylistSelectRefs = useRef<Record<number, HTMLSelectElement | null>>({});
@@ -194,13 +207,21 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
     [category, salonServices, restaurantMenu, retailProducts]
   );
 
-  const catalogCategories = useMemo(
-    () =>
-      Array.from(new Set(catalogItems.map((item) => normalizeGroup(item.category)))).sort((a, b) =>
-        a.localeCompare(b)
-      ),
-    [catalogItems]
-  );
+  const catalogCategories = useMemo(() => {
+    const rawCategories = Array.from(
+      new Set(catalogItems.map((item) => normalizeGroup(item.category)))
+    );
+    if (category === 'salon') {
+      return rawCategories
+        .filter((cat) => cat.trim().toLowerCase() !== 'spa')
+        .sort((a, b) => {
+          const pa = salonCategorySortPriority(a);
+          const pb = salonCategorySortPriority(b);
+          return pa !== pb ? pa - pb : a.localeCompare(b);
+        });
+    }
+    return rawCategories.sort((a, b) => a.localeCompare(b));
+  }, [catalogItems, category]);
 
   const categoryItems = useMemo(
     () =>
@@ -253,8 +274,9 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       setBillSuccessMessage(null);
       setMissingStylistIdx(null);
       setPermittedBranches([]);
-      setSelectedBranchCode('');
+      setSelectedBranchId('');
       setBranchError(null);
+      setCustomerPhoneTouched(false);
       pendingAttemptRef.current = null;
       pendingCheckoutRef.current = null;
       try {
@@ -784,8 +806,9 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       document.getElementById('pos-customer-name')?.focus();
       return;
     }
-    if (!customerPhone.trim()) {
-      setBillSaveError('Customer phone is required.');
+    if (!isValidTenDigitMobile(customerPhone)) {
+      setCustomerPhoneTouched(true);
+      setBillSaveError(INVALID_MOBILE_NUMBER_MESSAGE);
       document.getElementById('pos-customer-phone')?.focus();
       return;
     }
@@ -1115,6 +1138,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
     setRetailCart([]);
     setCustomerName('');
     setCustomerPhone('');
+    setCustomerPhoneTouched(false);
     setMissingStylistIdx(null);
     setBillSaveError(null);
     setBillSuccessMessage(null);
@@ -1653,15 +1677,48 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                         className={BASE_INPUT_CLASS}
                       />
                     </FormField>
-                    <FormField label="Phone (WhatsApp) *" htmlFor="pos-customer-phone">
+                    <FormField
+                      label="Phone (WhatsApp) *"
+                      htmlFor="pos-customer-phone"
+                      error={
+                        (customerPhoneTouched || customerPhone.length > 0) &&
+                        !isValidTenDigitMobile(customerPhone)
+                          ? INVALID_MOBILE_NUMBER_MESSAGE
+                          : undefined
+                      }
+                    >
                       <input
                         id="pos-customer-phone"
                         type="tel"
+                        inputMode="numeric"
+                        pattern="[0-9]*"
                         value={customerPhone}
-                        onChange={(e) => setCustomerPhone(e.target.value)}
-                        placeholder="Enter mobile number"
+                        onChange={(e) => {
+                          const digitsOnly = e.target.value.replace(/\D/g, '');
+                          setCustomerPhone(digitsOnly);
+                          setCustomerPhoneTouched(true);
+                          if (billSaveError === INVALID_MOBILE_NUMBER_MESSAGE && isValidTenDigitMobile(digitsOnly)) {
+                            setBillSaveError(null);
+                          }
+                        }}
+                        onBlur={() => {
+                          setCustomerPhoneTouched(true);
+                          if (customerPhone.length > 0 && !isValidTenDigitMobile(customerPhone)) {
+                            document.getElementById('pos-customer-phone')?.focus();
+                          }
+                        }}
+                        placeholder="10-digit mobile number"
                         required
-                        className={BASE_INPUT_CLASS}
+                        aria-invalid={
+                          (customerPhoneTouched || customerPhone.length > 0) &&
+                          !isValidTenDigitMobile(customerPhone)
+                        }
+                        className={`${BASE_INPUT_CLASS} ${
+                          (customerPhoneTouched || customerPhone.length > 0) &&
+                          !isValidTenDigitMobile(customerPhone)
+                            ? '!border-[#DC2626] !bg-[#FEF2F2]/60 focus:!border-[#DC2626] focus:!ring-2 focus:!ring-[#DC2626]/20'
+                            : ''
+                        }`}
                       />
                     </FormField>
                     <FormField label="Payment Mode" htmlFor="pos-payment-mode">
@@ -1739,6 +1796,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
                             salonCart.length === 0 ||
                             branchAuthBlocked ||
                             !selectedBranchId ||
+                            !isValidTenDigitMobile(customerPhone) ||
                             !isOnline ||
                             isLoadingStylists ||
                             Boolean(stylistError) ||

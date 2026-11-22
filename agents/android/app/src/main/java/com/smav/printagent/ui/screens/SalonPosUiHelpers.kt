@@ -8,7 +8,12 @@ import com.smav.printagent.util.BillIdGenerator
 import java.util.Locale
 
 internal const val EMPTY_CART_MESSAGE = "Your cart is empty. Add a service to continue."
+internal const val INVALID_MOBILE_NUMBER_MESSAGE = "Please enter a valid 10-digit mobile number."
 internal const val ASIA_KOLKATA_TZ = "Asia/Kolkata"
+
+internal fun sanitizeMobileNumberInput(raw: String): String = raw.filter { it.isDigit() }
+
+internal fun isValidTenDigitMobile(phone: String): Boolean = Regex("^\\d{10}$").matches(phone.trim())
 
 internal enum class SalonPosTab {
     MENU,
@@ -85,10 +90,10 @@ internal fun isExcludedSalonCategory(category: String): Boolean {
 /**
  * Dynamic category priority ordering for Salon POS:
  * 1. All
- * 2. Makeup
- * 3. Nails Art
- * 4. Salon
- * 5. Secondary Makeup-related categories (strictly after Salon)
+ * 2. Salon
+ * 3. Makeup
+ * 4. Nails Art
+ * 5. Secondary Makeup-related categories
  * 6. Any other dynamic categories alphabetically
  */
 internal fun salonCategorySortPriority(category: String): Int {
@@ -98,9 +103,9 @@ internal fun salonCategorySortPriority(category: String): Int {
         .replace(Regex("\\s+"), " ")
     return when {
         normalized == "all" -> 0
-        normalized == "makeup" -> 1
-        normalized == "nails art" || normalized == "nail art" || normalized == "nails" -> 2
-        normalized == "salon" || normalized.startsWith("salon ") -> 3
+        normalized == "salon" || normalized.startsWith("salon ") -> 1
+        normalized == "makeup" -> 2
+        normalized == "nails art" || normalized == "nail art" || normalized == "nails" -> 3
         "makeup" in normalized -> 4
         else -> 5
     }
@@ -185,12 +190,9 @@ internal fun validateSalonFinalizeForm(
     } else null
 
     val trimmedPhone = customerPhone.trim()
-    val phoneDigits = trimmedPhone.filter { it.isDigit() }
-    val phoneError = when {
-        trimmedPhone.isEmpty() -> "Customer phone is required."
-        phoneDigits.length < 7 -> "Enter a valid phone number."
-        else -> null
-    }
+    val phoneError = if (!isValidTenDigitMobile(trimmedPhone)) {
+        INVALID_MOBILE_NUMBER_MESSAGE
+    } else null
 
     val firstInvalid = when {
         branchError != null -> SalonFinalizeField.BRANCH

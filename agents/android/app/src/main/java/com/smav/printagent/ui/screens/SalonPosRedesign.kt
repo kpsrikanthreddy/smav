@@ -990,7 +990,7 @@ internal fun SalonPosScreen(
                 SmavCard(
                     onClick = {
                         customerName = appt.customerName
-                        customerPhone = appt.customerPhone
+                        customerPhone = sanitizeMobileNumberInput(appt.customerPhone)
                         val matchedSrv = services.firstOrNull { it.id == appt.serviceId }
                         val matchedStylist = stylists.firstOrNull { it.id == appt.stylistId }
                         if (matchedSrv != null) {
@@ -1426,6 +1426,19 @@ private fun FinalizeSalonBillDialog(
     val customerNameFocusRequester = remember { FocusRequester() }
     val customerPhoneFocusRequester = remember { FocusRequester() }
 
+    val isPhoneValid = isValidTenDigitMobile(customerPhone)
+    var phoneHasInteracted by remember { mutableStateOf(customerPhone.isNotEmpty()) }
+    val activePhoneError = customerPhoneError ?: if ((phoneHasInteracted || customerPhone.isNotEmpty()) && !isPhoneValid) {
+        INVALID_MOBILE_NUMBER_MESSAGE
+    } else null
+
+    LaunchedEffect(Unit) {
+        if (customerPhone.isNotEmpty() && !isValidTenDigitMobile(customerPhone)) {
+            customerPhoneError = INVALID_MOBILE_NUMBER_MESSAGE
+            customerPhoneFocusRequester.requestFocus()
+        }
+    }
+
     Dialog(
         onDismissRequest = { if (!busyBilling) onDismiss() },
         properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -1622,23 +1635,48 @@ private fun FinalizeSalonBillDialog(
                     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                         OutlinedTextField(
                             value = customerPhone,
-                            onValueChange = {
-                                onCustomerPhoneChange(it)
-                                if (customerPhoneError != null) customerPhoneError = null
+                            onValueChange = { rawInput ->
+                                val digitsOnly = sanitizeMobileNumberInput(rawInput)
+                                phoneHasInteracted = true
+                                onCustomerPhoneChange(digitsOnly)
+                                if (digitsOnly.isEmpty() || !isValidTenDigitMobile(digitsOnly)) {
+                                    customerPhoneError = INVALID_MOBILE_NUMBER_MESSAGE
+                                    customerPhoneFocusRequester.requestFocus()
+                                } else {
+                                    customerPhoneError = null
+                                }
                             },
                             label = { Text("Customer Phone *", fontSize = 12.sp) },
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                             singleLine = true,
-                            isError = customerPhoneError != null,
-                            colors = smavOutlinedFieldColors(),
+                            isError = activePhoneError != null,
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = SmavColors.TextPrimary,
+                                unfocusedTextColor = SmavColors.TextPrimary,
+                                disabledTextColor = SmavColors.TextSecondary,
+                                focusedContainerColor = SmavColors.Surface,
+                                unfocusedContainerColor = SmavColors.Surface,
+                                errorContainerColor = Color(0xFFFEF2F2),
+                                disabledContainerColor = SmavColors.SurfaceSubtle,
+                                focusedBorderColor = SmavColors.AccentPink,
+                                unfocusedBorderColor = SmavColors.Border,
+                                errorBorderColor = SmavColors.DangerText,
+                                focusedLabelColor = SmavColors.AccentPink,
+                                unfocusedLabelColor = SmavColors.TextSecondary,
+                                errorLabelColor = SmavColors.DangerText,
+                                focusedPlaceholderColor = SmavColors.TextMuted,
+                                unfocusedPlaceholderColor = SmavColors.TextMuted,
+                                cursorColor = SmavColors.AccentPink,
+                                errorCursorColor = SmavColors.DangerText
+                            ),
                             shape = RoundedCornerShape(10.dp),
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .focusRequester(customerPhoneFocusRequester)
                         )
-                        if (customerPhoneError != null) {
+                        if (activePhoneError != null) {
                             Text(
-                                text = customerPhoneError!!,
+                                text = activePhoneError,
                                 color = SmavColors.DangerText,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Medium,
@@ -1767,7 +1805,7 @@ private fun FinalizeSalonBillDialog(
                     )
                     SmavGradientButton(
                         text = "Generate & Print",
-                        enabled = !busyBilling && !isBillingBlocked && cartItems.isNotEmpty(),
+                        enabled = !busyBilling && !isBillingBlocked && cartItems.isNotEmpty() && isPhoneValid,
                         busy = busyBilling,
                         modifier = Modifier.weight(0.64f),
                         onClick = {

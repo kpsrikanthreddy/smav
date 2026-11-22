@@ -1900,6 +1900,12 @@ async function dispatchDueSaleNotificationsAfterSync(maxWaitMs = 8000): Promise<
 function startInternalSaleNotificationDispatcher() {
   if (!internalDispatcherState.enabled) return;
   if (internalDispatcherTimer) return;
+  const bootSweep = setTimeout(() => {
+    triggerBackgroundSaleNotificationDispatch();
+  }, 5000);
+  if (typeof bootSweep.unref === 'function') {
+    bootSweep.unref();
+  }
   internalDispatcherTimer = setInterval(() => {
     triggerBackgroundSaleNotificationDispatch();
   }, internalDispatcherState.intervalSec * 1000);
@@ -2049,6 +2055,12 @@ function broadcastCatalogUpdate(outletId: string, eventData: any) {
 }
 
 app.get('/api/health', (_req, res) => {
+  if (internalDispatcherState.enabled && !internalDispatcherState.running) {
+    const lastRunMs = internalDispatcherState.lastRunAt ? Date.parse(internalDispatcherState.lastRunAt) : 0;
+    if (!lastRunMs || Date.now() - lastRunMs >= 30_000) {
+      triggerBackgroundSaleNotificationDispatch();
+    }
+  }
   res.json({
     status: 'ok',
     service: 'SMAV Print Agent Enterprise Authentication Gateway',
@@ -5963,8 +5975,8 @@ app.get('/api/admin/bill-numbers/reconciliation', requireAuth, requireAdmin, asy
   }
 });
 
-// Trusted scheduler endpoint. Never call this from Android or a browser.
-app.post('/api/internal/notifications/dispatch', async (req, res) => {
+// Trusted scheduler endpoint (supports POST & GET cron pings). Never call this from Android or a browser.
+async function handleInternalNotificationDispatch(req: express.Request, res: express.Response) {
   const configured = process.env.SMAV_DISPATCH_CRON_SECRET || '';
   const supplied = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   if (configured.length < 32 || supplied.length !== configured.length ||
@@ -5990,7 +6002,10 @@ app.post('/api/internal/notifications/dispatch', async (req, res) => {
       message: error.message
     });
   }
-});
+}
+
+app.post('/api/internal/notifications/dispatch', handleInternalNotificationDispatch);
+app.get('/api/internal/notifications/dispatch', handleInternalNotificationDispatch);
 
 // Admin & Superadmin Integration Diagnostics (RBAC outlet-scoped for ADMIN, multi-outlet for SUPERADMIN)
 function getCentralSupabaseHost(): string | null {
@@ -6264,8 +6279,17 @@ app.post('/api/mobile/sync/bills', requireAuth, async (req, res) => {
       const { bill, items, idempotency_key } = entry || {};
       if (!bill || !Array.isArray(items) || !items.length || !idempotency_key || bill.outletId !== session.activeOutlet.id)
         return res.status(400).json({ success: false, message: 'Invalid bill or outlet assignment' });
-      if (!String(bill.customerName || '').trim() || !String(bill.customerPhone || '').trim())
-        return res.status(400).json({ success: false, message: 'Customer name and phone are required' });
+      if (!String(bill.customerName || '').trim())
+        return res.status(400).json({ success: false, message: 'Customer name is required' });
+      const normalizedCustomerPhone = String(bill.customerPhone || '').trim();
+      if (!/^\d{10}$/.test(normalizedCustomerPhone)) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_CUSTOMER_PHONE',
+          message: 'Please enter a valid 10-digit mobile number.'
+        });
+      }
+      bill.customerPhone = normalizedCustomerPhone;
       if (items.some((item: any) => !item.stylistId || !item.serviceId))
         return res.status(400).json({ success: false, message: 'Every salon service must have a selected stylist and service ID' });
 

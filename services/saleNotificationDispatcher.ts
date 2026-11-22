@@ -44,13 +44,36 @@ export interface InternalDispatcherRuntimeState {
   lastProcessed: number;
 }
 
-const FEEDBACK_DELAY_MS = 2 * 60_000;
-// Allow scheduler polling & retry jitter (3 min past scheduled_at = up to 5 min past billed_at)
-const FEEDBACK_GRACE_MS = 3 * 60_000;
+function parsePositiveIntEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = Number((process.env[name] || '').trim());
+  if (!Number.isFinite(raw) || raw <= 0) return fallback;
+  return Math.min(max, Math.max(min, Math.round(raw)));
+}
+
+const FEEDBACK_DELAY_MINUTES = parsePositiveIntEnv('SMAV_FEEDBACK_DELAY_MINUTES', 30, 1, 1440);
+const FEEDBACK_DELAY_MS = FEEDBACK_DELAY_MINUTES * 60_000;
+// Allow Cloud Run cold starts, cron intervals, and transient retries without dropping due feedback jobs
+const FEEDBACK_GRACE_MINUTES = parsePositiveIntEnv('SMAV_FEEDBACK_GRACE_MINUTES', 180, 10, 1440);
+const FEEDBACK_GRACE_MS = FEEDBACK_GRACE_MINUTES * 60_000;
+const DEFAULT_SALON_FEEDBACK_TEMPLATE =
+  (process.env.SMAV_FEEDBACK_TEMPLATE_NAME || 'glossylooks_customer_feedback').trim() ||
+  'glossylooks_customer_feedback';
+const STALE_PROCESSING_RECOVERY_MS = 5 * 60_000;
 // Allow downstream serverless cold start + DB persistence + Meta WhatsApp API round-trip
 const DISPATCH_TIMEOUT_MS = 25_000;
 const MEMORY_STEP_LOG_LIMIT = 120;
 const memoryStepLogs: StepLogEntry[] = [];
+
+function resolveIntegrationKeyForEndpoint(url: URL): string | null {
+  const host = url.hostname.toLowerCase();
+  if (host.includes('glossylooks')) {
+    return (process.env.GLOSSYLOOKS_INTEGRATION_KEY || '').trim() || null;
+  }
+  if (host.includes('starters4u')) {
+    return (process.env.MOZZ_INTEGRATION_KEY || '').trim() || null;
+  }
+  return null;
+}
 
 function isMissingColumnError(err: { code?: string; message?: string } | null | undefined): boolean {
   if (!err) return false;
@@ -802,21 +825,33 @@ export async function enqueueSaleNotificationJobs(params: {
 
   if (sendFeedback) {
     const billedMs = Date.parse(billedAtIso);
-    const feedbackDueMs = (Number.isNaN(billedMs) ? Date.now() : billedMs) + FEEDBACK_DELAY_MS;
-    if (feedbackDueMs > Date.now()) {
-      feedbackScheduledAt = new Date(feedbackDueMs).toISOString();
+    const baseMs = Number.isNaN(billedMs) ? Date.now() : billedMs;
+    const feedbackDueMs = baseMs + FEEDBACK_DELAY_MS;
+    const nowMs = Date.now();
+    const resolvedFeedbackTemplate = sourceType === 'salon' ? DEFAULT_SALON_FEEDBACK_TEMPLATE : null;
+    if (feedbackDueMs + FEEDBACK_GRACE_MS > nowMs) {
+      feedbackScheduledAt = new Date(Math.max(feedbackDueMs, nowMs)).toISOString();
       const feedbackPayload: Record<string, unknown> = {
         bill_id: billId,
         bill_number: billNumber,
+        central_bill_number: billNumber,
+        ...(centralBillId ? { central_bill_id: centralBillId } : {}),
         outlet_id: outlet.id,
         outlet_code: outlet.code,
         outlet_name: outlet.name,
         ...(branchCode ? { branch_code: branchCode } : {}),
+        ...(branchName ? { branch_name: branchName } : {}),
         customer_name: cleanName,
         customer_phone: cleanPhone,
         payment_mode: cleanPaymentMode,
         grand_total: Number(grandTotal),
-        billed_at: billedAtIso
+        billed_at: billedAtIso,
+        ...(resolvedFeedbackTemplate
+          ? {
+              template_name: resolvedFeedbackTemplate,
+              template_language: 'en'
+            }
+          : {})
       };
 
       const { error } = await upsertNotificationJobRow(db, {
@@ -832,7 +867,9 @@ export async function enqueueSaleNotificationJobs(params: {
       });
       if (error) {
         feedbackError = sanitizeErrorMessage(error.message);
-        console.error('[SMAV notification queue][feedback]', feedbackError);
+        console.error(
+          `[SMAV notification][feedback][enqueue_failed] bill=${billNumber} phone=${maskedPhone || 'n/a'} error=${feedbackError}`
+        );
         await recordNotificationStepLog(logDb, {
           bill_id: billId,
           outlet_id: outlet.id,
@@ -845,9 +882,30 @@ export async function enqueueSaleNotificationJobs(params: {
         });
       } else {
         feedbackQueued = true;
+        console.info(
+          `[SMAV notification][feedback][scheduled] bill=${billNumber} phone=${maskedPhone || 'n/a'} scheduledAt=${feedbackScheduledAt} delayMin=${FEEDBACK_DELAY_MINUTES} template=${resolvedFeedbackTemplate || 'route_default'}`
+        );
+        await recordNotificationStepLog(logDb, {
+          bill_id: billId,
+          outlet_id: outlet.id,
+          bill_number: billNumber,
+          event_type: 'feedback',
+          step: 'stage2_feedback_scheduled',
+          status: 'pending',
+          whatsapp_status: 'pending',
+          masked_phone: maskedPhone,
+          response_summary: {
+            scheduled_at: feedbackScheduledAt,
+            delay_minutes: FEEDBACK_DELAY_MINUTES,
+            template_name: resolvedFeedbackTemplate || 'route_default'
+          }
+        });
       }
     } else {
       feedbackSkippedOverdue = true;
+      console.warn(
+        `[SMAV notification][feedback][skipped_overdue] bill=${billNumber} phone=${maskedPhone || 'n/a'} billedAt=${billedAtIso}`
+      );
       await recordNotificationStepLog(logDb, {
         bill_id: billId,
         outlet_id: outlet.id,
@@ -857,7 +915,7 @@ export async function enqueueSaleNotificationJobs(params: {
         status: 'skipped',
         whatsapp_status: 'skipped',
         masked_phone: maskedPhone,
-        sanitized_error: 'Offline bill synced after 2-minute feedback window expired'
+        sanitized_error: `Offline bill synced after ${FEEDBACK_DELAY_MINUTES}-minute feedback window expired`
       });
     }
   }
@@ -893,6 +951,20 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
   const secret = (process.env.SMAV_DISPATCH_SECRET || '').trim();
   if (secret.length < 32) {
     throw new Error('SMAV_DISPATCH_SECRET must be at least 32 characters');
+  }
+
+  // Safely recover jobs interrupted mid-claim (before HTTP dispatch) so Cloud Run restarts never stall feedback delivery
+  try {
+    const staleBeforeIso = new Date(Date.now() - STALE_PROCESSING_RECOVERY_MS).toISOString();
+    await db
+      .from('smav_sale_notification_jobs')
+      .update({ status: 'pending', updated_at: new Date().toISOString() })
+      .eq('status', 'processing')
+      .is('dispatched_at', null)
+      .lt('attempts', 5)
+      .lt('updated_at', staleBeforeIso);
+  } catch {
+    // Non-fatal on schemas without dispatched_at
   }
 
   const { data, error } = await db.rpc('smav_claim_due_notifications', {
@@ -1028,7 +1100,21 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
       const configuredTemplateName =
         job.event_type === 'receipt'
           ? route!.receipt_template_name || null
-          : route!.feedback_template_name || null;
+          : route!.feedback_template_name ||
+            (job.source_type === 'salon' ? DEFAULT_SALON_FEEDBACK_TEMPLATE : null);
+
+      const outboundPayload =
+        job.event_type === 'feedback'
+          ? {
+              ...job.payload,
+              ...(configuredTemplateName && !job.payload?.template_name
+                ? { template_name: configuredTemplateName }
+                : {}),
+              ...(configuredTemplateName && !job.payload?.template_language
+                ? { template_language: 'en' }
+                : {})
+            }
+          : job.payload;
 
       const body = JSON.stringify({
         event_id: job.id,
@@ -1038,7 +1124,10 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
         event_type: job.event_type,
         ...(billId ? { bill_id: billId } : {}),
         ...(configuredTemplateName ? { template_hint: configuredTemplateName } : {}),
-        payload: job.payload
+        ...(job.event_type === 'feedback' && configuredTemplateName
+          ? { template_name: configuredTemplateName, template_language: 'en' }
+          : {}),
+        payload: outboundPayload
       });
 
       const timestamp = String(Math.floor(Date.now() / 1000));
@@ -1047,15 +1136,25 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
         .update(`${timestamp}.${body}`)
         .digest('hex');
 
+      const integrationKey = resolveIntegrationKeyForEndpoint(url);
+      const requestHeaders: Record<string, string> = {
+        'content-type': 'application/json',
+        'x-smav-timestamp': timestamp,
+        'x-smav-signature': signature,
+        'x-smav-event-id': job.id,
+        ...(integrationKey ? { 'x-integration-key': integrationKey } : {})
+      };
+
+      if (job.event_type === 'feedback') {
+        console.info(
+          `[SMAV notification][feedback][dispatching] job=${job.id} bill=${billNumber || 'n/a'} phone=${maskedPhone || 'n/a'} template=${configuredTemplateName || 'none'} attempt=${job.attempts} endpoint=${sanitizeUrlForDisplay(route!.endpoint_url)}`
+        );
+      }
+
       dispatchedAt = new Date().toISOString();
       const response = await fetch(url.toString(), {
         method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-smav-timestamp': timestamp,
-          'x-smav-signature': signature,
-          'x-smav-event-id': job.id
-        },
+        headers: requestHeaders,
         body,
         signal: AbortSignal.timeout(DISPATCH_TIMEOUT_MS)
       });
@@ -1135,6 +1234,12 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
           sanitized_error: errMessage,
           response_summary: sanitizedBody || {}
         });
+
+        if (job.event_type === 'feedback') {
+          console.error(
+            `[SMAV notification][feedback][http_error] job=${job.id} bill=${billNumber || 'n/a'} phone=${maskedPhone || 'n/a'} http=${response.status} retry=${retry} error=${sanitizeErrorMessage(errMessage)}`
+          );
+        }
 
         results.push({
           id: job.id,
@@ -1223,6 +1328,12 @@ export async function dispatchDueSaleNotifications(db: SupabaseClient, limit = 2
         sanitized_error: finalErrMsg || (jobUpdate.ok ? null : `Job update failed: ${jobUpdate.error}`),
         response_summary: sanitizedBody || {}
       });
+
+      if (job.event_type === 'feedback') {
+        console.info(
+          `[SMAV notification][feedback][result] job=${job.id} bill=${billNumber || 'n/a'} phone=${maskedPhone || 'n/a'} status=${finalJobStatus} http=${response.status} waStatus=${waMeta.whatsappStatus} waMsgId=${waMeta.whatsappMessageId || 'none'}${finalErrMsg ? ` error=${finalErrMsg}` : ''}`
+        );
+      }
 
       results.push({
         id: job.id,

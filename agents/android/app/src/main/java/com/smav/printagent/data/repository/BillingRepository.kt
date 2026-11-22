@@ -95,8 +95,10 @@ class BillingRepository(
         if (normalizedCustomerName.isBlank()) {
             return@withContext Result.failure(IllegalArgumentException("Customer name is required."))
         }
-        if (normalizedCustomerPhone.isBlank()) {
-            return@withContext Result.failure(IllegalArgumentException("Customer phone is required."))
+        if (!Regex("^\\d{10}$").matches(normalizedCustomerPhone)) {
+            return@withContext Result.failure(
+                IllegalArgumentException("Please enter a valid 10-digit mobile number.")
+            )
         }
         if (cartItems.any { it.stylist == null || it.stylist.id.isBlank() }) {
             return@withContext Result.failure(
