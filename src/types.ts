@@ -111,6 +111,7 @@ export interface UserOutletMembership {
 
 export interface UserSession {
   token: string;
+  sessionId?: string;
   userId: string;
   email: string;
   fullName: string;
@@ -124,6 +125,7 @@ export interface UserSession {
   createdAt: string;
   expiresAt?: string;
   supabaseToken?: string;
+  hasSupabaseRefreshSession?: boolean;
   platformRole?: string;
   // Backward compatibility fields
   user_id?: string;

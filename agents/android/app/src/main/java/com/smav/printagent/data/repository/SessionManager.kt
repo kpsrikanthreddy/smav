@@ -149,11 +149,11 @@ class SessionManager(context: Context) {
     }
 
     /**
-     * Clears authentication tokens and role/outlet session state on sign out.
+     * Clears authentication tokens and role/outlet/branch session state on explicit Sign Out or confirmed revocation.
      * Intentionally preserves deviceId, printer pairings, and ALL unsynchronized Room bills/orders.
      */
     fun clearSession() {
-        prefs.edit()
+        val editor = prefs.edit()
             .remove(KEY_AUTH_TOKEN)
             .remove(KEY_USER_ID)
             .remove(KEY_USER_NAME)
@@ -168,8 +168,15 @@ class SessionManager(context: Context) {
             .remove(KEY_DISPLAY_ROLE)
             .remove(KEY_PERMISSIONS)
             .remove(KEY_ASSIGNED_OUTLETS)
+            .remove(KEY_ACTIVE_ROUTE)
             .putBoolean(KEY_IS_LOGGED_IN, false)
-            .apply()
+
+        for (key in prefs.all.keys) {
+            if (key.startsWith("selected_branch_id_") || key.startsWith("permitted_branches_")) {
+                editor.remove(key)
+            }
+        }
+        editor.apply()
     }
 
     // Printer Paper Width (58mm or 80mm)
@@ -229,6 +236,31 @@ class SessionManager(context: Context) {
         }
     }
 
+    fun saveSelectedBranchId(outletId: String, branchId: String?) {
+        if (outletId.isBlank()) return
+        val editor = prefs.edit()
+        if (branchId.isNullOrBlank()) {
+            editor.remove("selected_branch_id_$outletId")
+        } else {
+            editor.putString("selected_branch_id_$outletId", branchId.trim())
+        }
+        editor.apply()
+    }
+
+    fun getSelectedBranchId(outletId: String): String? {
+        if (outletId.isBlank()) return null
+        return prefs.getString("selected_branch_id_$outletId", null)?.takeIf { it.isNotBlank() }
+    }
+
+    fun saveActiveRoute(routeName: String) {
+        if (routeName.isBlank()) return
+        prefs.edit().putString(KEY_ACTIVE_ROUTE, routeName).apply()
+    }
+
+    fun getActiveRoute(): String? {
+        return prefs.getString(KEY_ACTIVE_ROUTE, null)?.takeIf { it.isNotBlank() }
+    }
+
     fun getServerUrl(): String {
         val defaultUrl = BuildConfig.DEFAULT_SERVER_URL.trim().trimEnd('/')
         val saved = prefs.getString(KEY_SERVER_URL, null)?.trim()?.trimEnd('/')
@@ -273,6 +305,7 @@ class SessionManager(context: Context) {
         private const val KEY_LAST_LOGIN_TIME = "last_login_time"
         private const val KEY_PAPER_WIDTH = "paper_width"
         private const val KEY_SERVER_URL = "server_url"
+        private const val KEY_ACTIVE_ROUTE = "active_route"
         const val OFFLINE_AUTH_GRACE_MS: Long = 24L * 60L * 60L * 1000L
     }
 }

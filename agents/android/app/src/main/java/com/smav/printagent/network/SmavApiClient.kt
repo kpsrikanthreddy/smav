@@ -16,8 +16,11 @@ import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
 
-class UnauthorizedSessionException(message: String = "Your session has expired. Please sign in again.") :
-    IOException(message)
+class UnauthorizedSessionException(
+    message: String = "Your session has expired. Please sign in again.",
+    val errorCode: String? = null,
+    val confirmedInvalid: Boolean = false
+) : IOException(message)
 
 class HtmlResponseException(
     message: String = "The SMAV server returned a web page instead of data. Please verify the deployment."
@@ -66,21 +69,51 @@ object SmavApiClient {
     fun bearer(token: String): String =
         if (token.startsWith("Bearer ", ignoreCase = true)) token else "Bearer $token"
 
-    fun parseErrorMessage(response: Response<*>, fallback: String = "Request could not be completed."): String {
+    private val CONFIRMED_INVALID_CODES = setOf(
+        "SESSION_MISSING",
+        "SESSION_EXPIRED",
+        "SESSION_REVOKED",
+        "ACCOUNT_DISABLED",
+        "SESSION_INVALIDATED"
+    )
+
+    fun isConfirmedSessionInvalidation(statusCode: Int, errorCode: String?): Boolean {
+        if (statusCode != 401) return false
+        val normalized = errorCode?.trim()?.uppercase().orEmpty()
+        return normalized.isNotEmpty() && normalized in CONFIRMED_INVALID_CODES
+    }
+
+    fun parseErrorCode(response: Response<*>): String? {
+        val raw = runCatching { response.errorBody()?.string() }.getOrNull().orEmpty()
+        if (raw.isBlank()) return null
+        val parsed = runCatching { JsonParser.parseString(raw).asJsonObject }.getOrNull()
+        return parsed?.get("code")?.takeIf { !it.isJsonNull && it.isJsonPrimitive }?.asString?.trim()
+    }
+
+    fun parseErrorPayload(response: Response<*>, fallback: String = "Request could not be completed."): Pair<String?, String> {
         val raw = runCatching { response.errorBody()?.string() }.getOrNull().orEmpty()
         val parsed = runCatching { JsonParser.parseString(raw).asJsonObject }.getOrNull()
+        val code = parsed?.get("code")?.takeIf { !it.isJsonNull && it.isJsonPrimitive }?.asString?.trim()
         val serverMsg = parsed?.get("message")?.takeIf { !it.isJsonNull }?.asString
             ?: parsed?.get("error")?.takeIf { !it.isJsonNull }?.asString
-        if (!serverMsg.isNullOrBlank()) return sanitizeMessage(serverMsg)
-        return when (response.code()) {
-            401 -> "Your session has expired. Please sign in again."
-            403 -> "You do not have permission for this action."
-            404 -> "The requested record or service was not found."
-            409 -> "This record changed on the server. Refresh and try again."
-            429 -> "Too many attempts. Please wait a moment and try again."
-            in 500..599 -> "The SMAV server is temporarily unavailable. Please try again."
-            else -> fallback
+        val msg = if (!serverMsg.isNullOrBlank()) {
+            sanitizeMessage(serverMsg)
+        } else {
+            when (response.code()) {
+                401 -> "Your session has expired. Please sign in again."
+                403 -> "You do not have permission for this action."
+                404 -> "The requested record or service was not found."
+                409 -> "This record changed on the server. Refresh and try again."
+                429 -> "Too many attempts. Please wait a moment and try again."
+                in 500..599 -> "The SMAV server is temporarily unavailable. Please try again."
+                else -> fallback
+            }
         }
+        return code to msg
+    }
+
+    fun parseErrorMessage(response: Response<*>, fallback: String = "Request could not be completed."): String {
+        return parseErrorPayload(response, fallback).second
     }
 
     fun friendlyThrowable(t: Throwable, fallback: String = "Unable to connect to SMAV server."): String {
@@ -104,6 +137,7 @@ object SmavApiClient {
         }
         val sensitivePatterns = listOf(
             Regex("eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]+"),
+            Regex("smav_sess_v2\\.[A-Za-z0-9_-]+"),
             Regex("Bearer\\s+[A-Za-z0-9._~+/=-]{8,}", RegexOption.IGNORE_CASE),
             Regex("(service_?role|supabase_?key|anon_?key|access_?token|refresh_?token|api_?key|authorization)\\s*[:=]", RegexOption.IGNORE_CASE),
             Regex("(\"password\"|password\\s*=)\\s*[:=]?", RegexOption.IGNORE_CASE)
@@ -122,7 +156,12 @@ object SmavApiClient {
         mapper: (JsonObject) -> T
     ): T {
         if (response.code() == 401) {
-            throw UnauthorizedSessionException(parseErrorMessage(response))
+            val (code, msg) = parseErrorPayload(response)
+            throw UnauthorizedSessionException(
+                message = msg,
+                errorCode = code,
+                confirmedInvalid = isConfirmedSessionInvalidation(response.code(), code)
+            )
         }
         val body = response.body()
         if (!response.isSuccessful || body == null) {

@@ -1,4 +1,4 @@
-import React, { Suspense, lazy, useEffect, useMemo, useState } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Building2,
   Radio,
@@ -7,9 +7,24 @@ import {
   SlidersHorizontal,
   Utensils,
 } from 'lucide-react';
-import { SyncEventItem, UserOutletMembership, UserSession, getVisibleRole } from './types';
+import {
+  OutletBranchOption,
+  SyncEventItem,
+  UserOutletMembership,
+  UserSession,
+  getVisibleRole,
+} from './types';
 import { LoginScreen } from './components/LoginScreen';
 import { AppShell, AppShellTab, Card, LoadingState } from './components/ui';
+import {
+  WebWorkspaceTab,
+  defaultTabForRole,
+  restoreWebSession,
+  revalidateActiveWebSession,
+  sanitizeTabForRole,
+  saveWorkspaceSnapshot,
+  signOutWebSession,
+} from './lib/sessionPersistence';
 
 const OutletSelectionScreen = lazy(() =>
   import('./components/OutletSelectionScreen').then((m) => ({ default: m.OutletSelectionScreen }))
@@ -32,15 +47,28 @@ const CatalogSyncDiagnostics = lazy(() =>
 
 export default function App() {
   const [session, setSession] = useState<UserSession | null>(null);
+  const [isRestoringSession, setIsRestoringSession] = useState<boolean>(true);
+  const [sessionNotice, setSessionNotice] = useState<string | null>(null);
+  const [offlineBannerMessage, setOfflineBannerMessage] = useState<string | null>(null);
+  const [isRetryingSession, setIsRetryingSession] = useState<boolean>(false);
+
   const [multiBusinessOptions, setMultiBusinessOptions] = useState<UserOutletMembership[] | null>(null);
   const [tempUserId, setTempUserId] = useState<string>('');
   const [tempToken, setTempToken] = useState<string>('');
   const [isSwitchingOutlet, setIsSwitchingOutlet] = useState<boolean>(false);
   const [outletSwitchError, setOutletSwitchError] = useState<string | null>(null);
 
-  const [activeTab, setActiveTab] = useState<'primary' | 'pos' | 'sync' | 'diagnostics'>('primary');
+  const [activeTab, setActiveTab] = useState<WebWorkspaceTab>('primary');
+  const [permittedBranchesByOutlet, setPermittedBranchesByOutlet] = useState<
+    Record<string, OutletBranchOption[]>
+  >({});
+  const [selectedBranchByOutlet, setSelectedBranchByOutlet] = useState<Record<string, string>>({});
 
-  const [isOnline, setIsOnline] = useState<boolean>(true);
+  const lastRevalidationAtRef = useRef<number>(0);
+
+  const [isOnline, setIsOnline] = useState<boolean>(
+    typeof navigator !== 'undefined' ? navigator.onLine !== false : true
+  );
   const [isPrinterConnected, setIsPrinterConnected] = useState<boolean>(true);
   const [paperWidthMm, setPaperWidthMm] = useState<58 | 80>(() => {
     try {
@@ -56,6 +84,130 @@ export default function App() {
   });
   const [openCartSignal, setOpenCartSignal] = useState<number>(0);
 
+  // Persist non-sensitive workspace metadata (identity, visible role, outlet, branches, active tab — NEVER tokens)
+  useEffect(() => {
+    if (!session) return;
+    saveWorkspaceSnapshot({
+      session,
+      activeTab,
+      permittedBranchesByOutlet,
+      selectedBranchByOutlet,
+    });
+  }, [session, activeTab, permittedBranchesByOutlet, selectedBranchByOutlet]);
+
+  // Restore session on startup / browser refresh (shows loading UI; never a blank screen)
+  useEffect(() => {
+    let cancelled = false;
+    const boot = async () => {
+      setIsRestoringSession(true);
+      const restored = await restoreWebSession();
+      if (cancelled) return;
+
+      if (restored.status === 'authenticated') {
+        setSession(restored.session);
+        setActiveTab(restored.activeTab);
+        setPermittedBranchesByOutlet(restored.permittedBranchesByOutlet);
+        setSelectedBranchByOutlet(restored.selectedBranchByOutlet);
+        setOfflineBannerMessage(null);
+        setSessionNotice(null);
+        setIsOnline(true);
+        lastRevalidationAtRef.current = Date.now();
+      } else if (restored.status === 'offline_retained') {
+        setSession(restored.session);
+        setActiveTab(restored.activeTab);
+        setPermittedBranchesByOutlet(restored.permittedBranchesByOutlet);
+        setSelectedBranchByOutlet(restored.selectedBranchByOutlet);
+        setOfflineBannerMessage(restored.offlineMessage);
+        setIsOnline(false);
+      } else {
+        setSession(null);
+        setOfflineBannerMessage(null);
+        if (restored.message) {
+          setSessionNotice(restored.message);
+        }
+      }
+      setIsRestoringSession(false);
+    };
+    void boot();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleRetrySessionConnection = useCallback(async () => {
+    if (!session) return;
+    setIsRetryingSession(true);
+    try {
+      const result = await revalidateActiveWebSession(session, {
+        activeTab,
+        permittedBranchesByOutlet,
+        selectedBranchByOutlet,
+      });
+      lastRevalidationAtRef.current = Date.now();
+
+      if (result.status === 'valid') {
+        setSession(result.session);
+        setOfflineBannerMessage(null);
+        setIsOnline(true);
+        if (Array.isArray(result.permittedBranches)) {
+          const outletId = result.session.activeOutlet.id;
+          setPermittedBranchesByOutlet((prev) => ({
+            ...prev,
+            [outletId]: result.permittedBranches!,
+          }));
+        }
+      } else if (result.status === 'offline_retained') {
+        // Retain valid session; keep offline/retry banner visible
+        setOfflineBannerMessage(result.offlineMessage);
+        setIsOnline(false);
+      } else if (result.status === 'invalidated') {
+        // Clear ONLY on confirmed expired/revoked/disabled session
+        setSession(null);
+        setMultiBusinessOptions(null);
+        setOfflineBannerMessage(null);
+        setSessionNotice(result.message);
+      }
+    } finally {
+      setIsRetryingSession(false);
+    }
+  }, [session, activeTab, permittedBranchesByOutlet, selectedBranchByOutlet]);
+
+  // Listen for browser online/offline transitions & tab visibility to silently keep Supabase session fresh
+  useEffect(() => {
+    const onOffline = () => {
+      setIsOnline(false);
+      if (session) {
+        setOfflineBannerMessage(
+          'You appear to be offline. Your session is retained — reconnect and click Retry to sync.'
+        );
+      }
+    };
+    const onOnline = () => {
+      setIsOnline(true);
+      if (session) {
+        void handleRetrySessionConnection();
+      }
+    };
+    const onVisibility = () => {
+      if (
+        document.visibilityState === 'visible' &&
+        session &&
+        Date.now() - lastRevalidationAtRef.current > 60 * 1000
+      ) {
+        void handleRetrySessionConnection();
+      }
+    };
+
+    window.addEventListener('offline', onOffline);
+    window.addEventListener('online', onOnline);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('offline', onOffline);
+      window.removeEventListener('online', onOnline);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [session, handleRetrySessionConnection]);
+
   const handleChangePaperWidth = (width: 58 | 80) => {
     setPaperWidthMm(width);
     try {
@@ -69,6 +221,32 @@ export default function App() {
     setActiveTab('pos');
     setOpenCartSignal((prev) => prev + 1);
   };
+
+  const handlePermittedBranchesChange = useCallback(
+    (outletId: string, branches: OutletBranchOption[]) => {
+      if (!outletId) return;
+      setPermittedBranchesByOutlet((prev) => {
+        const existing = prev[outletId];
+        if (
+          existing &&
+          existing.length === branches.length &&
+          existing.every((b, idx) => b.id === branches[idx]?.id && b.branchCode === branches[idx]?.branchCode)
+        ) {
+          return prev;
+        }
+        return { ...prev, [outletId]: branches };
+      });
+    },
+    []
+  );
+
+  const handleSelectedBranchChange = useCallback((outletId: string, branchId: string) => {
+    if (!outletId) return;
+    setSelectedBranchByOutlet((prev) => {
+      if ((prev[outletId] || '') === branchId) return prev;
+      return { ...prev, [outletId]: branchId };
+    });
+  }, []);
 
   const [serverCatalogRevision, setServerCatalogRevision] = useState<number>(101);
   const [localCatalogRevision, setLocalCatalogRevision] = useState<number>(101);
@@ -126,17 +304,24 @@ export default function App() {
   }, [session?.activeOutlet?.id]);
 
   const handleLoginSuccess = (userSession: UserSession, _redirectTo?: string) => {
+    const nextTab = defaultTabForRole(userSession.role);
     setSession(userSession);
     setMultiBusinessOptions(null);
     setTempToken('');
     setTempUserId('');
     setOutletSwitchError(null);
-
-    if (userSession.role === 'superadmin' || userSession.role === 'admin') {
-      setActiveTab('primary');
-    } else {
-      setActiveTab('pos');
-    }
+    setSessionNotice(null);
+    setOfflineBannerMessage(null);
+    setIsOnline(true);
+    setActiveTab(nextTab);
+    lastRevalidationAtRef.current = Date.now();
+    saveWorkspaceSnapshot({
+      session: userSession,
+      activeTab: nextTab,
+      permittedBranchesByOutlet,
+      selectedBranchByOutlet,
+      lastValidatedAt: Date.now(),
+    });
   };
 
   const handleMultiBusinessFound = (outlets: UserOutletMembership[], token: string, userId: string) => {
@@ -149,7 +334,11 @@ export default function App() {
     try {
       const res = await fetch('/api/auth/select-outlet', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'SMAV-Web',
+        },
         body: JSON.stringify({
           tempToken: tokenFromScreen || tempToken,
           userId: tempUserId || undefined,
@@ -173,18 +362,28 @@ export default function App() {
     setIsSwitchingOutlet(true);
     setOutletSwitchError(null);
     try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'SMAV-Web',
+      };
+      if (session.token) {
+        headers.Authorization = `Bearer ${session.token}`;
+      }
       const res = await fetch('/api/auth/switch-outlet', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session.token}`,
-        },
+        credentials: 'include',
+        headers,
         body: JSON.stringify({ outletId }),
       });
       const data = await res.json();
       if (res.ok && data.success && data.session) {
+        const nextTab = sanitizeTabForRole(
+          data.session.role === 'staff' ? 'pos' : 'primary',
+          data.session.role
+        );
         setSession(data.session);
-        setActiveTab(data.session.role === 'staff' ? 'pos' : 'primary');
+        setActiveTab(nextTab);
+        setOfflineBannerMessage(null);
       } else {
         setOutletSwitchError(data.message || 'Unable to switch outlet.');
       }
@@ -198,12 +397,17 @@ export default function App() {
   const handleSuperadminLaunchOutletPos = async (outletId: string) => {
     if (!session) return;
     try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'SMAV-Web',
+      };
+      if (session.token) {
+        headers.Authorization = `Bearer ${session.token}`;
+      }
       const res = await fetch('/api/superadmin/launch-pos', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session.token}`,
-        },
+        credentials: 'include',
+        headers,
         body: JSON.stringify({ outletId }),
       });
       const data = await res.json();
@@ -217,16 +421,14 @@ export default function App() {
   };
 
   const handleLogout = async () => {
-    if (session?.token) {
-      try {
-        await fetch('/api/auth/logout', {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${session.token}` },
-        });
-      } catch (_e) {}
-    }
+    await signOutWebSession(session);
     setSession(null);
     setMultiBusinessOptions(null);
+    setPermittedBranchesByOutlet({});
+    setSelectedBranchByOutlet({});
+    setOfflineBannerMessage(null);
+    setOutletSwitchError(null);
+    setSessionNotice(null);
   };
 
   const tabs: AppShellTab[] = useMemo(() => {
@@ -281,6 +483,20 @@ export default function App() {
     return list;
   }, [session]);
 
+  // Never show a blank screen while restoring a persisted session
+  if (isRestoringSession) {
+    return (
+      <div className="min-h-screen bg-[#F5F6FA] flex items-center justify-center p-4">
+        <Card padding="lg" className="w-full max-w-sm">
+          <LoadingState
+            title="Restoring your SMAV session…"
+            subtitle="Verifying outlet access, role, and permitted branches."
+          />
+        </Card>
+      </div>
+    );
+  }
+
   if (!session && multiBusinessOptions) {
     return (
       <Suspense
@@ -309,6 +525,7 @@ export default function App() {
       <LoginScreen
         onLoginSuccess={handleLoginSuccess}
         onMultiBusinessFound={handleMultiBusinessFound}
+        noticeMessage={sessionNotice}
       />
     );
   }
@@ -329,6 +546,8 @@ export default function App() {
         label: `${o.outletName} (${getVisibleRole(o.displayRole || o.role)})`,
       })) || [];
 
+  const activeOutletId = session.activeOutlet.id;
+
   return (
     <AppShell
       roleLabel={visibleRole}
@@ -338,9 +557,9 @@ export default function App() {
       userFullName={session.fullName}
       tabs={tabs}
       activeTab={activeTab}
-      onTabChange={(id) => setActiveTab(id as typeof activeTab)}
+      onTabChange={(id) => setActiveTab(sanitizeTabForRole(id, session.role))}
       outletOptions={outletOptions}
-      selectedOutletId={session.activeOutlet.id}
+      selectedOutletId={activeOutletId}
       onOutletChange={handleSwitchAssignedOutlet}
       isSwitchingOutlet={isSwitchingOutlet}
       onLogout={handleLogout}
@@ -348,6 +567,17 @@ export default function App() {
       cartTotalAmount={cartSummary.grandTotal}
       onOpenSelectedCart={handleOpenSelectedCart}
       bannerError={outletSwitchError}
+      offlineBanner={
+        offlineBannerMessage
+          ? {
+              message: offlineBannerMessage,
+              isRetrying: isRetryingSession,
+              onRetry: () => {
+                void handleRetrySessionConnection();
+              },
+            }
+          : null
+      }
     >
       <Suspense fallback={<LoadingState title="Loading workspace…" />}>
         {activeTab === 'diagnostics' && session.role === 'superadmin' && (
@@ -386,6 +616,10 @@ export default function App() {
             onPerformDeltaSync={() => {}}
             onCartSummaryChange={setCartSummary}
             openCartSignal={openCartSignal}
+            initialPermittedBranches={permittedBranchesByOutlet[activeOutletId]}
+            initialSelectedBranchId={selectedBranchByOutlet[activeOutletId] || ''}
+            onPermittedBranchesChange={handlePermittedBranchesChange}
+            onSelectedBranchChange={handleSelectedBranchChange}
           />
         )}
 

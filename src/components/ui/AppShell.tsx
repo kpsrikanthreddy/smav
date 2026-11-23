@@ -1,5 +1,5 @@
 import React from 'react';
-import { LogOut, Printer, ShoppingCart } from 'lucide-react';
+import { LogOut, Printer, RefreshCw, ShoppingCart, WifiOff } from 'lucide-react';
 import { StatusBadge } from './StatusBadge';
 
 export interface AppShellTab {
@@ -11,6 +11,12 @@ export interface AppShellTab {
 export interface OutletOption {
   id: string;
   label: string;
+}
+
+export interface OfflineBannerState {
+  message: string;
+  isRetrying?: boolean;
+  onRetry: () => void;
 }
 
 export interface AppShellProps {
@@ -31,6 +37,7 @@ export interface AppShellProps {
   cartTotalAmount?: number;
   onOpenSelectedCart?: () => void;
   bannerError?: string | null;
+  offlineBanner?: OfflineBannerState | null;
   children: React.ReactNode;
 }
 
@@ -52,6 +59,7 @@ export const AppShell: React.FC<AppShellProps> = ({
   cartTotalAmount = 0,
   onOpenSelectedCart,
   bannerError,
+  offlineBanner,
   children,
 }) => {
   return (
@@ -175,6 +183,26 @@ export const AppShell: React.FC<AppShellProps> = ({
           </nav>
         </div>
       </header>
+
+      {offlineBanner && (
+        <div role="status" className="max-w-7xl mx-auto w-full px-3.5 sm:px-6 lg:px-8 pt-4">
+          <div className="rounded-xl border border-[#FDE68A] bg-[#FFFBEB] px-4 py-2.5 flex items-center justify-between gap-3 text-xs font-medium text-[#92400E]">
+            <div className="flex items-center gap-2 min-w-0">
+              <WifiOff className="w-4 h-4 shrink-0 text-[#D97706]" />
+              <span>{offlineBanner.message}</span>
+            </div>
+            <button
+              type="button"
+              disabled={offlineBanner.isRetrying}
+              onClick={offlineBanner.onRetry}
+              className="shrink-0 inline-flex items-center gap-1.5 rounded-lg border border-[#F59E0B] bg-white hover:bg-[#FEF3C7] px-3 py-1.5 text-xs font-semibold text-[#92400E] transition cursor-pointer disabled:opacity-60"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${offlineBanner.isRetrying ? 'animate-spin' : ''}`} />
+              <span>{offlineBanner.isRetrying ? 'Reconnecting…' : 'Retry'}</span>
+            </button>
+          </div>
+        </div>
+      )}
 
       {bannerError && (
         <div role="alert" className="max-w-7xl mx-auto w-full px-3.5 sm:px-6 lg:px-8 pt-4">

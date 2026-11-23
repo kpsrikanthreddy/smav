@@ -6,17 +6,19 @@ import { BASE_INPUT_CLASS, Button, Card, FormField, PasswordField } from './ui';
 interface LoginScreenProps {
   onLoginSuccess: (session: UserSession, redirectTo?: string) => void;
   onMultiBusinessFound: (outlets: UserOutletMembership[], tempToken: string, userId: string) => void;
+  noticeMessage?: string | null;
 }
 
 export const LoginScreen: React.FC<LoginScreenProps> = ({
   onLoginSuccess,
   onMultiBusinessFound,
+  noticeMessage,
 }) => {
   const [emailOrId, setEmailOrId] = useState('');
   const [password, setPassword] = useState('');
   const [outletCode, setOutletCode] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(noticeMessage || null);
   const [errorDetails, setErrorDetails] = useState<string | null>(null);
 
   // Forgot Password Modal State
@@ -54,7 +56,11 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
     try {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'SMAV-Web',
+        },
         body: JSON.stringify({
           emailOrId: emailOrId.trim(),
           password: password.trim(),
@@ -130,7 +136,11 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
     try {
       const res = await fetch('/api/auth/complete-first-login-password', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'SMAV-Web',
+        },
         body: JSON.stringify({
           passwordChangeToken: passwordChangeState.token,
           newPassword: firstLoginNewPassword,

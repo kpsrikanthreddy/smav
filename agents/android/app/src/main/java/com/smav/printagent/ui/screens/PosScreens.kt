@@ -118,6 +118,7 @@ fun PosBillingRouterScreen(
             loadError = errorMsg,
             onRefresh = { loadCatalog() },
             billingRepo = billingRepo,
+            sessionManager = sessionManager,
             onOpenRecentBills = onOpenRecentBills,
             onOpenPrinterSettings = onOpenPrinterSettings,
             onCartSummaryChange = onCartSummaryChange,

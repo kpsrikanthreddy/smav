@@ -119,6 +119,9 @@ fun SmavAppScaffold(
     cartItemCount: Int = 0,
     cartTotalAmount: Double = 0.0,
     onOpenSelectedCart: (() -> Unit)? = null,
+    offlineBannerMessage: String? = null,
+    isRetryingConnection: Boolean = false,
+    onRetryConnection: (() -> Unit)? = null,
     content: @Composable (PaddingValues) -> Unit
 ) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
@@ -440,6 +443,56 @@ fun SmavAppScaffold(
                                         fontSize = 11.sp,
                                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
                                     )
+                                }
+                            }
+                        }
+                    }
+                    if (!isOnline || !offlineBannerMessage.isNullOrBlank()) {
+                        Surface(
+                            color = SmavColors.WarningBg,
+                            border = BorderStroke(1.dp, SmavColors.WarningBorder),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 6.dp),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.CloudOff,
+                                    contentDescription = "Offline",
+                                    tint = SmavColors.WarningText,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Text(
+                                    text = offlineBannerMessage?.takeIf { it.isNotBlank() }
+                                        ?: "Server temporarily unreachable. Your session is retained.",
+                                    color = SmavColors.WarningText,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                if (onRetryConnection != null) {
+                                    OutlinedButton(
+                                        onClick = onRetryConnection,
+                                        enabled = !isRetryingConnection,
+                                        shape = RoundedCornerShape(8.dp),
+                                        border = BorderStroke(1.dp, SmavColors.WarningText),
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                        modifier = Modifier.height(32.dp)
+                                    ) {
+                                        Text(
+                                            text = if (isRetryingConnection) "Retrying…" else "Retry",
+                                            color = SmavColors.WarningText,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
                                 }
                             }
                         }

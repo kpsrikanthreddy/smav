@@ -59,6 +59,10 @@ interface StaffPOSProps {
   onPerformDeltaSync: () => void;
   onCartSummaryChange?: (summary: { itemCount: number; grandTotal: number }) => void;
   openCartSignal?: number;
+  initialPermittedBranches?: OutletBranchOption[];
+  initialSelectedBranchId?: string;
+  onPermittedBranchesChange?: (outletId: string, branches: OutletBranchOption[]) => void;
+  onSelectedBranchChange?: (outletId: string, branchId: string) => void;
 }
 
 const normalizeGroup = (value?: string | null) => (value || '').trim() || 'General';
@@ -113,6 +117,10 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
   localRevision,
   onCartSummaryChange,
   openCartSignal = 0,
+  initialPermittedBranches,
+  initialSelectedBranchId,
+  onPermittedBranchesChange,
+  onSelectedBranchChange,
 }) => {
   const category = session.activeOutlet.category;
   const [activePosView, setActivePosView] = useState<'billing' | 'catalog' | 'secondary' | 'ledger'>('billing');
@@ -123,8 +131,12 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
 
   // Salon Data
   const [salonServices, setSalonServices] = useState<SalonService[]>([]);
-  const [permittedBranches, setPermittedBranches] = useState<OutletBranchOption[]>([]);
-  const [selectedBranchId, setSelectedBranchId] = useState<string>('');
+  const [permittedBranches, setPermittedBranches] = useState<OutletBranchOption[]>(
+    () => initialPermittedBranches || []
+  );
+  const [selectedBranchId, setSelectedBranchId] = useState<string>(
+    () => initialSelectedBranchId || ''
+  );
   const [isLoadingBranches, setIsLoadingBranches] = useState<boolean>(false);
   const [branchError, setBranchError] = useState<string | null>(null);
   const [branchAuthBlocked, setBranchAuthBlocked] = useState<boolean>(false);
@@ -263,6 +275,8 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
     setSearchQuery('');
     if (prevOutletIdRef.current !== session.activeOutlet.id) {
       prevOutletIdRef.current = session.activeOutlet.id;
+      setPermittedBranches(initialPermittedBranches || []);
+      setSelectedBranchId(initialSelectedBranchId || '');
       setSalonCart([]);
       setRestaurantCart([]);
       setRetailCart([]);
@@ -472,6 +486,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
       activeList.sort((a, b) => a.branchName.localeCompare(b.branchName));
 
       setPermittedBranches(activeList);
+      onPermittedBranchesChange?.(session.activeOutlet.id, activeList);
       setBranchError(null);
 
       const isBlocked = Boolean(billingBlockedFlag) || activeList.length === 0;
@@ -483,7 +498,7 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
           : null
       );
 
-      // Preselect branch ONLY when authenticated user has exactly 1 active assigned branch; otherwise require manual selection.
+      // Preselect branch ONLY when authenticated user has exactly 1 active assigned branch; otherwise preserve valid user selection or require manual selection.
       if (!isBlocked && activeList.length === 1) {
         const preferredId =
           autoBranch?.id && activeList.some((b) => b.id === autoBranch.id)
@@ -496,8 +511,14 @@ export const StaffPOS: React.FC<StaffPOSProps> = ({
         );
       }
     },
-    []
+    [onPermittedBranchesChange, session.activeOutlet.id]
   );
+
+  useEffect(() => {
+    if (category === 'salon') {
+      onSelectedBranchChange?.(session.activeOutlet.id, selectedBranchId);
+    }
+  }, [category, onSelectedBranchChange, selectedBranchId, session.activeOutlet.id]);
 
   const loadPermittedBranches = useCallback(async () => {
     if (category !== 'salon') {

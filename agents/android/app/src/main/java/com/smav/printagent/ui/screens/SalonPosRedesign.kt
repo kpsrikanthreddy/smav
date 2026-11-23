@@ -37,6 +37,7 @@ import com.smav.printagent.data.local.entities.SalonBillEntity
 import com.smav.printagent.data.local.entities.SalonBillItemEntity
 import com.smav.printagent.data.repository.BillingRepository
 import com.smav.printagent.data.repository.PosInitBundle
+import com.smav.printagent.data.repository.SessionManager
 import com.smav.printagent.model.*
 import com.smav.printagent.ui.components.*
 import com.smav.printagent.ui.theme.*
@@ -62,6 +63,7 @@ internal fun SalonPosScreen(
     loadError: String?,
     onRefresh: () -> Unit,
     billingRepo: BillingRepository,
+    sessionManager: SessionManager? = null,
     onOpenRecentBills: () -> Unit,
     onOpenPrinterSettings: () -> Unit,
     onCartSummaryChange: (Int, Double) -> Unit = { _, _ -> },
@@ -82,8 +84,21 @@ internal fun SalonPosScreen(
     var discountPercentText by remember { mutableStateOf("0") }
     var paymentMode by remember { mutableStateOf("upi") }
 
-    // Branch is ALWAYS blank by default and never auto-selected.
-    var selectedBranch by remember(branch.id) { mutableStateOf<BranchOption?>(null) }
+    val cachedBranches = remember(branch.id, sessionManager) {
+        sessionManager?.getPermittedBranches(branch.id).orEmpty().filter { it.isActive }
+    }
+    val persistedSelectedBranchId = remember(branch.id, sessionManager) {
+        sessionManager?.getSelectedBranchId(branch.id)
+    }
+
+    // Restores only a previously user-selected branch if still permitted; never auto-selects an unchosen branch.
+    var selectedBranch by remember(branch.id) {
+        mutableStateOf(
+            persistedSelectedBranchId?.let { savedId ->
+                cachedBranches.firstOrNull { it.id == savedId }
+            }
+        )
+    }
 
     var stylistPickerLineId by remember { mutableStateOf<String?>(null) }
     var highlightedMissingStylistLineId by remember { mutableStateOf<String?>(null) }
@@ -102,19 +117,26 @@ internal fun SalonPosScreen(
 
     val services = bundle?.salonServices.orEmpty()
     val stylists = bundle?.stylists.orEmpty()
-    val permittedBranches = remember(bundle?.branches) {
-        bundle?.branches.orEmpty().filter { it.isActive }
+    val permittedBranches = remember(bundle?.branches, cachedBranches) {
+        val fromBundle = bundle?.branches.orEmpty().filter { it.isActive }
+        if (fromBundle.isNotEmpty()) fromBundle else cachedBranches
     }
     val isBillingBlocked = bundle != null && !loading && (bundle.billingBlocked || permittedBranches.isEmpty())
     val branchAuthMessage = bundle?.branchAuthorizationMessage
         ?: "No active branch is assigned to your account. Contact an administrator before billing."
 
-    // Clear selectedBranch only if it is no longer among active permitted branches. Never auto-select.
+    // Restore persisted user selection once branches arrive, or clear if no longer permitted.
     LaunchedEffect(permittedBranches, isBillingBlocked) {
         if (isBillingBlocked) {
             selectedBranch = null
-        } else if (selectedBranch != null && permittedBranches.none { it.id == selectedBranch?.id }) {
+        } else if (selectedBranch == null) {
+            val savedId = sessionManager?.getSelectedBranchId(branch.id)
+            if (!savedId.isNullOrBlank()) {
+                selectedBranch = permittedBranches.firstOrNull { it.id == savedId }
+            }
+        } else if (permittedBranches.none { it.id == selectedBranch?.id }) {
             selectedBranch = null
+            sessionManager?.saveSelectedBranchId(branch.id, null)
         }
     }
 
@@ -1023,6 +1045,7 @@ internal fun SalonPosScreen(
             selectedBranch = selectedBranch,
             onSelectBranch = { chosen ->
                 selectedBranch = chosen
+                sessionManager?.saveSelectedBranchId(branch.id, chosen.id)
                 billingError = null
                 checkoutAttemptFingerprint = null
             },

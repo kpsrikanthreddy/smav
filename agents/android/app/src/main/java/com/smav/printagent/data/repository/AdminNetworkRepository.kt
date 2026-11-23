@@ -116,27 +116,94 @@ class AdminNetworkRepository(
 
     suspend fun validateCurrentSession(): Result<StaffSession> = withContext(Dispatchers.IO) {
         runCatching {
-            val existing = sessionManager.getStaffSession() ?: throw UnauthorizedSessionException()
-            val sessionResp = api.getAuthSession(SmavApiClient.bearer(existing.token))
-            if (sessionResp.code() == 401 || sessionResp.code() == 403) {
-                throw UnauthorizedSessionException(
-                    SmavApiClient.parseErrorMessage(
-                        sessionResp,
-                        "Your account is inactive or your session has expired. Please sign in again."
-                    )
+            val existing = sessionManager.getStaffSession()
+                ?: throw UnauthorizedSessionException(
+                    message = "No active session found.",
+                    errorCode = "SESSION_MISSING",
+                    confirmedInvalid = true
                 )
+            var sessionResp = api.getAuthSession(SmavApiClient.bearer(existing.token))
+
+            if (sessionResp.code() == 401) {
+                val (code, msg) = SmavApiClient.parseErrorPayload(
+                    sessionResp,
+                    "Your account is inactive or your session has expired. Please sign in again."
+                )
+                // Attempt explicit server-side refresh before declaring session expired
+                if (code == "SESSION_EXPIRED") {
+                    val refreshResp = runCatching {
+                        api.refreshAuthSession(SmavApiClient.bearer(existing.token))
+                    }.getOrNull()
+                    if (refreshResp != null && refreshResp.isSuccessful) {
+                        sessionResp = refreshResp
+                    } else if (refreshResp != null && refreshResp.code() == 401) {
+                        val (rCode, rMsg) = SmavApiClient.parseErrorPayload(refreshResp, msg)
+                        throw UnauthorizedSessionException(
+                            message = rMsg,
+                            errorCode = rCode ?: code,
+                            confirmedInvalid = SmavApiClient.isConfirmedSessionInvalidation(401, rCode ?: code)
+                        )
+                    } else {
+                        // Refresh failed due to temporary network/5xx error: retain active session
+                        throw java.io.IOException("SMAV server is temporarily unreachable. Session retained.")
+                    }
+                } else if (SmavApiClient.isConfirmedSessionInvalidation(401, code)) {
+                    throw UnauthorizedSessionException(
+                        message = msg,
+                        errorCode = code,
+                        confirmedInvalid = true
+                    )
+                } else {
+                    throw java.io.IOException(msg)
+                }
             }
+
             val sessionJson = SmavApiClient.unwrapOrThrow(sessionResp) { it }
             var updated = parseSessionPayload(sessionJson, existing.email, existing.token)
 
-            val outletsResp = runCatching { api.getAuthorizedOutlets(SmavApiClient.bearer(existing.token)) }.getOrNull()
+            // Persist permitted branches if returned with session payload (non-blocking if absent)
+            val branchesArr = sessionJson.getAsJsonArray("permittedBranches")
+            if (branchesArr != null && updated.businessId.isNotBlank()) {
+                val parsedBranches = branchesArr.mapNotNull { el ->
+                    val b = el.asJsonObjectOrNull() ?: return@mapNotNull null
+                    val id = b.optString("id")
+                    val code = b.optString("branchCode", "branch_code")
+                    val name = b.optString("name", "branchName", "branch_name")
+                    if (id.isBlank() || code.isBlank() || name.isBlank()) return@mapNotNull null
+                    BranchOption(
+                        id = id,
+                        outletId = b.optString("outletId", "outlet_id").ifBlank { updated.businessId },
+                        outletCode = b.optString("outletCode", "outlet_code"),
+                        branchCode = code,
+                        branchName = name,
+                        billPrefix = b.optString("billPrefix", "bill_prefix"),
+                        isActive = b.optBool("isActive", true),
+                        address = b.optString("address"),
+                        gstin = b.optString("gstin"),
+                        whatsappPhone = b.optString("whatsappPhone", "whatsapp_phone")
+                    )
+                }.filter { it.isActive }
+                if (parsedBranches.isNotEmpty()) {
+                    sessionManager.savePermittedBranches(updated.businessId, parsedBranches)
+                    val prevSelected = sessionManager.getSelectedBranchId(updated.businessId)
+                    if (!prevSelected.isNullOrBlank() && parsedBranches.none { it.id == prevSelected }) {
+                        sessionManager.saveSelectedBranchId(updated.businessId, null)
+                    }
+                }
+            }
+
+            // Refresh authorized outlets list best-effort; transient failures never invalidate session
+            val outletsResp = runCatching { api.getAuthorizedOutlets(SmavApiClient.bearer(updated.token)) }.getOrNull()
             if (outletsResp != null && outletsResp.isSuccessful) {
                 val oJson = outletsResp.body()
                 val outlets = parseAssignedOutlets(oJson?.getAsJsonArray("outlets"))
                 if (outlets.isNotEmpty()) {
                     updated = updated.copy(assignedOutlets = outlets)
                 }
+            } else if (updated.assignedOutlets.isEmpty() && existing.assignedOutlets.isNotEmpty()) {
+                updated = updated.copy(assignedOutlets = existing.assignedOutlets)
             }
+
             sessionManager.saveStaffSession(updated)
             updated
         }

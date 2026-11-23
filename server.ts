@@ -54,6 +54,25 @@ import { OutletUserSyncCoordinator } from './syncCoordinator.ts';
 import type { OutletTargetDescriptor } from './syncCoordinator.ts';
 import { loadOutletRuntimeConfig, listPosTemplates } from './services/outletRegistry.ts';
 import { loadCentralOutletCatalog, loadCentralCatalogChanges } from './services/outletAdapters.ts';
+import {
+  SESSION_TTL_MS,
+  SessionRevocationStore,
+  clearSessionCookie,
+  extractJwtExpiryMs,
+  extractRequestSessionToken,
+  generateSessionId,
+  refreshSupabaseSessionIfNeeded,
+  sanitizeSessionForClient,
+  sealSessionPayload,
+  setSessionCookie,
+  unsealSessionPayload,
+  verifyCookieMutationCsrf,
+  type SealedMembershipCompact,
+  type SealedOutletCompact,
+  type SealedSessionPayload,
+  type SessionErrorCode,
+  type SessionValidationOutcome
+} from './services/sessionPersistence.ts';
 
 dotenv.config();
 
@@ -145,6 +164,7 @@ export interface UserAccount {
 
 export interface UserSession {
   token: string;
+  sessionId?: string;
   userId: string;
   email: string;
   fullName: string;
@@ -158,6 +178,9 @@ export interface UserSession {
   createdAt: string;
   expiresAt: string;
   supabaseToken?: string;
+  supabaseRefreshToken?: string;
+  supabaseExpiresAt?: number;
+  hasSupabaseRefreshSession?: boolean;
   platformRole?: string;
 }
 
@@ -699,6 +722,7 @@ export class SmavAuthGateway implements IAuthProvider {
   private outletRepo: CentralOutletRepository;
   private userRepo: CentralUserRepository;
   private activeSessions = new Map<string, UserSession>();
+  private revocationStore = new SessionRevocationStore();
   private resetTokens = new Map<string, PasswordResetTokenRecord>();
   private pendingAuthSelections = new Map<string, {
     userId: string;
@@ -706,6 +730,8 @@ export class SmavAuthGateway implements IAuthProvider {
     fullName: string;
     platformRole: string;
     supabaseToken: string;
+    supabaseRefreshToken?: string;
+    supabaseExpiresAt?: number;
     memberships: UserOutletMembership[];
     outlets: Outlet[];
     expiresAt: number;
@@ -1013,6 +1039,11 @@ export class SmavAuthGateway implements IAuthProvider {
                 updatedAt: new Date().toISOString()
               };
 
+              const supabaseExpiresAt =
+                typeof authData.session.expires_at === 'number' && authData.session.expires_at > 0
+                  ? authData.session.expires_at * 1000
+                  : extractJwtExpiryMs(authData.session.access_token);
+
               const session = this.createSession(
                 superadminUser,
                 superadminOutlet,
@@ -1020,7 +1051,9 @@ export class SmavAuthGateway implements IAuthProvider {
                 ['*'],
                 deviceId,
                 authData.session.access_token,
-                'SUPERADMIN'
+                'SUPERADMIN',
+                authData.session.refresh_token,
+                supabaseExpiresAt
               );
 
               await writeTrustedServerAuditLog({
@@ -1028,7 +1061,7 @@ export class SmavAuthGateway implements IAuthProvider {
                 userEmail,
                 action: 'LOGIN_SUCCESS',
                 entityType: 'AUTH_SESSION',
-                entityId: session.token,
+                entityId: session.sessionId || 'session',
                 details: {
                   platform_role: 'SUPERADMIN',
                   provider: 'central_smav_supabase',
@@ -1114,12 +1147,18 @@ export class SmavAuthGateway implements IAuthProvider {
               if (!outletCode && authorizedOutlets.length > 1) {
                 loginRateLimiter.recordAttempt(rateLimitKey, true);
                 const tempToken = generateSecureToken('smav_temp');
+                const pendingSupabaseExpiresAt =
+                  typeof authData.session.expires_at === 'number' && authData.session.expires_at > 0
+                    ? authData.session.expires_at * 1000
+                    : extractJwtExpiryMs(authData.session.access_token);
                 this.pendingAuthSelections.set(tempToken, {
                   userId: profile.id,
                   email: userEmail,
                   fullName: profile.full_name || userEmail.split('@')[0],
                   platformRole,
                   supabaseToken: authData.session.access_token,
+                  supabaseRefreshToken: authData.session.refresh_token,
+                  supabaseExpiresAt: pendingSupabaseExpiresAt,
                   memberships: authorizedMemberships,
                   outlets: authorizedOutlets,
                   expiresAt: Date.now() + 10 * 60 * 1000
@@ -1178,6 +1217,11 @@ export class SmavAuthGateway implements IAuthProvider {
                 memberships: authorizedMemberships
               };
 
+              const outletSupabaseExpiresAt =
+                typeof authData.session.expires_at === 'number' && authData.session.expires_at > 0
+                  ? authData.session.expires_at * 1000
+                  : extractJwtExpiryMs(authData.session.access_token);
+
               const session = this.createSession(
                 account,
                 selectedOutlet,
@@ -1185,7 +1229,9 @@ export class SmavAuthGateway implements IAuthProvider {
                 membership.permissions,
                 deviceId,
                 authData.session.access_token,
-                platformRole
+                platformRole,
+                authData.session.refresh_token,
+                outletSupabaseExpiresAt
               );
               loginRateLimiter.recordAttempt(rateLimitKey, true);
 
@@ -1195,7 +1241,7 @@ export class SmavAuthGateway implements IAuthProvider {
                 outletId: selectedOutlet.id,
                 action: 'LOGIN_SUCCESS',
                 entityType: 'AUTH_SESSION',
-                entityId: session.token,
+                entityId: session.sessionId || 'session',
                 details: {
                   role: membership.displayRole,
                   outletCode: selectedOutlet.code,
@@ -1393,7 +1439,9 @@ export class SmavAuthGateway implements IAuthProvider {
         membership.permissions,
         deviceId,
         pending.supabaseToken,
-        pending.platformRole
+        pending.platformRole,
+        pending.supabaseRefreshToken,
+        pending.supabaseExpiresAt
       );
 
       auditLogger.log({
@@ -1417,6 +1465,73 @@ export class SmavAuthGateway implements IAuthProvider {
     };
   }
 
+  private toCompactOutlet(outlet: Outlet): SealedOutletCompact {
+    return {
+      id: outlet.id,
+      code: outlet.code,
+      name: outlet.name,
+      category: outlet.category,
+      address: outlet.address || '',
+      phone: outlet.phone || '',
+      gstin: outlet.gstin || '',
+      receiptHeader: outlet.receiptHeader || '',
+      receiptFooter: outlet.receiptFooter || '',
+      providerType: outlet.providerType,
+      isActive: outlet.isActive !== false
+    };
+  }
+
+  private toCompactMemberships(memberships?: UserOutletMembership[]): SealedMembershipCompact[] {
+    return (memberships || []).slice(0, 20).map((m) => ({
+      outletId: m.outletId,
+      outletCode: m.outletCode,
+      outletName: m.outletName,
+      outletCategory: m.outletCategory,
+      role: m.role,
+      displayRole: m.displayRole,
+      specificTitle: m.specificTitle,
+      isPrimary: m.isPrimary
+    }));
+  }
+
+  private sealUserSession(session: UserSession): string {
+    const sid = session.sessionId || generateSessionId();
+    session.sessionId = sid;
+    const payload: SealedSessionPayload = {
+      v: 2,
+      sid,
+      userId: session.userId,
+      email: session.email,
+      fullName: session.fullName,
+      role: session.role,
+      displayRole: session.displayRole || displayRoleFor(session.role),
+      platformRole: session.platformRole,
+      activeOutlet: this.toCompactOutlet(session.activeOutlet),
+      assignedOutlets: this.toCompactMemberships(session.assignedOutlets),
+      specificTitle: session.specificTitle,
+      permissions: session.permissions,
+      deviceId: session.deviceId,
+      createdAt: session.createdAt,
+      expiresAt: session.expiresAt,
+      supabaseToken: session.supabaseToken,
+      supabaseRefreshToken: session.supabaseRefreshToken,
+      supabaseExpiresAt: session.supabaseExpiresAt
+    };
+    return sealSessionPayload(payload);
+  }
+
+  private resealSession(session: UserSession, previousToken?: string): UserSession {
+    const oldToken = previousToken || session.token;
+    const nextToken = this.sealUserSession(session);
+    session.token = nextToken;
+    this.activeSessions.set(nextToken, session);
+    if (oldToken && oldToken !== nextToken) {
+      // Alias previous token to the updated session so concurrent in-flight requests don't spuriously 401
+      this.activeSessions.set(oldToken, session);
+    }
+    return session;
+  }
+
   private createSession(
     user: UserAccount,
     outlet: Outlet,
@@ -1424,14 +1539,17 @@ export class SmavAuthGateway implements IAuthProvider {
     permissions: string[],
     deviceId?: string,
     supabaseToken?: string,
-    platformRole?: string
+    platformRole?: string,
+    supabaseRefreshToken?: string,
+    supabaseExpiresAt?: number
   ): UserSession {
-    const token = generateSecureToken('smav_jwt');
     const now = Date.now();
-    const expiresAt = new Date(now + 24 * 60 * 60 * 1000).toISOString();
+    const sessionId = generateSessionId();
+    const expiresAt = new Date(now + SESSION_TTL_MS).toISOString();
 
     const session: UserSession = {
-      token,
+      token: '',
+      sessionId,
       userId: user.id,
       email: user.email,
       fullName: user.fullName,
@@ -1445,10 +1563,14 @@ export class SmavAuthGateway implements IAuthProvider {
       createdAt: new Date(now).toISOString(),
       expiresAt,
       supabaseToken,
+      supabaseRefreshToken,
+      supabaseExpiresAt: supabaseExpiresAt || extractJwtExpiryMs(supabaseToken),
+      hasSupabaseRefreshSession: Boolean(supabaseRefreshToken || supabaseToken),
       platformRole
     };
 
-    this.activeSessions.set(token, session);
+    session.token = this.sealUserSession(session);
+    this.activeSessions.set(session.token, session);
     return session;
   }
 
@@ -1457,12 +1579,18 @@ export class SmavAuthGateway implements IAuthProvider {
   public async revokeUserSessions(userId: string, outletId?: string): Promise<number> {
     const targetId = String(userId || '').trim();
     if (!targetId) return 0;
+    if (!outletId) {
+      this.revocationStore.revokeUserBefore(targetId, Date.now());
+    }
     let revoked = 0;
     for (const [token, sess] of this.activeSessions.entries()) {
       if (sess.userId !== targetId) continue;
       if (outletId && sess.role !== 'superadmin' && sess.activeOutlet?.id !== outletId) continue;
+      if (sess.sessionId) {
+        this.revocationStore.revokeSessionId(sess.sessionId);
+      }
       this.activeSessions.delete(token);
-      this.sessionLiveCheckedAt.delete(token);
+      this.sessionLiveCheckedAt.delete(sess.sessionId || token);
       revoked++;
     }
     if (revoked > 0) {
@@ -1487,7 +1615,8 @@ export class SmavAuthGateway implements IAuthProvider {
       return { active: true };
     }
 
-    const lastChecked = this.sessionLiveCheckedAt.get(session.token) || 0;
+    const checkKey = session.sessionId || session.token;
+    const lastChecked = this.sessionLiveCheckedAt.get(checkKey) || 0;
     if (!forceFresh && Date.now() - lastChecked < 15 * 1000) {
       return { active: true };
     }
@@ -1507,7 +1636,7 @@ export class SmavAuthGateway implements IAuthProvider {
         .maybeSingle();
 
       if (profErr) {
-        // Fail open only on transient transport errors so offline/degraded networks do not spuriously log out
+        // Fail open only on transient transport/DB errors so offline/degraded networks do not spuriously log out
         return { active: true };
       }
 
@@ -1544,32 +1673,200 @@ export class SmavAuthGateway implements IAuthProvider {
         }
       }
 
-      this.sessionLiveCheckedAt.set(session.token, Date.now());
+      this.sessionLiveCheckedAt.set(checkKey, Date.now());
       return { active: true };
     } catch (_e) {
       return { active: true };
     }
   }
 
-  public async validateSession(token: string, options?: { forceFresh?: boolean }): Promise<UserSession | null> {
-    if (!token) return null;
-    const session = this.activeSessions.get(token);
-    if (!session) return null;
+  private async rehydrateFromSealedToken(token: string): Promise<SessionValidationOutcome<UserSession>> {
+    const unsealed = unsealSessionPayload(token);
+    if (!unsealed) {
+      return {
+        ok: false,
+        code: 'SESSION_INVALIDATED',
+        message: 'Session token is invalid or unrecognized. Please sign in again.'
+      };
+    }
+
+    if (this.revocationStore.isSessionRevoked(unsealed.sid, unsealed.userId, unsealed.createdAt)) {
+      return {
+        ok: false,
+        code: 'SESSION_REVOKED',
+        message: 'Your session was signed out or revoked. Please sign in again.'
+      };
+    }
+
+    if (new Date(unsealed.expiresAt).getTime() < Date.now()) {
+      return {
+        ok: false,
+        code: 'SESSION_EXPIRED',
+        message: 'Your session has expired. Please sign in again.'
+      };
+    }
+
+    const storedOutlet = await this.outletRepo.getOutletById(unsealed.activeOutlet.id).catch(() => undefined);
+    const activeOutlet: Outlet = storedOutlet || {
+      id: unsealed.activeOutlet.id,
+      code: unsealed.activeOutlet.code,
+      name: unsealed.activeOutlet.name,
+      category: unsealed.activeOutlet.category,
+      address: unsealed.activeOutlet.address || '',
+      phone: unsealed.activeOutlet.phone || '',
+      gstin: unsealed.activeOutlet.gstin || '',
+      receiptHeader: unsealed.activeOutlet.receiptHeader || unsealed.activeOutlet.name,
+      receiptFooter: unsealed.activeOutlet.receiptFooter || 'Thank you!',
+      providerType: unsealed.activeOutlet.providerType || 'central_smav',
+      isActive: unsealed.activeOutlet.isActive !== false,
+      createdAt: unsealed.createdAt,
+      updatedAt: unsealed.createdAt
+    };
+
+    const assignedOutlets: UserOutletMembership[] = (unsealed.assignedOutlets || []).map((m) => ({
+      outletId: m.outletId,
+      outletCode: m.outletCode,
+      outletName: m.outletName,
+      outletCategory: m.outletCategory,
+      role: m.role,
+      displayRole: m.displayRole || displayRoleFor(m.role),
+      specificTitle: m.specificTitle,
+      permissions: permissionsForRole(m.role),
+      isPrimary: Boolean(m.isPrimary)
+    }));
+
+    const rehydrated: UserSession = {
+      token,
+      sessionId: unsealed.sid,
+      userId: unsealed.userId,
+      email: unsealed.email,
+      fullName: unsealed.fullName,
+      role: unsealed.role,
+      displayRole: unsealed.displayRole || displayRoleFor(unsealed.role),
+      activeOutlet,
+      assignedOutlets,
+      specificTitle: unsealed.specificTitle,
+      permissions: unsealed.permissions?.length ? unsealed.permissions : permissionsForRole(unsealed.role),
+      deviceId: unsealed.deviceId,
+      createdAt: unsealed.createdAt,
+      expiresAt: unsealed.expiresAt,
+      supabaseToken: unsealed.supabaseToken,
+      supabaseRefreshToken: unsealed.supabaseRefreshToken,
+      supabaseExpiresAt: unsealed.supabaseExpiresAt,
+      hasSupabaseRefreshSession: Boolean(unsealed.supabaseRefreshToken || unsealed.supabaseToken),
+      platformRole: unsealed.platformRole
+    };
+
+    this.activeSessions.set(token, rehydrated);
+    return { ok: true, session: rehydrated };
+  }
+
+  public async validateSessionDetailed(
+    token: string,
+    options?: { forceFresh?: boolean; forceRefreshSupabase?: boolean }
+  ): Promise<SessionValidationOutcome<UserSession>> {
+    if (!token) {
+      return { ok: false, code: 'SESSION_MISSING', message: 'Missing or invalid authorization credentials.' };
+    }
+
+    let session = this.activeSessions.get(token);
+    if (!session) {
+      const rehydrated = await this.rehydrateFromSealedToken(token);
+      if (!rehydrated.ok || !rehydrated.session) {
+        return rehydrated;
+      }
+      session = rehydrated.session;
+    }
+
+    if (this.revocationStore.isSessionRevoked(session.sessionId, session.userId, session.createdAt)) {
+      this.activeSessions.delete(token);
+      this.activeSessions.delete(session.token);
+      this.sessionLiveCheckedAt.delete(session.sessionId || token);
+      return {
+        ok: false,
+        code: 'SESSION_REVOKED',
+        message: 'Your session was signed out or revoked. Please sign in again.'
+      };
+    }
 
     if (new Date(session.expiresAt).getTime() < Date.now()) {
       this.activeSessions.delete(token);
-      this.sessionLiveCheckedAt.delete(token);
-      return null;
+      this.activeSessions.delete(session.token);
+      this.sessionLiveCheckedAt.delete(session.sessionId || token);
+      return {
+        ok: false,
+        code: 'SESSION_EXPIRED',
+        message: 'Your session has expired. Please sign in again.'
+      };
+    }
+
+    let tokenRotated = session.token !== token;
+    let supabaseRefreshed = false;
+
+    // Automatically refresh Supabase access/refresh tokens when near expiry or explicitly requested
+    if (session.supabaseRefreshToken && centralSupabaseConfig.isConfigured) {
+      const publicSupabase = getCentralSupabaseClient();
+      if (publicSupabase) {
+        const refreshOutcome = await refreshSupabaseSessionIfNeeded({
+          supabaseToken: session.supabaseToken,
+          supabaseRefreshToken: session.supabaseRefreshToken,
+          supabaseExpiresAt: session.supabaseExpiresAt,
+          forceRefresh: Boolean(options?.forceRefreshSupabase),
+          refreshFn: (rt) => publicSupabase.auth.refreshSession({ refresh_token: rt })
+        });
+
+        if (refreshOutcome.status === 'refreshed' && refreshOutcome.accessToken) {
+          session.supabaseToken = refreshOutcome.accessToken;
+          session.supabaseRefreshToken = refreshOutcome.refreshToken || session.supabaseRefreshToken;
+          session.supabaseExpiresAt = refreshOutcome.expiresAt;
+          session.expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+          session.hasSupabaseRefreshSession = true;
+          this.resealSession(session, token);
+          tokenRotated = true;
+          supabaseRefreshed = true;
+        } else if (refreshOutcome.status === 'invalid') {
+          if (session.sessionId) {
+            this.revocationStore.revokeSessionId(session.sessionId);
+          }
+          this.activeSessions.delete(token);
+          this.activeSessions.delete(session.token);
+          this.sessionLiveCheckedAt.delete(session.sessionId || token);
+          return {
+            ok: false,
+            code: refreshOutcome.code || 'SESSION_EXPIRED',
+            message: refreshOutcome.message || 'Your session has expired. Please sign in again.'
+          };
+        }
+        // On 'transient_error', retain the valid session rather than spuriously logging out!
+      }
     }
 
     const liveCheck = await this.verifySessionActiveInCentralDb(session, Boolean(options?.forceFresh));
     if (!liveCheck.active) {
+      if (session.sessionId) {
+        this.revocationStore.revokeSessionId(session.sessionId);
+      }
       this.activeSessions.delete(token);
-      this.sessionLiveCheckedAt.delete(token);
-      return null;
+      this.activeSessions.delete(session.token);
+      this.sessionLiveCheckedAt.delete(session.sessionId || token);
+      return {
+        ok: false,
+        code: 'ACCOUNT_DISABLED',
+        message: liveCheck.reason || 'Your account has been deactivated. Please contact your administrator.'
+      };
     }
 
-    return session;
+    return {
+      ok: true,
+      session,
+      tokenRotated,
+      supabaseRefreshed
+    };
+  }
+
+  public async validateSession(token: string, options?: { forceFresh?: boolean }): Promise<UserSession | null> {
+    const result = await this.validateSessionDetailed(token, options);
+    return result.ok && result.session ? result.session : null;
   }
 
   public async switchOutlet(token: string, outlet: Outlet): Promise<UserSession | null> {
@@ -1577,7 +1874,8 @@ export class SmavAuthGateway implements IAuthProvider {
     if (!session || session.role !== 'superadmin') return null;
     session.activeOutlet = outlet;
     session.specificTitle = 'Superadmin Auditor';
-    return session;
+    session.expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+    return this.resealSession(session, token);
   }
 
   public async switchAuthenticatedOutlet(
@@ -1601,20 +1899,50 @@ export class SmavAuthGateway implements IAuthProvider {
     if (assignedOutlets) {
       session.assignedOutlets = assignedOutlets;
     }
-    return session;
+    session.expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+    return this.resealSession(session, token);
   }
 
   public async revokeSession(token: string): Promise<boolean> {
+    if (!token) return false;
     const existing = this.activeSessions.get(token);
+    const unsealed = existing ? null : unsealSessionPayload(token);
+    const sessionId = existing?.sessionId || unsealed?.sid;
+    const userId = existing?.userId || unsealed?.userId;
+    const email = existing?.email || unsealed?.email;
+    const outletId = existing?.activeOutlet?.id || unsealed?.activeOutlet?.id;
+    const deviceId = existing?.deviceId || unsealed?.deviceId;
+    const supabaseToken = existing?.supabaseToken || unsealed?.supabaseToken;
+
+    if (sessionId) {
+      this.revocationStore.revokeSessionId(sessionId);
+    }
+
     if (existing) {
       this.activeSessions.delete(token);
-      this.sessionLiveCheckedAt.delete(token);
+      if (existing.token && existing.token !== token) {
+        this.activeSessions.delete(existing.token);
+      }
+      this.sessionLiveCheckedAt.delete(existing.sessionId || token);
+    }
+
+    // Best-effort Supabase session sign-out on explicit Sign Out
+    if (supabaseToken && centralSupabaseConfig.isConfigured) {
+      try {
+        const authedClient = getCentralSupabaseClient(supabaseToken);
+        await authedClient?.auth.signOut().catch(() => null);
+      } catch {
+        // Ignore network errors during logout cleanup
+      }
+    }
+
+    if (existing || unsealed) {
       auditLogger.log({
         eventType: 'SESSION_REVOKED',
-        actorId: existing.userId,
-        actorEmail: existing.email,
-        outletId: existing.activeOutlet.id,
-        details: { deviceId: existing.deviceId }
+        actorId: userId,
+        actorEmail: email,
+        outletId,
+        details: { deviceId, sessionId }
       });
       return true;
     }
@@ -2132,18 +2460,45 @@ app.get('/api/realtime/catalog-events', (req, res) => {
 // Authentication Middleware (Server-Side Verification)
 // -------------------------------------------------------------------------------------------------
 async function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ success: false, message: 'Missing or invalid authorization header' });
+  const { token, source } = extractRequestSessionToken(req);
+  if (!token) {
+    return res.status(401).json({
+      success: false,
+      code: 'SESSION_MISSING',
+      message: 'Missing or invalid authorization header'
+    });
   }
 
-  const token = authHeader.split(' ')[1];
-  const session = await smavGateway.validateSession(token);
-  if (!session) {
-    return res.status(401).json({ success: false, message: 'Session expired or invalidated. Please sign in again.' });
+  if (source === 'cookie' && !verifyCookieMutationCsrf(req)) {
+    return res.status(403).json({
+      success: false,
+      code: 'CSRF_CHECK_FAILED',
+      message: 'Cross-site request rejected.'
+    });
   }
 
-  (req as any).userSession = session;
+  const validation = await smavGateway.validateSessionDetailed(token);
+  if (!validation.ok || !validation.session) {
+    if (
+      source === 'cookie' &&
+      validation.code &&
+      ['SESSION_EXPIRED', 'SESSION_REVOKED', 'ACCOUNT_DISABLED', 'SESSION_INVALIDATED'].includes(validation.code)
+    ) {
+      clearSessionCookie(res, req);
+    }
+    return res.status(401).json({
+      success: false,
+      code: validation.code || 'SESSION_INVALIDATED',
+      message: validation.message || 'Session expired or invalidated. Please sign in again.'
+    });
+  }
+
+  if (validation.tokenRotated && source === 'cookie') {
+    setSessionCookie(res, req, validation.session.token);
+  }
+
+  (req as any).userSession = validation.session;
+  (req as any).sessionAuthSource = source;
   next();
 }
 
@@ -2200,10 +2555,16 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
 
+    const sessionToken = result.token || result.session?.token;
+    if (sessionToken) {
+      setSessionCookie(res, req, sessionToken);
+    }
+
     return res.json({
       ...result,
+      session: result.session ? sanitizeSessionForClient(result.session) : undefined,
       multiBusiness: false,
-      token: result.token || result.session?.token
+      token: sessionToken
     });
   } catch (err: any) {
     console.error('[Auth Login Error]', err?.message || 'Unexpected authentication error');
@@ -2245,12 +2606,13 @@ app.post('/api/mobile-auth/login', async (req, res) => {
     });
   }
 
+  const safeSession = result.session ? sanitizeSessionForClient(result.session) : undefined;
   res.json({
     success: true,
     multi_business: false,
     token: result.session?.token,
     session: {
-      ...result.session,
+      ...safeSession,
       // Outlet identity ONLY at login; physical branches are loaded dynamically from /api/pos/branches
       outlet_id: result.session?.activeOutlet.id,
       outlet_code: result.session?.activeOutlet.code,
@@ -2278,7 +2640,15 @@ app.post('/api/auth/select-outlet', async (req, res) => {
     return res.status(403).json(result);
   }
 
-  res.json(result);
+  if (result.session?.token) {
+    setSessionCookie(res, req, result.session.token);
+  }
+
+  res.json({
+    ...result,
+    token: result.session?.token,
+    session: result.session ? sanitizeSessionForClient(result.session) : undefined
+  });
 });
 
 app.post('/api/mobile-auth/select-business', async (req, res) => {
@@ -2287,11 +2657,12 @@ app.post('/api/mobile-auth/select-business', async (req, res) => {
   const result = await smavGateway.selectAuthorizedOutlet(user_id || temp_token || tempToken, targetOutletId, device_id, temp_token || tempToken);
   if (!result.success) return res.status(403).json(result);
 
+  const safeSession = result.session ? sanitizeSessionForClient(result.session) : undefined;
   res.json({
     success: true,
     token: result.session?.token,
     session: {
-      ...result.session,
+      ...safeSession,
       // Outlet identity ONLY on business selection; physical branches are loaded dynamically from /api/pos/branches
       outlet_id: result.session?.activeOutlet.id,
       outlet_code: result.session?.activeOutlet.code,
@@ -2304,21 +2675,130 @@ app.post('/api/mobile-auth/select-business', async (req, res) => {
   });
 });
 
-app.get('/api/auth/session', async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ success: false, code: 'SESSION_MISSING', message: 'Missing or invalid authorization header' });
+async function resolveSessionPermittedBranchesBestEffort(session: UserSession): Promise<{
+  permittedBranches?: any[];
+  autoSelectedBranch?: any | null;
+  requiresManualBranchSelection?: boolean;
+  billingBlocked?: boolean;
+  authorizationMessage?: string | null;
+}> {
+  if (!session.activeOutlet?.id || session.activeOutlet.category !== 'salon') {
+    return {};
   }
-  const token = authHeader.split(' ')[1];
-  const session = await smavGateway.validateSession(token, { forceFresh: true });
-  if (!session) {
+  try {
+    const serviceDb = getCentralSupabaseServiceClient();
+    const [allBranches, userBranchAssignments] = await Promise.all([
+      centralBillNumberCoordinator.listOutletBranches(serviceDb, session.activeOutlet.id),
+      centralBillNumberCoordinator.getUserBranchAssignments(serviceDb, session.userId, session.activeOutlet.id)
+    ]);
+    const resolved = resolvePermittedBranchesForUser({
+      allOutletBranches: allBranches,
+      userRole: session.role,
+      assignedBranchIds: userBranchAssignments.branchIds,
+      assignedBranchCodes: userBranchAssignments.branchCodes,
+      hasExplicitAssignments: userBranchAssignments.hasExplicitAssignments
+    });
+    return {
+      permittedBranches: resolved.branches,
+      autoSelectedBranch: resolved.autoSelectedBranch,
+      requiresManualBranchSelection: resolved.requiresManualSelection,
+      billingBlocked: resolved.billingBlocked,
+      authorizationMessage: resolved.authorizationMessage
+    };
+  } catch {
+    // Temporary branch/catalog lookup errors must NEVER invalidate a valid login session
+    return {};
+  }
+}
+
+app.get('/api/auth/session', async (req, res) => {
+  const { token, source } = extractRequestSessionToken(req);
+  if (!token) {
     return res.status(401).json({
       success: false,
-      code: 'SESSION_INVALIDATED',
-      message: 'Your session has expired or your account has been deactivated. Please sign in again.'
+      code: 'SESSION_MISSING',
+      message: 'No active login session found.'
     });
   }
-  res.json({ success: true, session });
+
+  const validation = await smavGateway.validateSessionDetailed(token, { forceFresh: true });
+  if (!validation.ok || !validation.session) {
+    if (
+      source === 'cookie' &&
+      validation.code &&
+      ['SESSION_EXPIRED', 'SESSION_REVOKED', 'ACCOUNT_DISABLED', 'SESSION_INVALIDATED'].includes(validation.code)
+    ) {
+      clearSessionCookie(res, req);
+    }
+    return res.status(401).json({
+      success: false,
+      code: validation.code || 'SESSION_INVALIDATED',
+      message:
+        validation.message ||
+        'Your session has expired or your account has been deactivated. Please sign in again.'
+    });
+  }
+
+  const session = validation.session;
+  setSessionCookie(res, req, session.token);
+
+  const branchInfo = await resolveSessionPermittedBranchesBestEffort(session);
+  res.json({
+    success: true,
+    token: session.token,
+    session: sanitizeSessionForClient(session),
+    supabaseRefreshed: Boolean(validation.supabaseRefreshed),
+    ...branchInfo
+  });
+});
+
+app.post('/api/auth/refresh', async (req, res) => {
+  const { token, source } = extractRequestSessionToken(req);
+  if (!token) {
+    return res.status(401).json({
+      success: false,
+      code: 'SESSION_MISSING',
+      message: 'No active login session found.'
+    });
+  }
+  if (source === 'cookie' && !verifyCookieMutationCsrf(req)) {
+    return res.status(403).json({
+      success: false,
+      code: 'CSRF_CHECK_FAILED',
+      message: 'Cross-site request rejected.'
+    });
+  }
+
+  const validation = await smavGateway.validateSessionDetailed(token, {
+    forceFresh: true,
+    forceRefreshSupabase: true
+  });
+  if (!validation.ok || !validation.session) {
+    if (
+      source === 'cookie' &&
+      validation.code &&
+      ['SESSION_EXPIRED', 'SESSION_REVOKED', 'ACCOUNT_DISABLED', 'SESSION_INVALIDATED'].includes(validation.code)
+    ) {
+      clearSessionCookie(res, req);
+    }
+    return res.status(401).json({
+      success: false,
+      code: validation.code || 'SESSION_EXPIRED',
+      message: validation.message || 'Your session has expired. Please sign in again.'
+    });
+  }
+
+  const session = validation.session;
+  setSessionCookie(res, req, session.token);
+
+  const branchInfo = await resolveSessionPermittedBranchesBestEffort(session);
+  res.json({
+    success: true,
+    token: session.token,
+    session: sanitizeSessionForClient(session),
+    supabaseRefreshed: Boolean(validation.supabaseRefreshed),
+    ...branchInfo
+  });
 });
 
 app.get('/api/auth/outlets', requireAuth, async (req, res) => {
@@ -2420,7 +2900,13 @@ app.post('/api/auth/switch-outlet', requireAuth, async (req, res) => {
 
     if (session.role === 'superadmin') {
       const updated = await smavGateway.switchAuthenticatedOutlet(session.token, targetOutlet, 'superadmin');
-      return res.json({ success: true, session: updated, redirectTo: '/superadmin/outlets' });
+      if (updated?.token) setSessionCookie(res, req, updated.token);
+      return res.json({
+        success: true,
+        token: updated?.token,
+        session: updated ? sanitizeSessionForClient(updated) : null,
+        redirectTo: '/superadmin/outlets'
+      });
     }
 
     const { data: roleRows } = await authedSupabase
@@ -2453,10 +2939,12 @@ app.post('/api/auth/switch-outlet', requireAuth, async (req, res) => {
     const isOutletAdmin = ['ADMIN', 'OWNER'].includes(String(matchedRole.role || '').toUpperCase());
     const nextRole: UserRole = isOutletAdmin ? 'admin' : 'staff';
     const updated = await smavGateway.switchAuthenticatedOutlet(session.token, targetOutlet, nextRole);
+    if (updated?.token) setSessionCookie(res, req, updated.token);
 
     return res.json({
       success: true,
-      session: updated,
+      token: updated?.token,
+      session: updated ? sanitizeSessionForClient(updated) : null,
       redirectTo: nextRole === 'admin' ? '/admin/dashboard' : '/pos'
     });
   }
@@ -2471,9 +2959,11 @@ app.post('/api/auth/switch-outlet', requireAuth, async (req, res) => {
   }
   const nextRole: UserRole = session.role === 'superadmin' ? 'superadmin' : (membership?.role || 'staff');
   const updated = await smavGateway.switchAuthenticatedOutlet(session.token, outlet, nextRole);
+  if (updated?.token) setSessionCookie(res, req, updated.token);
   res.json({
     success: true,
-    session: updated,
+    token: updated?.token,
+    session: updated ? sanitizeSessionForClient(updated) : null,
     redirectTo: nextRole === 'superadmin' ? '/superadmin/outlets' : nextRole === 'admin' ? '/admin/dashboard' : '/pos'
   });
 });
@@ -4274,9 +4764,15 @@ app.post('/api/central-supabase/verify-login', async (req, res) => {
   }
 });
 
-app.post('/api/auth/logout', requireAuth, async (req, res) => {
-  const token = req.headers.authorization!.split(' ')[1];
-  await smavGateway.revokeSession(token);
+app.post('/api/auth/logout', async (req, res) => {
+  const { token, source } = extractRequestSessionToken(req);
+  if (source === 'cookie' && !verifyCookieMutationCsrf(req)) {
+    return res.status(403).json({ success: false, code: 'CSRF_CHECK_FAILED', message: 'Cross-site request rejected.' });
+  }
+  if (token) {
+    await smavGateway.revokeSession(token);
+  }
+  clearSessionCookie(res, req);
   res.json({ success: true, message: 'Session revoked successfully' });
 });
 
@@ -4329,7 +4825,16 @@ app.post('/api/auth/complete-first-login-password', async (req, res) => {
     return res.status(401).json(authResult);
   }
 
-  return res.json(authResult);
+  const sessionToken = authResult.token || authResult.session?.token;
+  if (sessionToken) {
+    setSessionCookie(res, req, sessionToken);
+  }
+
+  return res.json({
+    ...authResult,
+    token: sessionToken,
+    session: authResult.session ? sanitizeSessionForClient(authResult.session) : undefined
+  });
 });
 
 // Central registry: Supabase is authoritative. Do not silently fall back to demo records.
@@ -4792,23 +5297,21 @@ app.post('/api/superadmin/launch-pos', requireAuth, requireSuperadmin, async (re
   if (!outlet) return res.status(404).json({ success: false, message: 'Outlet not found' });
 
   const superadminSession: UserSession = (req as any).userSession;
+  const updatedSession = (await smavGateway.switchOutlet(superadminSession.token, outlet)) || superadminSession;
+  setSessionCookie(res, req, updatedSession.token);
+
   const temporarySession: UserSession = {
-    token: superadminSession.token,
-    userId: superadminSession.userId,
-    email: superadminSession.email,
-    fullName: `${superadminSession.fullName} (Auditor)`,
+    ...updatedSession,
+    fullName: updatedSession.fullName.includes('(Auditor)')
+      ? updatedSession.fullName
+      : `${updatedSession.fullName} (Auditor)`,
     role: 'superadmin',
+    displayRole: 'SUPERADMIN',
     activeOutlet: outlet,
     specificTitle: 'Superadmin Auditor',
     permissions: ['*'],
-    deviceId: 'SMAV-SUPERADMIN-CONSOLE',
-    createdAt: new Date().toISOString(),
-    expiresAt: superadminSession.expiresAt,
-    supabaseToken: superadminSession.supabaseToken,
-    platformRole: superadminSession.platformRole
+    deviceId: updatedSession.deviceId || 'SMAV-SUPERADMIN-CONSOLE'
   };
-
-  await smavGateway.switchOutlet(superadminSession.token, outlet);
 
   auditLogger.log({
     eventType: 'SUPERADMIN_LAUNCHED_OUTLET_POS',
@@ -4817,7 +5320,11 @@ app.post('/api/superadmin/launch-pos', requireAuth, requireSuperadmin, async (re
     details: { outletName: outlet.name }
   });
 
-  res.json({ success: true, session: temporarySession });
+  res.json({
+    success: true,
+    token: updatedSession.token,
+    session: sanitizeSessionForClient(temporarySession)
+  });
 });
 
 app.get('/api/superadmin/audit-logs', requireAuth, requireSuperadmin, (req, res) => {

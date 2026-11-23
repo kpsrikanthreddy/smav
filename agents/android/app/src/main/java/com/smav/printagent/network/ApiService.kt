@@ -223,6 +223,9 @@ interface ApiService {
     @GET("api/auth/session")
     suspend fun getAuthSession(@Header("Authorization") token: String): Response<JsonObject>
 
+    @POST("api/auth/refresh")
+    suspend fun refreshAuthSession(@Header("Authorization") token: String): Response<JsonObject>
+
     @GET("api/auth/profile")
     suspend fun getAuthProfile(@Header("Authorization") token: String): Response<JsonObject>
 

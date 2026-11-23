@@ -19,6 +19,7 @@ import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -72,54 +73,71 @@ class MainActivity : ComponentActivity() {
                 val scope = rememberCoroutineScope()
 
                 var active by remember { mutableStateOf(sessions.getStaffSession()) }
+                var isRestoringSession by remember { mutableStateOf(active == null && sessions.isLoggedIn()) }
                 var isOnline by remember { mutableStateOf(true) }
-                var authErrorMessage by remember { mutableStateOf("") }
+                var isRetryingSession by remember { mutableStateOf(false) }
+                var offlineBannerMessage by remember { mutableStateOf<String?>(null) }
+                var authErrorMessage by rememberSaveable { mutableStateOf("") }
 
                 // Multi-outlet selection state before full session
-                var pendingToken by remember { mutableStateOf("") }
-                var pendingUserId by remember { mutableStateOf("") }
-                var pendingEmail by remember { mutableStateOf("") }
+                var pendingToken by rememberSaveable { mutableStateOf("") }
+                var pendingUserId by rememberSaveable { mutableStateOf("") }
+                var pendingEmail by rememberSaveable { mutableStateOf("") }
                 var pendingOutlets by remember { mutableStateOf<List<AvailableBusinessOption>>(emptyList()) }
                 var pendingSelectionBusy by remember { mutableStateOf(false) }
 
-                fun revalidateActiveSession() {
-                    if (active == null) return
+                fun revalidateActiveSession(userInitiated: Boolean = false) {
+                    val current = active ?: sessions.getStaffSession()
+                    if (current == null) {
+                        isRestoringSession = false
+                        return
+                    }
+                    if (active == null) {
+                        active = current
+                    }
+                    if (userInitiated) {
+                        isRetryingSession = true
+                    }
                     scope.launch {
-                        adminRepo.validateCurrentSession()
-                            .onSuccess { refreshed ->
-                                active = refreshed
-                                isOnline = true
-                            }
-                            .onFailure { err ->
-                                if (err is UnauthorizedSessionException) {
-                                    sessions.clearSession()
-                                    active = null
-                                    authErrorMessage = err.message
-                                        ?: "Your account is inactive or your session has expired. Please sign in again."
-                                } else if (sessions.isOfflineAuthorizationExpired()) {
-                                    sessions.clearSession()
-                                    active = null
-                                    isOnline = false
-                                    authErrorMessage =
-                                        "Offline authorization window expired. Please reconnect to the internet and sign in again."
-                                } else {
-                                    isOnline = false
+                        try {
+                            adminRepo.validateCurrentSession()
+                                .onSuccess { refreshed ->
+                                    active = refreshed
+                                    isOnline = true
+                                    offlineBannerMessage = null
                                 }
-                            }
+                                .onFailure { err ->
+                                    if (err is UnauthorizedSessionException && err.confirmedInvalid) {
+                                        // Clear ONLY for confirmed invalid/expired/revoked/disabled session
+                                        sessions.clearSession()
+                                        active = null
+                                        offlineBannerMessage = null
+                                        authErrorMessage = err.message
+                                            ?: "Your account is inactive or your session has expired. Please sign in again."
+                                    } else {
+                                        // Temporary network/server/API outage: retain valid session and show offline/retry banner
+                                        isOnline = false
+                                        offlineBannerMessage =
+                                            "Server temporarily unreachable. Your session is retained — tap Retry to reconnect."
+                                    }
+                                }
+                        } finally {
+                            isRestoringSession = false
+                            isRetryingSession = false
+                        }
                     }
                 }
 
-                // Background startup session validation (never wipes Room bills on 401/offline expiry)
+                // Background startup session validation (never wipes Room bills or clears valid session on transient errors)
                 LaunchedEffect(Unit) {
-                    revalidateActiveSession()
+                    revalidateActiveSession(userInitiated = false)
                 }
 
-                // Revalidate session every time the POS returns to foreground so deactivated or
-                // role-updated users are refreshed immediately when connectivity is available.
+                // Revalidate session when returning to foreground so role/outlet updates and Supabase token refreshes stay current
                 DisposableEffect(this@MainActivity) {
                     val observer = LifecycleEventObserver { _, event ->
                         if (event == Lifecycle.Event.ON_RESUME && active != null) {
-                            revalidateActiveSession()
+                            revalidateActiveSession(userInitiated = false)
                         }
                     }
                     this@MainActivity.lifecycle.addObserver(observer)
@@ -129,10 +147,50 @@ class MainActivity : ComponentActivity() {
                 }
 
                 when {
+                    isRestoringSession -> {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(SmavColors.Background)
+                                .padding(24.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Surface(
+                                color = SmavColors.Surface,
+                                shape = RoundedCornerShape(16.dp),
+                                border = BorderStroke(1.dp, SmavColors.Border)
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(24.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                                ) {
+                                    CircularProgressIndicator(color = SmavColors.AccentPink)
+                                    Text(
+                                        text = "Restoring your SMAV session…",
+                                        color = SmavColors.TextPrimary,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 15.sp
+                                    )
+                                    Text(
+                                        text = "Loading outlet, role, and permitted branches.",
+                                        color = SmavColors.TextSecondary,
+                                        fontSize = 12.sp,
+                                        textAlign = TextAlign.Center
+                                    )
+                                }
+                            }
+                        }
+                    }
+
                     active != null -> {
                         SmavAuthenticatedApp(
                             session = active!!,
                             isOnline = isOnline,
+                            offlineBannerMessage = offlineBannerMessage,
+                            isRetryingSession = isRetryingSession,
+                            onRetrySession = { revalidateActiveSession(userInitiated = true) },
+                            onVerifySessionState = { revalidateActiveSession(userInitiated = false) },
                             sessions = sessions,
                             database = database,
                             printerManager = printerManager,
@@ -143,10 +201,13 @@ class MainActivity : ComponentActivity() {
                             onSessionUpdated = { updated ->
                                 active = updated
                                 isOnline = true
+                                offlineBannerMessage = null
                             },
                             onSignedOut = { reason ->
                                 scope.launch { adminRepo.signOutRemote() }
+                                sessions.clearSession()
                                 active = null
+                                offlineBannerMessage = null
                                 pendingOutlets = emptyList()
                                 pendingToken = ""
                                 pendingUserId = ""
@@ -468,6 +529,10 @@ private fun CompactLoginScreen(
 private fun SmavAuthenticatedApp(
     session: StaffSession,
     isOnline: Boolean,
+    offlineBannerMessage: String?,
+    isRetryingSession: Boolean,
+    onRetrySession: () -> Unit,
+    onVerifySessionState: () -> Unit,
     sessions: SessionManager,
     database: AppDatabase,
     printerManager: BluetoothPrinterManager,
@@ -479,10 +544,29 @@ private fun SmavAuthenticatedApp(
     onSignedOut: (String?) -> Unit
 ) {
     val scope = rememberCoroutineScope()
-    var currentRoute by remember(session.role) { mutableStateOf(defaultRouteForRole(session.role)) }
-    var showOutletSwitcher by remember { mutableStateOf(false) }
-    var cartItemCount by remember(session.businessId) { mutableStateOf(0) }
-    var cartTotalAmount by remember(session.businessId) { mutableStateOf(0.0) }
+    var currentRouteName by rememberSaveable(session.userId, session.role.code) {
+        val restored = sessions.getActiveRoute()?.let { saved ->
+            runCatching { SmavRoute.valueOf(saved) }.getOrNull()
+        }
+        val allowedRoutes = drawerItemsForSession(session).map { it.route }.toSet()
+        val initial = if (restored != null && restored in allowedRoutes) {
+            restored
+        } else {
+            defaultRouteForRole(session.role)
+        }
+        mutableStateOf(initial.name)
+    }
+    val currentRoute = remember(currentRouteName, session.role) {
+        runCatching { SmavRoute.valueOf(currentRouteName) }.getOrElse { defaultRouteForRole(session.role) }
+    }
+    fun navigateTo(route: SmavRoute) {
+        currentRouteName = route.name
+        sessions.saveActiveRoute(route.name)
+    }
+
+    var showOutletSwitcher by rememberSaveable { mutableStateOf(false) }
+    var cartItemCount by rememberSaveable(session.businessId) { mutableStateOf(0) }
+    var cartTotalAmount by rememberSaveable(session.businessId) { mutableStateOf(0.0) }
     var openCartSignal by remember { mutableStateOf(0) }
 
     // Observe outlet-scoped pending offline bill counts
@@ -505,13 +589,22 @@ private fun SmavAuthenticatedApp(
         if (currentRoute in allowedRoutes) currentRoute else defaultRouteForRole(session.role)
     }
 
+    LaunchedEffect(safeRoute) {
+        sessions.saveActiveRoute(safeRoute.name)
+    }
+
+    // Never sign out directly on a feature/catalog/branch/sync API failure; verify with central auth first.
+    val handleFeatureUnauthorized: (String) -> Unit = { _ ->
+        onVerifySessionState()
+    }
+
     SmavAppScaffold(
         session = session,
         currentRoute = safeRoute,
         isOnline = isOnline,
         pendingSyncCount = pendingSyncCount,
         anyPrinterConnected = anyPrinterConnected,
-        onNavigate = { currentRoute = it },
+        onNavigate = { navigateTo(it) },
         onOpenOutletSwitcher = if (session.role.isSuperadmin() || session.assignedOutlets.size > 1) {
             { showOutletSwitcher = true }
         } else null,
@@ -519,9 +612,12 @@ private fun SmavAuthenticatedApp(
         cartItemCount = cartItemCount,
         cartTotalAmount = cartTotalAmount,
         onOpenSelectedCart = {
-            currentRoute = SmavRoute.POS_BILLING
+            navigateTo(SmavRoute.POS_BILLING)
             openCartSignal += 1
-        }
+        },
+        offlineBannerMessage = offlineBannerMessage,
+        isRetryingConnection = isRetryingSession,
+        onRetryConnection = onRetrySession
     ) { innerPadding ->
         Box(
             modifier = Modifier
@@ -536,45 +632,45 @@ private fun SmavAuthenticatedApp(
                         onSessionUpdated = onSessionUpdated,
                         onLaunchPosSuccess = { launched ->
                             onSessionUpdated(launched)
-                            currentRoute = SmavRoute.POS_BILLING
+                            navigateTo(SmavRoute.POS_BILLING)
                         },
-                        onUnauthorized = { msg -> onSignedOut(msg) },
-                        onOpenRoute = { currentRoute = it }
+                        onUnauthorized = handleFeatureUnauthorized,
+                        onOpenRoute = { navigateTo(it) }
                     )
                 }
 
                 SmavRoute.SUPERADMIN_ADMINS -> if (session.role.isSuperadmin()) {
                     SuperadminAdminsScreen(
                         adminRepo = adminRepo,
-                        onUnauthorized = { msg -> onSignedOut(msg) }
+                        onUnauthorized = handleFeatureUnauthorized
                     )
                 }
 
                 SmavRoute.SUPERADMIN_DIAGNOSTICS -> if (session.role.isSuperadmin()) {
                     SuperadminDiagnosticsScreen(
                         adminRepo = adminRepo,
-                        onUnauthorized = { msg -> onSignedOut(msg) }
+                        onUnauthorized = handleFeatureUnauthorized
                     )
                 }
 
                 SmavRoute.SUPERADMIN_REPORTS -> if (session.role.isSuperadmin()) {
                     SuperadminReportsScreen(
                         adminRepo = adminRepo,
-                        onUnauthorized = { msg -> onSignedOut(msg) }
+                        onUnauthorized = handleFeatureUnauthorized
                     )
                 }
 
                 SmavRoute.SUPERADMIN_AUDIT -> if (session.role.isSuperadmin()) {
                     SuperadminAuditLogsScreen(
                         adminRepo = adminRepo,
-                        onUnauthorized = { msg -> onSignedOut(msg) }
+                        onUnauthorized = handleFeatureUnauthorized
                     )
                 }
 
                 SmavRoute.SUPERADMIN_SUPABASE -> if (session.role.isSuperadmin()) {
                     SuperadminSupabaseStatusScreen(
                         adminRepo = adminRepo,
-                        onUnauthorized = { msg -> onSignedOut(msg) }
+                        onUnauthorized = handleFeatureUnauthorized
                     )
                 }
 
@@ -584,9 +680,9 @@ private fun SmavAuthenticatedApp(
                         pendingSyncCount = pendingSyncCount,
                         adminRepo = adminRepo,
                         catalogRepo = catalogRepo,
-                        onNavigate = { currentRoute = it },
+                        onNavigate = { navigateTo(it) },
                         onOpenOutletSwitcher = { showOutletSwitcher = true },
-                        onUnauthorized = { msg -> onSignedOut(msg) }
+                        onUnauthorized = handleFeatureUnauthorized
                     )
                 }
 
@@ -594,7 +690,7 @@ private fun SmavAuthenticatedApp(
                     AdminStaffScreen(
                         session = session,
                         adminRepo = adminRepo,
-                        onUnauthorized = { msg -> onSignedOut(msg) }
+                        onUnauthorized = handleFeatureUnauthorized
                     )
                 }
 
@@ -603,7 +699,7 @@ private fun SmavAuthenticatedApp(
                         session = session,
                         adminRepo = adminRepo,
                         catalogRepo = catalogRepo,
-                        onUnauthorized = { msg -> onSignedOut(msg) }
+                        onUnauthorized = handleFeatureUnauthorized
                     )
                 }
 
@@ -612,7 +708,7 @@ private fun SmavAuthenticatedApp(
                         session = session,
                         pendingSyncCount = pendingSyncCount,
                         adminRepo = adminRepo,
-                        onUnauthorized = { msg -> onSignedOut(msg) }
+                        onUnauthorized = handleFeatureUnauthorized
                     )
                 }
 
@@ -622,7 +718,7 @@ private fun SmavAuthenticatedApp(
                         pendingSyncCount = pendingSyncCount,
                         adminRepo = adminRepo,
                         syncRepo = syncRepo,
-                        onUnauthorized = { msg -> onSignedOut(msg) }
+                        onUnauthorized = handleFeatureUnauthorized
                     )
                 }
 
@@ -631,9 +727,9 @@ private fun SmavAuthenticatedApp(
                         session = session,
                         sessionManager = sessions,
                         adminRepo = adminRepo,
-                        onOpenPrinterSettings = { currentRoute = SmavRoute.PRINTER_SETTINGS },
+                        onOpenPrinterSettings = { navigateTo(SmavRoute.PRINTER_SETTINGS) },
                         onOpenOutletSwitcher = { showOutletSwitcher = true },
-                        onUnauthorized = { msg -> onSignedOut(msg) }
+                        onUnauthorized = handleFeatureUnauthorized
                     )
                 }
 
@@ -643,9 +739,9 @@ private fun SmavAuthenticatedApp(
                     billingRepo = billingRepo,
                     sessionManager = sessions,
                     onOpenOutletSwitcher = { showOutletSwitcher = true },
-                    onOpenRecentBills = { currentRoute = SmavRoute.POS_RECENT_BILLS },
-                    onOpenPrinterSettings = { currentRoute = SmavRoute.PRINTER_SETTINGS },
-                    onUnauthorized = { msg -> onSignedOut(msg) },
+                    onOpenRecentBills = { navigateTo(SmavRoute.POS_RECENT_BILLS) },
+                    onOpenPrinterSettings = { navigateTo(SmavRoute.PRINTER_SETTINGS) },
+                    onUnauthorized = handleFeatureUnauthorized,
                     onCartSummaryChange = { count, total ->
                         cartItemCount = count
                         cartTotalAmount = total
@@ -664,7 +760,7 @@ private fun SmavAuthenticatedApp(
                     session = session,
                     pendingSyncCount = pendingSyncCount,
                     syncRepo = syncRepo,
-                    onUnauthorized = { msg -> onSignedOut(msg) }
+                    onUnauthorized = handleFeatureUnauthorized
                 )
 
                 SmavRoute.PRINTER_SETTINGS -> PrinterSettingsScreen(
@@ -677,7 +773,7 @@ private fun SmavAuthenticatedApp(
                     IntegrationDiagnosticsScreen(
                         session = session,
                         adminRepo = adminRepo,
-                        onUnauthorized = { msg -> onSignedOut(msg) }
+                        onUnauthorized = handleFeatureUnauthorized
                     )
                 }
             }
@@ -700,7 +796,7 @@ private fun SmavAuthenticatedApp(
                         onSessionUpdated(updated)
                     }.onFailure { err ->
                         if (err is UnauthorizedSessionException) {
-                            onSignedOut(err.message)
+                            onVerifySessionState()
                         }
                     }
                 }
